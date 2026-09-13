@@ -9,6 +9,7 @@ from collections import Counter
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
+import httpx
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -19,7 +20,10 @@ ANTHROPIC_KEY = os.getenv('ANTHROPIC_KEY', '')
 OWNER_ID     = int(os.getenv('OWNER_ID', '0'))
 DB_PATH      = 'thermocraft.db'
 
-ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+ai = anthropic.Anthropic(
+    api_key=ANTHROPIC_KEY,
+    http_client=httpx.Client()
+)
 
 # ── BOSHLANG'ICH MAHSULOTLAR ──────────────────────────────────────
 INIT_P = [
