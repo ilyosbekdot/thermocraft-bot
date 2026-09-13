@@ -9,7 +9,7 @@ from collections import Counter
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
-import httpx
+import httpx2
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ DB_PATH      = 'thermocraft.db'
 
 ai = anthropic.Anthropic(
     api_key=ANTHROPIC_KEY,
-    http_client=httpx.Client()
+    http_client=httpx2.Client()
 )
 
 # ── BOSHLANG'ICH MAHSULOTLAR ──────────────────────────────────────
@@ -420,7 +420,7 @@ async def handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await upd.message.reply_text(f"❓ Topilmadi: {pname}")
 
-    # ── NARX OZGARTIRISH ──────────────────────────────────────────
+    # ── NARX OZGARTIRISH ────────────────���─────────────────────────
     elif action == 'set_price':
         pname    = parsed.get('product','')
         new_price= float(parsed.get('price', 0))
