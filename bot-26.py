@@ -78,32 +78,43 @@ INIT_P = [
 # Texnik ma'lumotlar (saytdan olingan)
 INIT_SPECS = {
     'TTS 20 Pro': [
-        ('Quvvat','20W (22W peak)'),('Lazer turi','Diod 450nm'),
-        ('Ishchi maydon','418 × 418 mm'),('Lazer dog\'i','0.13 × 0.145 mm'),
-        ('Maks tezlik','30,000 mm/min'),('Aniqlik','0.01 mm'),
-        ('Kontroller','32-bit ESP32 Pro V2.1'),
-        ('Ulanish','WiFi + USB'),('Dastur','LightBurn, LaserGRBL'),
-        ('Materiallar','Yog\'och, akrilik, teri, metall, bambu, tosh'),
-        ('Og\'irlik','3.2 kg'),('O\'lcham','695×595×125 mm'),
-        ('Kuchlanish','110-240V'),('Kafolat','3 oy'),
+        ('🟢 Quvvat','20W (22W peak) — professional daraja'),
+        ('🟢 Lazer dog\'i','0.13 × 0.145 mm (eng aniq)'),
+        ('🟢 Ishchi maydon','418 × 418 mm (TTS 10/55 dan 40% katta!)'),
+        ('🟢 Kesish','20mm yog\'och 1 o\'tishda, 5mm akrilik 1 o\'tishda'),
+        ('🟢 Air Assist','✅ O\'z ichida bepul (10-30L/min)'),
+        ('─── Umumiy xususiyatlar ───',''),
+        ('Tezlik','30,000 mm/min'),
+        ('Og\'irlik','3.2 kg (lazer boshi)'),
+        ('Ulanish','WiFi + USB + TF karta'),
+        ('Dastur','LightBurn, LaserGRBL'),
+        ('Materiallar','Yog\'och, akrilik, teri, metall, bambu, tosh, shisha'),
     ],
     'TTS 10 Pro': [
-        ('Quvvat','10W'),('Lazer turi','Diod 450nm'),
-        ('Ishchi maydon','418 × 418 mm'),('Lazer dog\'i','0.15 × 0.16 mm'),
-        ('Maks tezlik','30,000 mm/min'),('Aniqlik','0.01 mm'),
-        ('Kontroller','32-bit ESP32 Pro V2.1'),
-        ('Ulanish','WiFi + USB'),('Dastur','LightBurn, LaserGRBL'),
-        ('Materiallar','Yog\'och, akrilik, teri, shisha, metall bo\'yash'),
-        ('Og\'irlik','3.0 kg'),('O\'lcham','695×595×125 mm'),
-        ('Kuchlanish','110-240V'),('Kafolat','3 oy'),
+        ('🟡 Quvvat','10W — o\'rta daraja'),
+        ('🟡 Lazer dog\'i','0.08 mm (yuqori aniqlik)'),
+        ('🟡 Ishchi maydon','300 × 300 mm (kengaytiriladi 600×600mm)'),
+        ('🟡 Kesish','10mm yog\'och, 3mm akrilik'),
+        ('🟡 Air Assist','❌ Yo\'q (alohida)'),
+        ('─── Umumiy xususiyatlar ───',''),
+        ('Tezlik','30,000 mm/min'),
+        ('Og\'irlik','3.6 kg'),
+        ('Ulanish','WiFi + USB + TF karta'),
+        ('Dastur','LightBurn, LaserGRBL'),
+        ('Materiallar','Yog\'och, plastik, qog\'oz, teri, po\'lat (bo\'yalgan)'),
     ],
     'TTS 55 Pro': [
-        ('Quvvat','5.5W'),('Lazer turi','Diod 450nm'),
-        ('Ishchi maydon','418 × 418 mm'),('Maks tezlik','30,000 mm/min'),
-        ('Aniqlik','0.01 mm'),('Kontroller','32-bit ESP32 Pro V2.1'),
-        ('Ulanish','WiFi + USB'),('Dastur','LightBurn, LaserGRBL'),
-        ('Materiallar','Yog\'och, qog\'oz, teri, plastik, bambu'),
-        ('Og\'irlik','2.8 kg'),('Kuchlanish','110-240V'),('Kafolat','3 oy'),
+        ('🔴 Quvvat','5.5W — boshlang\'ich daraja'),
+        ('🔴 Lazer dog\'i','0.15 mm'),
+        ('🔴 Ishchi maydon','300 × 300 mm (kengaytiriladi 600×600mm)'),
+        ('🔴 Kesish','3mm yog\'och, 2mm akrilik'),
+        ('🔴 Air Assist','❌ Yo\'q (alohida)'),
+        ('─── Umumiy xususiyatlar ───',''),
+        ('Tezlik','30,000 mm/min'),
+        ('Og\'irlik','3.2 kg'),
+        ('Ulanish','WiFi + USB + TF karta'),
+        ('Dastur','LightBurn, LaserGRBL'),
+        ('Materiallar','Yog\'och, plastik, qog\'oz, teri, po\'lat (bo\'yalgan)'),
     ],
     'CNC3018 Pro': [
         ('Ishchi maydon','300 × 180 × 45 mm'),('Boshqaruv','GRBL'),
@@ -876,6 +887,40 @@ MENU_MAP = {
     "🔔 Eslatmalar": "eslatmalar",
     "📣 Reklama": "reklama_menu",
 }
+
+async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
+    """Menyu tugmasini tegishli bo'limga yo'naltiradi"""
+    action = MENU_MAP.get(msg)
+    if not action:
+        return False
+    if   action == 'stock':         await cmd_astatka(u, ctx)
+    elif action == 'today':         await cmd_bugun(u, ctx)
+    elif action == 'month':         await cmd_oy(u, ctx)
+    elif action == 'year':          await cmd_yil(u, ctx)
+    elif action == 'transit':       await cmd_yolda(u, ctx)
+    elif action == 'supplier_debt': await cmd_zavod_qarz(u, ctx)
+    elif action == 'prices':        await cmd_narxlar(u, ctx)
+    elif action == 'analiz':        await cmd_analiz(u, ctx)
+    elif action == 'customers':     await cmd_mijozlar(u, ctx)
+    elif action == 'debts':         await cmd_qarzlar(u, ctx)
+    elif action == 'expenses':      await cmd_xarajatlar(u, ctx)
+    elif action == 'target':        await cmd_maqsad(u, ctx)
+    elif action == 'warranties':    await cmd_kafolat(u, ctx)
+    elif action == 'trend':         await cmd_trend(u, ctx)
+    elif action == 'cashflow':      await cmd_cashflow(u, ctx)
+    elif action == 'olx':           await cmd_olx(u, ctx)
+    elif action == 'undo_list':     await cmd_undo_list(u, ctx)
+    elif action == 'kassa':         await cmd_kassa(u, ctx)
+    elif action == 'nelikvid':      await cmd_nelikvid(u, ctx)
+    elif action == 'eslatmalar':    await cmd_eslatmalar(u, ctx)
+    elif action == 'new_product':   await conv_start(u, ctx)
+    elif action == 'reklama_menu':
+        await u.message.reply_text(
+            "\U0001F4E3 *Reklama yuborish*\n\nFormat: `/reklama Xabar matni`\n\n"
+            "Misol:\n`/reklama Yangi TTS 20 Pro keldi!`",
+            parse_mode='Markdown')
+    return True
+
 
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
@@ -1654,45 +1699,14 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = u.message.text
     prods = get_products()
 
-    # Foto qo'shish rejimi
-    if ctx.user_data.get('photo_product_id'):
+    # Foto qo'shish rejimi (menyu tugmasi bosilsa rejimdan chiqadi)
+    if ctx.user_data.get('photo_product_id') and msg not in MENU_MAP:
         return
+    ctx.user_data.pop('photo_product_id', None)
 
     # Menyu tugmalari
     if msg in MENU_MAP:
-        action = MENU_MAP[msg]
-        class FakeUpd:
-            effective_user = u.effective_user
-            message = u.message
-            callback_query = None
-        fake = FakeUpd()
-        if action == 'stock': await cmd_astatka(fake, ctx)
-        elif action == 'today': await cmd_bugun(fake, ctx)
-        elif action == 'month': await cmd_oy(fake, ctx)
-        elif action == 'year': await cmd_yil(fake, ctx)
-        elif action == 'transit': await cmd_yolda(fake, ctx)
-        elif action == 'supplier_debt': await cmd_zavod_qarz(fake, ctx)
-        elif action == 'prices': await cmd_narxlar(fake, ctx)
-        elif action == 'analiz': await cmd_analiz(fake, ctx)
-        elif action == 'customers': await cmd_mijozlar(fake, ctx)
-        elif action == 'debts': await cmd_qarzlar(fake, ctx)
-        elif action == 'expenses': await cmd_xarajatlar(fake, ctx)
-        elif action == 'target': await cmd_maqsad(fake, ctx)
-        elif action == 'warranties': await cmd_kafolat(fake, ctx)
-        elif action == 'trend': await cmd_trend(fake, ctx)
-        elif action == 'cashflow': await cmd_cashflow(fake, ctx)
-        elif action == 'olx': await cmd_olx(fake, ctx)
-        elif action == 'new_product': await conv_start(fake, ctx)
-        elif action == 'undo_list': await cmd_undo_list(fake, ctx)
-        elif action == 'kassa': await cmd_kassa(fake, ctx)
-        elif action == 'nelikvid': await cmd_nelikvid(fake, ctx)
-        elif action == 'eslatmalar': await cmd_eslatmalar(fake, ctx)
-        elif action == 'reklama_menu':
-            await u.message.reply_text(
-                "📣 *Reklama yuborish*\n\n"
-                "Format: `/reklama Xabar matni`\n\n"
-                "Misol:\n`/reklama Yangi TTS 20 Pro keldi! $490 dan`",
-                parse_mode='Markdown')
+        await route_menu(u, ctx, msg)
         return
 
     # Oy tafsil: /oy_tafsil 2026-04
@@ -2488,6 +2502,28 @@ async def cmd_stock_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "_Hozirgi holat botda yangilandi!_",
         parse_mode='Markdown')
 
+
+# ── SUHBATDAN CHIQISH (menyu tugmasi bosilsa) ────────────────────
+async def conv_escape_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await cmd_start(u, ctx)
+    return ConversationHandler.END
+
+async def conv_escape_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await route_menu(u, ctx, u.message.text)
+    return ConversationHandler.END
+
+async def on_error(u: object, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("Xato:", exc_info=ctx.error)
+    try:
+        if isinstance(u, Update) and u.effective_message:
+            await u.effective_message.reply_text(
+                f"\u26a0\ufe0f Xato yuz berdi:\n`{str(ctx.error)[:250]}`",
+                parse_mode='Markdown')
+    except Exception:
+        pass
+
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN: raise ValueError("BOT_TOKEN yo'q!")
@@ -2521,7 +2557,11 @@ def main():
                 CommandHandler('tayyor', conv_finish),
             ],
         },
-        fallbacks=[CommandHandler('bekor', conv_cancel)],
+        fallbacks=[
+            CommandHandler('bekor', conv_cancel),
+            CommandHandler('start', conv_escape_start),
+            MessageHandler(filters.Text(list(MENU_MAP.keys())), conv_escape_menu),
+        ],
         allow_reentry=True,
     )
 
@@ -2568,6 +2608,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    app.add_error_handler(on_error)
     log.info("ThermoCrafts Bot v3.0 ishga tushdi! ✅")
     log.info(f"21 modul | {len(get_products())} mahsulot")
     app.run_polling(drop_pending_updates=True)
