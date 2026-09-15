@@ -796,7 +796,8 @@ MAHSULOTLAR:
 {plist}
 
 AMALLAR (to'liq ro'yxat):
-Sotish: {{"action":"sell","product":"nom","qty":1,"price":260,"discount":0,"customer":"","type":"B2C"}}
+Sotish: {{"action":"sell","product":"nom","qty":1,"price":260,"currency":"USD","discount":0,"customer":"","type":"B2C"}}
+MUHIM VALYUTA QOIDASI: narx DOIM dollarda beriladi. Agar foydalanuvchi som da aytsa (masalan "3 884 000", "3.8 mln", "5 mln som") -> "currency":"UZS" qoy va raqamni somda qoldir. Dollar belgisi yoki 5000 dan kichik son -> "currency":"USD".
 Tovar qoshish (keldi): {{"action":"add","product":"nom","qty":2}}
 Yangi tovar: {{"action":"new_product"}}
 Astatka: {{"action":"stock","cat":"Barchasi"}}
@@ -1431,7 +1432,7 @@ async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for op in ops:
         data = json.loads(op[4])
-        label = f"#{op[0]} {op[2]}: "
+        label = f"#{op[0]} [{str(op[1])[:16]}] {op[2]}: "
         if op[2] == 'sale': label += f"{data.get('product','')} {fmt(data.get('revenue',0))}"
         elif op[2] == 'expense': label += f"{data.get('note','')} {fmt(data.get('amount',0))}"
         elif op[2] == 'transit': label += f"{data.get('product','')} {fmt(data.get('total',0))}"
@@ -1730,6 +1731,14 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prod = find_product(parsed.get('product',''))
         qty = max(1, int(parsed.get('qty', 1)))
         price = float(parsed.get('price', 0))
+        # So'mda kiritilgan bo'lsa dollarga o'giramiz
+        cur = str(parsed.get('currency', 'USD')).upper()
+        uzs_note = ''
+        if price > 0 and (cur == 'UZS' or price >= 5000):
+            rate = get_exchange_rate()
+            uzs_sum = price
+            price = round(price / rate, 2)
+            uzs_note = f"\n\U0001F4B1 {uzs_sum:,.0f} so'm -> {fmt(price)} (kurs {rate:,.0f})"
         discount = float(parsed.get('discount', 0))
         customer = parsed.get('customer', '')
         ctype = parsed.get('type', 'B2C')
@@ -1742,7 +1751,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok, sale_id = save_sale(prod['id'], prod['name'], qty, price, prod['cost'], discount, customer, ctype)
         if ok:
             profit = (price - prod['cost']) * qty
-            disc_txt = f"\n🏷️ Chegirma: {discount}%" if discount else ""
+            disc_txt = (uzs_note or '') + (f"\n🏷️ Chegirma: {discount}%" if discount else "")
             cust_txt = f"\n👤 {customer} ({ctype})" if customer else ""
             await u.message.reply_text(
                 f"✅ *Sotuv qayd!*\n\n📦 {prod['name']}\n"
@@ -2524,6 +2533,23 @@ async def on_error(u: object, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+
+# ── MARKDOWN XATOSIDAN HIMOYA ────────────────────────────────────
+def _install_safe_reply():
+    """Markdown buzilsa, xabarni oddiy matn sifatida qayta yuboradi"""
+    from telegram import Message
+    _orig = Message.reply_text
+    async def safe_reply_text(self, text, *a, **kw):
+        try:
+            return await _orig(self, text, *a, **kw)
+        except Exception as e:
+            if "parse entities" in str(e).lower() or "parse_mode" in str(e).lower():
+                kw.pop('parse_mode', None)
+                clean = text.replace('*','').replace('_','').replace('`','')
+                return await _orig(self, clean, *a, **kw)
+            raise
+    Message.reply_text = safe_reply_text
+
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN: raise ValueError("BOT_TOKEN yo'q!")
@@ -2608,6 +2634,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    _install_safe_reply()
     app.add_error_handler(on_error)
     log.info("ThermoCrafts Bot v3.0 ishga tushdi! ✅")
     log.info(f"21 modul | {len(get_products())} mahsulot")
