@@ -449,7 +449,7 @@ def add_photo(product_id, file_id):
               (product_id, file_id, order))
     conn.commit(); conn.close()
 
-def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'):
+def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C', cash=True, method='naqd'):
     profit = (price - cost) * qty
     now = datetime.now()
     conn = db(); c = conn.cursor()
@@ -476,7 +476,9 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
                 c.execute('UPDATE customers SET total_purchases=total_purchases+?, last_purchase=? WHERE id=?',
                           (price*qty, now.strftime('%Y-%m-%d'), row[0]))
     conn.commit(); conn.close()
-    if ok: log_op('sale', {'sale_id':sale_id,'product':pname,'qty':qty,'price':price,'profit':profit})
+    if ok:
+        log_op('sale', {'sale_id':sale_id,'product':pname,'qty':qty,'price':price,'profit':profit})
+        if cash: add_cash(price*qty, 'kirim', 'sotuv', f'{pname} x{qty} (#{sale_id})', method)
     return ok, sale_id
 
 def reverse_sale(sale_id):
@@ -484,11 +486,15 @@ def reverse_sale(sale_id):
     c.execute('SELECT * FROM sales WHERE id=? AND reversed=0', (sale_id,))
     row = c.fetchone()
     if not row: conn.close(); return False
-    product, qty, cost = row[3], row[4], row[5]
+    product, qty, cost, revenue = row[3], row[4], row[5], row[6]
     c.execute('UPDATE sales SET reversed=1 WHERE id=?', (sale_id,))
     c.execute('UPDATE products SET qty=qty+? WHERE name=?', (qty, product))
     c.execute("UPDATE warranties SET status='cancelled' WHERE sale_id=?", (sale_id,))
     conn.commit(); conn.close()
+    c2 = db(); cc = c2.cursor()
+    cc.execute("SELECT COUNT(*) FROM cash_box WHERE note LIKE ?", (f'%(#{sale_id})',))
+    had_cash = cc.fetchone()[0] > 0; c2.close()
+    if had_cash: add_cash(revenue, 'chiqim', 'qaytarish', f'{product} bekor (#{sale_id})')
     return True
 
 def add_expense(amount, category, expense_type='period', note=''):
@@ -499,6 +505,7 @@ def add_expense(amount, category, expense_type='period', note=''):
     eid = c.lastrowid
     conn.commit(); conn.close()
     log_op('expense', {'id':eid,'amount':amount,'type':expense_type,'note':note})
+    add_cash(amount, 'chiqim', category, f'{note} (#x{eid})')
     return eid
 
 def add_transit(supplier, product, qty, unit_cost, deposit=0, bank_fee=0, delivery_fee=0, note=''):
@@ -888,6 +895,7 @@ def _undo_op(op_id: int):
         c2 = db(); cc = c2.cursor()
         cc.execute('UPDATE expenses SET reversed=1 WHERE id=?', (d.get('id', 0),))
         ok = cc.rowcount > 0; c2.commit(); c2.close()
+        if ok: add_cash(d.get('amount', 0), 'kirim', 'qaytarish', f"xarajat bekor (#x{d.get('id')})")
     if ok:
         c.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,)); conn.commit()
     conn.close()
@@ -1017,15 +1025,16 @@ async def execute_tool(name, inp, ctx=None):
             if disc > 0: price = round(price * (1 - disc / 100), 2)
             cust = inp.get("customer") or ""
             ctype = inp.get("customer_type") or "B2C"
-            ok, sale_id = save_sale(prod['id'], prod['name'], qty, price, prod['cost'], disc, cust, ctype)
+            on_credit = bool(inp.get("on_credit")) and bool(cust)
+            ok, sale_id = save_sale(prod['id'], prod['name'], qty, price, prod['cost'], disc, cust, ctype,
+                                    cash=not on_credit, method=inp.get("payment_method") or "naqd")
             if not ok: return _j({"error": "Saqlanmadi"})
             total = price * qty
             profit = (price - prod['cost']) * qty
-            if inp.get("on_credit") and cust:
+            if on_credit:
                 add_debt(cust, total, "berildi", f"nasiya: {prod['name']} x{qty}")
                 cash_note = "nasiya — kassaga tushmadi, debitor yozildi"
             else:
-                add_cash(total, "kirim", "sotuv", f"{prod['name']} x{qty}", inp.get("payment_method") or "naqd")
                 cash_note = "kassaga kirim yozildi"
             return _j({"ok": True, "sale_id": sale_id, "product": prod['name'], "qty": qty,
                        "unit_price": price, "total": total, "profit": profit,
@@ -1042,7 +1051,6 @@ async def execute_tool(name, inp, ctx=None):
             amt = float(inp.get("amount_usd", 0))
             if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
             eid = add_expense(amt, inp.get("category", "boshqa"), inp.get("expense_type", "period"), inp.get("note", ""))
-            add_cash(amt, "chiqim", inp.get("category", "xarajat"), inp.get("note", ""))
             return _j({"ok": True, "expense_id": eid, "amount": amt, "cash_balance": get_cash_balance()})
 
         if name == "record_cash":
@@ -2250,6 +2258,7 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             c2.execute('UPDATE expenses SET reversed=1 WHERE id=?', (op_data.get('id',0),))
             ok = c2.rowcount > 0
             conn2.commit(); conn2.close()
+            if ok: add_cash(op_data.get('amount',0), 'kirim', 'qaytarish', f"xarajat bekor (#x{op_data.get('id')})")
         if ok:
             c.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,))
             conn.commit()
