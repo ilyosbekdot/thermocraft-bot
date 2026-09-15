@@ -3,7 +3,7 @@
 ThermoCrafts Biznes Bot v3.0
 21 Modul | IAS 2 | ABC/XYZ CV | Katalog | Kafolat | Marketing
 """
-import os, json, sqlite3, logging, math, re, requests, base64
+import os, json, sqlite3, logging, math, re, requests, base64, asyncio
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -862,6 +862,586 @@ QOIDALAR:
     return {'action':'unknown','reply':'Tushunmadim 🤔\n/yordam buyrug\'ini ko\'ring'}
 
 
+
+# ══════════════════════════════════════════════════════════════════
+# AI AGENT — to'liq sun'iy intellekt rejimi (tool-use)
+# ══════════════════════════════════════════════════════════════════
+AI_MODE  = os.getenv('AI_MODE', 'agent')          # 'agent' yoki 'parse'
+AI_MODEL = os.getenv('AI_MODEL', 'claude-sonnet-5')
+AI_HISTORY = {}          # user_id -> [messages]
+AI_HISTORY_MAX = 20      # 10 ta savol-javob
+
+def _j(obj):
+    """Tool natijasini ixcham JSON ga aylantiradi"""
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+def _undo_op(op_id: int):
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT * FROM op_log WHERE id=? AND reversed=0', (op_id,))
+    op = c.fetchone()
+    if not op:
+        conn.close(); return False, "Topilmadi yoki allaqachon qaytarilgan"
+    d = json.loads(op[4]); ok = False
+    if op[3] == 'sale':
+        ok = reverse_sale(d.get('sale_id', 0))
+    elif op[3] == 'expense':
+        c2 = db(); cc = c2.cursor()
+        cc.execute('UPDATE expenses SET reversed=1 WHERE id=?', (d.get('id', 0),))
+        ok = cc.rowcount > 0; c2.commit(); c2.close()
+    if ok:
+        c.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,)); conn.commit()
+    conn.close()
+    return ok, ("qaytarildi" if ok else "qaytarib bo'lmadi")
+
+# ── Asboblar ro'yxati ────────────────────────────────────────────
+AI_TOOLS = [
+    {"name": "get_stock",
+     "description": "Astatka: barcha mahsulotlar, soni, sebest, narx, yetkazuvchi. Nomi bo'yicha qidirish uchun ham ishlatiladi.",
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Ixtiyoriy: nom yoki kategoriya bo'yicha filtr"}}}},
+    {"name": "record_sale",
+     "description": "Sotuvni qayd qiladi: astatkani kamaytiradi, kassaga naqd kirim yozadi, foyda hisoblaydi.",
+     "input_schema": {"type": "object", "required": ["product", "qty"], "properties": {
+         "product": {"type": "string", "description": "Mahsulot nomi (astatkadagi kabi)"},
+         "qty": {"type": "integer"},
+         "price_usd": {"type": "number", "description": "Dona narxi dollarda. 0 bo'lsa ro'yxat narxi olinadi"},
+         "price_uzs": {"type": "number", "description": "Agar so'mda aytilgan bo'lsa — dona narxi so'mda"},
+         "discount_pct": {"type": "number", "default": 0},
+         "customer": {"type": "string", "default": ""},
+         "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "default": "B2C"},
+         "on_credit": {"type": "boolean", "default": False, "description": "Nasiya bo'lsa true — kassaga tushmaydi, debitor yoziladi"},
+         "payment_method": {"type": "string", "enum": ["naqd", "karta", "payme", "click", "otkazma"], "default": "naqd"}}}},
+    {"name": "add_stock",
+     "description": "Tovar keldi — astatkaga qo'shadi.",
+     "input_schema": {"type": "object", "required": ["product", "qty"], "properties": {
+         "product": {"type": "string"}, "qty": {"type": "integer"}}}},
+    {"name": "record_expense",
+     "description": "Xarajat yozadi va kassadan chiqim qiladi.",
+     "input_schema": {"type": "object", "required": ["amount_usd", "category"], "properties": {
+         "amount_usd": {"type": "number"},
+         "category": {"type": "string", "description": "reklama, transport, bank, ijara, boshqa..."},
+         "expense_type": {"type": "string", "enum": ["period", "cogs_bank", "cogs_delivery"], "default": "period"},
+         "note": {"type": "string", "default": ""}}}},
+    {"name": "record_cash",
+     "description": "Kassaga kirim yoki chiqim (sotuv/xarajatdan tashqari: qarz qaytdi, shaxsiy oldi va h.k.)",
+     "input_schema": {"type": "object", "required": ["amount_usd", "direction"], "properties": {
+         "amount_usd": {"type": "number"},
+         "direction": {"type": "string", "enum": ["kirim", "chiqim"]},
+         "method": {"type": "string", "default": "naqd"},
+         "note": {"type": "string", "default": ""}}}},
+    {"name": "get_cash",
+     "description": "Kassa qoldig'i va oxirgi operatsiyalar.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_report",
+     "description": "Hisobot: tushum, tannarx, foyda, sotilgan mahsulotlar. period: today | month | year",
+     "input_schema": {"type": "object", "required": ["period"], "properties": {
+         "period": {"type": "string", "enum": ["today", "month", "year"]},
+         "month": {"type": "string", "description": "YYYY-MM (period=month bo'lsa)"},
+         "year": {"type": "string", "description": "YYYY (period=year bo'lsa)"}}}},
+    {"name": "get_sales_list",
+     "description": "Oxirgi sotuvlar ro'yxati (sana, mahsulot, narx, mijoz).",
+     "input_schema": {"type": "object", "properties": {
+         "days": {"type": "integer", "default": 7},
+         "product": {"type": "string", "description": "Ixtiyoriy filtr"}}}},
+    {"name": "get_expenses_list",
+     "description": "Xarajatlar ro'yxati (oy bo'yicha).",
+     "input_schema": {"type": "object", "properties": {
+         "month": {"type": "string", "description": "YYYY-MM, bo'sh bo'lsa joriy oy"}}}},
+    {"name": "get_last_operations",
+     "description": "Oxirgi operatsiyalar (bekor qilish uchun id lar bilan).",
+     "input_schema": {"type": "object", "properties": {"n": {"type": "integer", "default": 8}}}},
+    {"name": "undo_operation",
+     "description": "Operatsiyani bekor qiladi (sotuv yoki xarajat). get_last_operations dan id oling.",
+     "input_schema": {"type": "object", "required": ["op_id"], "properties": {"op_id": {"type": "integer"}}}},
+    {"name": "get_debts",
+     "description": "Debitor/kreditorlik: kim bizga qarz, biz kimga qarz. Zavod qarzi ham.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "add_debt",
+     "description": "Qarz yozish. type: 'berildi' = biz berdik (u bizga qarz), 'olindi' = biz oldik (biz qarz).",
+     "input_schema": {"type": "object", "required": ["person", "amount_usd", "type"], "properties": {
+         "person": {"type": "string"}, "amount_usd": {"type": "number"},
+         "type": {"type": "string", "enum": ["berildi", "olindi"]},
+         "note": {"type": "string", "default": ""}}}},
+    {"name": "get_transit",
+     "description": "Yo'ldagi tovarlar va zavod qarzi.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_analytics",
+     "description": "Tahlil: abc_xyz | nelikvid | trend | cashflow",
+     "input_schema": {"type": "object", "required": ["kind"], "properties": {
+         "kind": {"type": "string", "enum": ["abc_xyz", "nelikvid", "trend", "cashflow"]}}}},
+    {"name": "get_customers",
+     "description": "Mijozlar ro'yxati.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "add_customer",
+     "description": "Yangi mijoz qo'shish.",
+     "input_schema": {"type": "object", "required": ["name"], "properties": {
+         "name": {"type": "string"}, "phone": {"type": "string", "default": ""},
+         "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "default": "B2C"},
+         "notes": {"type": "string", "default": ""}}}},
+    {"name": "get_rate",
+     "description": "Joriy USD/UZS kursi (CBU).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "update_price",
+     "description": "Mahsulot sotish narxini o'zgartirish.",
+     "input_schema": {"type": "object", "required": ["product", "new_price_usd"], "properties": {
+         "product": {"type": "string"}, "new_price_usd": {"type": "number"}}}},
+    {"name": "post_channel",
+     "description": "Telegram kanalga post yuborish. Faqat foydalanuvchi aniq so'raganda.",
+     "input_schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}},
+]
+
+# ── Asboblarni bajarish ──────────────────────────────────────────
+async def execute_tool(name, inp, ctx=None):
+    try:
+        if name == "get_stock":
+            q = (inp.get("query") or "").lower()
+            ps = get_products()
+            if q:
+                ps = [p for p in ps if q in p['name'].lower() or q in p['cat'].lower() or q in p['sup'].lower()]
+            return _j([{"id": p['id'], "name": p['name'], "cat": p['cat'], "supplier": p['sup'],
+                        "qty": p['qty'], "cost": p['cost'], "price": p['price']} for p in ps])
+
+        if name == "record_sale":
+            prod = find_product(inp.get("product", ""))
+            if not prod: return _j({"error": f"Mahsulot topilmadi: {inp.get('product')}"})
+            qty = max(1, int(inp.get("qty", 1)))
+            if prod['qty'] < qty:
+                return _j({"error": f"Yetarli emas: {prod['name']} faqat {prod['qty']} ta"})
+            price = float(inp.get("price_usd") or 0)
+            uzs = float(inp.get("price_uzs") or 0)
+            rate = get_exchange_rate()
+            if uzs > 0: price = round(uzs / rate, 2)
+            if price <= 0: price = prod['price']
+            if price >= 5000: price = round(price / rate, 2)   # so'mni dollar deb yozmasin
+            disc = float(inp.get("discount_pct") or 0)
+            if disc > 0: price = round(price * (1 - disc / 100), 2)
+            cust = inp.get("customer") or ""
+            ctype = inp.get("customer_type") or "B2C"
+            ok, sale_id = save_sale(prod['id'], prod['name'], qty, price, prod['cost'], disc, cust, ctype)
+            if not ok: return _j({"error": "Saqlanmadi"})
+            total = price * qty
+            profit = (price - prod['cost']) * qty
+            if inp.get("on_credit") and cust:
+                add_debt(cust, total, "berildi", f"nasiya: {prod['name']} x{qty}")
+                cash_note = "nasiya — kassaga tushmadi, debitor yozildi"
+            else:
+                add_cash(total, "kirim", "sotuv", f"{prod['name']} x{qty}", inp.get("payment_method") or "naqd")
+                cash_note = "kassaga kirim yozildi"
+            return _j({"ok": True, "sale_id": sale_id, "product": prod['name'], "qty": qty,
+                       "unit_price": price, "total": total, "profit": profit,
+                       "remaining_qty": prod['qty'] - qty, "cash": cash_note,
+                       "uzs_total": round(total * rate)})
+
+        if name == "add_stock":
+            prod = find_product(inp.get("product", ""))
+            if not prod: return _j({"error": "Mahsulot topilmadi"})
+            add_qty(prod['id'], int(inp.get("qty", 1)))
+            return _j({"ok": True, "product": prod['name'], "new_qty": prod['qty'] + int(inp.get("qty", 1))})
+
+        if name == "record_expense":
+            amt = float(inp.get("amount_usd", 0))
+            if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
+            eid = add_expense(amt, inp.get("category", "boshqa"), inp.get("expense_type", "period"), inp.get("note", ""))
+            add_cash(amt, "chiqim", inp.get("category", "xarajat"), inp.get("note", ""))
+            return _j({"ok": True, "expense_id": eid, "amount": amt, "cash_balance": get_cash_balance()})
+
+        if name == "record_cash":
+            amt = float(inp.get("amount_usd", 0))
+            if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
+            add_cash(amt, inp.get("direction", "kirim"), "boshqa", inp.get("note", ""), inp.get("method", "naqd"))
+            return _j({"ok": True, "cash_balance": get_cash_balance()})
+
+        if name == "get_cash":
+            hist = get_cash_history()[:8]
+            return _j({"balance": get_cash_balance(),
+                       "recent": [{"date": r[1], "type": r[3], "amount": r[4], "note": r[6]} for r in hist]})
+
+        if name == "get_report":
+            p = inp.get("period", "today")
+            if p == "today": f = today()
+            elif p == "month": f = inp.get("month") or this_month()
+            else: f = inp.get("year") or datetime.now().strftime('%Y')
+            sales = get_sales(f); exps = get_expenses(f)
+            rev = sum(s[6] for s in sales); cogs = sum(s[5] * s[4] for s in sales)
+            exp_total = sum(e[2] for e in exps)
+            by_prod = defaultdict(lambda: [0, 0.0])
+            for s in sales: by_prod[s[3]][0] += s[4]; by_prod[s[3]][1] += s[6]
+            return _j({"period": f, "revenue": rev, "cogs": cogs, "gross_profit": rev - cogs,
+                       "expenses": exp_total, "net_profit": rev - cogs - exp_total,
+                       "sales_count": len(sales),
+                       "by_product": [{"product": k, "qty": v[0], "revenue": v[1]} for k, v in by_prod.items()]})
+
+        if name == "get_sales_list":
+            days = int(inp.get("days", 7))
+            since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            conn = db(); c = conn.cursor()
+            c.execute("SELECT date,product,qty,revenue,profit,customer FROM sales WHERE date>=? AND reversed=0 ORDER BY id DESC LIMIT 40", (since,))
+            rows = c.fetchall(); conn.close()
+            pf = (inp.get("product") or "").lower()
+            if pf: rows = [r for r in rows if pf in r[1].lower()]
+            return _j([{"date": r[0], "product": r[1], "qty": r[2], "revenue": r[3], "profit": r[4], "customer": r[5]} for r in rows])
+
+        if name == "get_expenses_list":
+            m = inp.get("month") or this_month()
+            return _j([{"date": e[1], "amount": e[2], "category": e[3], "type": e[4], "note": e[5]} for e in get_expenses(m)])
+
+        if name == "get_last_operations":
+            ops = get_last_ops(int(inp.get("n", 8)))
+            return _j([{"op_id": o[0], "when": o[1], "type": o[3], "data": json.loads(o[4])} for o in ops])
+
+        if name == "undo_operation":
+            ok, msg = _undo_op(int(inp.get("op_id", 0)))
+            return _j({"ok": ok, "message": msg})
+
+        if name == "get_debts":
+            conn = db(); c = conn.cursor()
+            c.execute("SELECT date,person,amount,type,note FROM debts WHERE paid=0 ORDER BY id DESC")
+            debts = c.fetchall()
+            c.execute("SELECT supplier,product,remaining,status FROM transit WHERE remaining>0")
+            fac = c.fetchall(); conn.close()
+            return _j({"receivable_they_owe_us": [{"date": d[0], "person": d[1], "amount": d[2], "note": d[4]} for d in debts if d[3] == 'berildi'],
+                       "payable_we_owe": [{"date": d[0], "person": d[1], "amount": d[2], "note": d[4]} for d in debts if d[3] == 'olindi'],
+                       "factory_debt": [{"supplier": f[0], "item": f[1], "remaining": f[2]} for f in fac]})
+
+        if name == "add_debt":
+            amt = float(inp.get("amount_usd", 0))
+            if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
+            add_debt(inp.get("person", ""), amt, inp.get("type", "berildi"), inp.get("note", ""))
+            return _j({"ok": True})
+
+        if name == "get_transit":
+            conn = db(); c = conn.cursor()
+            c.execute("SELECT id,date,supplier,product,qty,unit_cost,total_cost,deposit,remaining,status FROM transit WHERE status IN ('yolda','qarz') ORDER BY id DESC")
+            rows = c.fetchall(); conn.close()
+            return _j([{"id": r[0], "date": r[1], "supplier": r[2], "product": r[3], "qty": r[4],
+                        "unit_cost": r[5], "total": r[6], "deposit": r[7], "remaining": r[8], "status": r[9]} for r in rows])
+
+        if name == "get_analytics":
+            k = inp.get("kind")
+            if k == "abc_xyz": return _j(abc_xyz_analysis())
+            if k == "nelikvid": return _j(get_nelikvid(60))
+            if k == "trend":
+                months, change = get_sales_trend(); return _j({"months": months, "change_pct": change})
+            if k == "cashflow": return _j(cash_flow_forecast())
+            return _j({"error": "noma'lum kind"})
+
+        if name == "get_customers":
+            conn = db(); c = conn.cursor()
+            c.execute("SELECT name,phone,type,total_purchases,notes FROM customers ORDER BY total_purchases DESC LIMIT 30")
+            rows = c.fetchall(); conn.close()
+            return _j([{"name": r[0], "phone": r[1], "type": r[2], "total": r[3], "notes": r[4]} for r in rows])
+
+        if name == "add_customer":
+            add_customer(inp.get("name", ""), inp.get("phone", ""), inp.get("customer_type", "B2C"), inp.get("notes", ""))
+            return _j({"ok": True})
+
+        if name == "get_rate":
+            return _j({"usd_uzs": get_exchange_rate(), "source": "cbu.uz"})
+
+        if name == "update_price":
+            prod = find_product(inp.get("product", ""))
+            if not prod: return _j({"error": "Mahsulot topilmadi"})
+            update_product(prod['id'], price=float(inp.get("new_price_usd", prod['price'])))
+            return _j({"ok": True, "product": prod['name'], "old": prod['price'], "new": inp.get("new_price_usd")})
+
+        if name == "post_channel":
+            if ctx is None: return _j({"error": "ctx yo'q"})
+            ok = await post_to_channel(ctx, inp.get("text", ""))
+            return _j({"ok": ok})
+
+        return _j({"error": f"Noma'lum asbob: {name}"})
+    except Exception as e:
+        log.exception("tool error")
+        return _j({"error": str(e)[:200]})
+
+# ── Agent tsikli ─────────────────────────────────────────────────
+def _ai_system_prompt():
+    rate = get_exchange_rate()
+    return f"""Siz ThermoCrafts (Yunusobod, Toshkent) biznes yordamchisisiz. Egasi — Ilyosbek.
+Biznes: Two Trees lazer/CNC, Freesub termopress, sublimatsiya qog'ozlari. Sotuv OLX.uz va Telegram orqali.
+Bugun: {datetime.now().strftime('%d.%m.%Y %H:%M')}. Kurs: 1 USD = {rate:,.0f} so'm.
+
+QOIDALAR:
+1. Har doim o'zbek tilida, qisqa va aniq javob bering. Telegram Markdown ishlatmang — oddiy matn, emoji mumkin.
+2. Pul birligi — dollar. Foydalanuvchi so'mda aytsa (mln, so'm, 5000 dan katta raqam) — price_uzs/amount ga so'mni bering, asbob o'zi o'giradi. Javobda ikkala valyutani ko'rsating.
+3. Sotuv/xarajat/qarz kabi YOZUV amallarini bajarishdan oldin ma'lumot yetarli bo'lsa DARHOL bajaring, so'ng nima qilganingizni bir-ikki qatorda tasdiqlang. Faqat mahsulot yoki summa aniq bo'lmasa savol bering.
+4. Mahsulot nomini foydalanuvchi qisqa yozsa (tts20, cnc, 15in1) — get_stock bilan toping, taxmin qilmang.
+5. "sotilmadi", "ketmadi" — bu SOTUV EMAS. Inkorni to'g'ri tushuning.
+6. Savolga javob berish uchun kerak bo'lsa bir nechta asbobni ketma-ket chaqiring va o'zingiz hisoblang.
+7. Xato bo'lsa (asbob error qaytarsa) — sababini tushuntiring va nima qilishni taklif qiling.
+8. Bekor qilish so'ralsa: avval get_last_operations, keyin undo_operation.
+9. Raqamlarni o'qish oson formatda yozing: $1,250 / 14,700,000 so'm.
+"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# MIRA-USLUBI: doimiy xotira, xarakter, proaktiv xabarlar, vision
+# ══════════════════════════════════════════════════════════════════
+AI_NAME   = os.getenv('AI_NAME', 'Aida')
+AI_WEB    = os.getenv('AI_WEB', '1') == '1'          # internetdan qidirish
+TZ_OFFSET = int(os.getenv('TZ_OFFSET', '5'))         # Toshkent UTC+5
+BRIEF_MORNING = os.getenv('BRIEF_MORNING', '09:00')  # ertalabki xulosa
+BRIEF_EVENING = os.getenv('BRIEF_EVENING', '21:00')  # kechki xulosa
+_WEB_OK = {'v': AI_WEB}
+
+def _local_now():
+    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+
+# ── Doimiy xotira (SQLite) ───────────────────────────────────────
+def init_ai_tables():
+    conn = db(); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS ai_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        role TEXT, content TEXT, ts TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ai_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT,
+        category TEXT DEFAULT 'umumiy', created TEXT, active INTEGER DEFAULT 1)''')
+    conn.commit(); conn.close()
+
+def mem_add(fact, category='umumiy'):
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT id FROM ai_memory WHERE active=1 AND lower(fact)=lower(?)', (fact.strip(),))
+    if c.fetchone(): conn.close(); return None
+    c.execute('INSERT INTO ai_memory (fact,category,created) VALUES (?,?,?)',
+              (fact.strip(), category, today()))
+    mid = c.lastrowid; conn.commit(); conn.close(); return mid
+
+def mem_list(limit=60):
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT id,fact,category,created FROM ai_memory WHERE active=1 ORDER BY id DESC LIMIT ?', (limit,))
+    rows = c.fetchall(); conn.close(); return rows
+
+def mem_forget(mid):
+    conn = db(); c = conn.cursor()
+    c.execute('UPDATE ai_memory SET active=0 WHERE id=?', (mid,))
+    ok = c.rowcount > 0; conn.commit(); conn.close(); return ok
+
+def hist_load(user_id, n=AI_HISTORY_MAX):
+    """Oxirgi n xabarni bazadan yuklaydi (faqat matn — tool bloklari saqlanmaydi)"""
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT role,content FROM ai_messages WHERE user_id=? ORDER BY id DESC LIMIT ?', (user_id, n))
+    rows = c.fetchall()[::-1]; conn.close()
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
+def hist_save(user_id, role, text):
+    conn = db(); c = conn.cursor()
+    c.execute('INSERT INTO ai_messages (user_id,role,content,ts) VALUES (?,?,?,?)',
+              (user_id, role, text, _local_now().strftime('%Y-%m-%d %H:%M')))
+    conn.commit(); conn.close()
+
+def hist_clear(user_id):
+    conn = db(); c = conn.cursor()
+    c.execute('DELETE FROM ai_messages WHERE user_id=?', (user_id,))
+    conn.commit(); conn.close()
+
+# ── Xotira asboblari ────────────────────────────────────────────
+AI_TOOLS += [
+    {"name": "remember",
+     "description": "Muhim faktni doimiy xotiraga yozadi (mijoz haqida, egasining odati, qaror, narx siyosati, eslatma). Suhbat tugasa ham saqlanadi.",
+     "input_schema": {"type": "object", "required": ["fact"], "properties": {
+         "fact": {"type": "string", "description": "Qisqa, aniq fakt. Masalan: 'Alisher — zargar, B2B, har oy 1-2 ta TTS oladi'"},
+         "category": {"type": "string", "enum": ["mijoz", "egasi", "qaror", "narx", "eslatma", "umumiy"], "default": "umumiy"}}}},
+    {"name": "forget",
+     "description": "Xotiradan faktni o'chiradi (id bo'yicha).",
+     "input_schema": {"type": "object", "required": ["memory_id"], "properties": {"memory_id": {"type": "integer"}}}},
+    {"name": "list_memory",
+     "description": "Doimiy xotiradagi barcha faktlar (id bilan).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "set_reminder",
+     "description": "Eslatma qo'yadi — belgilangan sanada ertalabki xulosada chiqadi.",
+     "input_schema": {"type": "object", "required": ["text", "date"], "properties": {
+         "text": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD"}}}},
+]
+
+async def _execute_tool_mira(name, inp, ctx=None):
+    if name == "remember":
+        mid = mem_add(inp.get("fact", ""), inp.get("category", "umumiy"))
+        return _j({"ok": True, "id": mid, "note": "allaqachon bor" if mid is None else "saqlandi"})
+    if name == "forget":
+        return _j({"ok": mem_forget(int(inp.get("memory_id", 0)))})
+    if name == "list_memory":
+        return _j([{"id": r[0], "fact": r[1], "category": r[2], "created": r[3]} for r in mem_list()])
+    if name == "set_reminder":
+        mid = mem_add(f"[{inp.get('date')}] {inp.get('text','')}", "eslatma")
+        return _j({"ok": True, "id": mid})
+    return None
+
+# ── Xarakter + xotira bilan system prompt ───────────────────────
+def _mira_system_prompt():
+    rate = get_exchange_rate()
+    mem = mem_list(60)
+    mem_txt = "\n".join(f"- (#{r[0]}, {r[2]}) {r[1]}" for r in mem) if mem else "- (hali bo'sh)"
+    return f"""Siz — {AI_NAME}, ThermoCrafts (Yunusobod, Toshkent) biznesining shaxsiy AI hamkori. Egasi — Ilyosbek.
+Biznes: Two Trees lazer/CNC, Freesub termopress, AlgoLaser, sublimatsiya qog'ozlari. Sotuv OLX.uz, Telegram kanal, B2B.
+Hozir: {_local_now().strftime('%d.%m.%Y %H:%M')} (Toshkent). Kurs: 1 USD = {rate:,.0f} so'm.
+
+XARAKTER:
+- Siz chatbot emas, biznes-sherik. O'z fikringiz bor: raqam ko'rsangiz — xulosa chiqaring, xato ko'rsangiz — ayting.
+- Qisqa, aniq, do'stona. Bo'sh maqtov yo'q. Egasiga "siz" deb murojaat qiling.
+- O'zbek tilida. Telegram Markdown ishlatmang (yulduzcha, pastki chiziq yo'q) — oddiy matn + emoji.
+
+DOIMIY XOTIRA (siz oldin eslab qolganlar):
+{mem_txt}
+
+XOTIRA QOIDALARI:
+- Egasi mijoz, odat, qaror yoki muhim narsa aytsa — darhol `remember` bilan yozing (so'ramasdan). Masalan: yangi mijoz kim, qaysi narxga kelishildi, egasi qachon ishlamaydi.
+- Eslab qolganingizni javobda bir so'z bilan ko'rsating: "(eslab qoldim)".
+- Xotiradagi fakt eskirgan bo'lsa — `forget` qiling va yangisini yozing.
+
+ISH QOIDALARI:
+1. Pul birligi — dollar. So'mda aytilsa (mln, so'm, 5000+ raqam) — price_uzs/amount ga so'mni bering, asbob o'giradi. Javobda ikkala valyutani ko'rsating.
+2. Sotuv/xarajat/qarz YOZUV amallari: ma'lumot yetarli bo'lsa darhol bajaring, keyin 1-2 qatorda tasdiqlang. Faqat mahsulot yoki summa aniq bo'lmasa so'rang.
+3. Qisqa nomlar (tts20, cnc, 15in1) — get_stock bilan toping, taxmin qilmang.
+4. "sotilmadi", "ketmadi" — bu sotuv EMAS.
+5. Kerak bo'lsa bir nechta asbobni ketma-ket chaqiring va o'zingiz hisoblang.
+6. Bekor qilish: avval get_last_operations, keyin undo_operation.
+7. Internetdan ma'lumot kerak bo'lsa (raqobatchi narxi, texnik xususiyat, yangi model) — web_search ishlating va manbani ayting.
+8. Raqamlar: $1,250 / 14,700,000 so'm.
+9. Egasi rasm yuborsa: chek bo'lsa — xarajat yozing; mahsulot bo'lsa — qaysi mahsulot ekanini ayting; boshqa bo'lsa — tavsiflab so'rang.
+"""
+
+def _all_tools():
+    tools = list(AI_TOOLS)
+    if _WEB_OK['v']:
+        tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 3})
+    return tools
+
+# ── Yangi agent tsikli (doimiy xotira + rasm) ───────────────────
+async def ai_agent(user_id: int, user_msg, ctx=None, persist=True) -> str:
+    """user_msg: matn yoki content-bloklar ro'yxati (rasm uchun)"""
+    history = hist_load(user_id)
+    messages = history + [{"role": "user", "content": user_msg}]
+    save_text = user_msg if isinstance(user_msg, str) else "[rasm] " + next(
+        (b.get("text", "") for b in user_msg if isinstance(b, dict) and b.get("type") == "text"), "")
+    final_text = ""
+    for _ in range(7):
+        try:
+            resp = await asyncio.to_thread(
+                ai.messages.create, model=AI_MODEL, max_tokens=1500,
+                system=_mira_system_prompt(), tools=_all_tools(), messages=messages)
+        except Exception as e:
+            if _WEB_OK['v'] and 'web_search' in str(e).lower():
+                _WEB_OK['v'] = False
+                log.warning("web_search o'chirildi: %s", e)
+                continue
+            raise
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":
+            final_text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            break
+        results = []
+        for b in resp.content:
+            if getattr(b, "type", "") != "tool_use": continue
+            out = await _execute_tool_mira(b.name, b.input or {}, ctx)
+            if out is None: out = await execute_tool(b.name, b.input or {}, ctx)
+            log.info(f"AI tool {b.name}: {str(b.input)[:100]} -> {out[:100]}")
+            results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+        messages.append({"role": "user", "content": results})
+    else:
+        final_text = "Juda ko'p qadam bo'ldi — savolni qisqaroq qiling."
+    if not final_text: final_text = "Bajarildi."
+    if persist:
+        hist_save(user_id, "user", save_text)
+        hist_save(user_id, "assistant", final_text)
+    return final_text
+
+async def cmd_ai_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    hist_clear(u.effective_user.id)
+    await u.message.reply_text(f"🧹 Suhbat tozalandi. Doimiy xotira saqlanib qoldi (/xotira).")
+
+async def cmd_xotira(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    mem = mem_list(60)
+    if not mem:
+        await u.message.reply_text(f"🧠 {AI_NAME} xotirasi hali bo'sh. Suhbatda mijoz, qaror, odatlaringizni ayting — eslab qoladi."); return
+    text = f"🧠 {AI_NAME} XOTIRASI ({len(mem)} ta)\n\n"
+    for r in mem: text += f"#{r[0]} [{r[2]}] {r[1]}\n"
+    text += "\nO'chirish: \"#12 ni unut\" deb yozing."
+    await u.message.reply_text(text)
+
+# ── Rasm → AI (vision) ───────────────────────────────────────────
+async def handle_photo_ai(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Rasm: caption'da 'kanal'/'post' bo'lsa — kanalga; aks holda AI tahlil qiladi"""
+    if not is_owner(u): return
+    cap = (u.message.caption or "").strip()
+    if any(w in cap.lower() for w in ("kanal", "post", "e'lon", "elon")):
+        return await handle_photo_post(u, ctx)
+    if ctx.user_data.get('photo_product_id'):
+        return await handle_photo(u, ctx)
+    await ctx.bot.send_chat_action(chat_id=u.effective_chat.id, action='typing')
+    try:
+        f = await ctx.bot.get_file(u.message.photo[-1].file_id)
+        raw = await f.download_as_bytearray()
+        b64 = base64.b64encode(bytes(raw)).decode()
+        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                   {"type": "text", "text": cap or "Bu rasmda nima? Kerak bo'lsa tegishli amalni bajaring."}]
+        reply = await ai_agent(u.effective_user.id, content, ctx)
+    except Exception as e:
+        log.exception("photo ai"); reply = f"⚠️ Rasmni o'qiy olmadim: {str(e)[:150]}"
+    await u.message.reply_text(reply)
+
+# ── Proaktiv xabarlar (ertalab / kechqurun) ─────────────────────
+async def _briefing(app, kind):
+    try:
+        rate = get_exchange_rate()
+        bal = get_cash_balance()
+        if kind == 'morning':
+            y = (_local_now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            ys = get_sales(y); yrev = sum(s[6] for s in ys); yprof = sum(s[7] for s in ys)
+            low = [p['name'] for p in get_products() if 0 < p['qty'] <= 1]
+            out = [p['name'] for p in get_products() if p['qty'] == 0 and p['id'] <= 21]
+            nel = get_nelikvid(60)
+            rem = [r for r in mem_list(60) if r[2] == 'eslatma' and r[1].startswith(f"[{today()}]")]
+            head = (f"☀️ Xayrli tong! {_local_now().strftime('%d.%m.%Y')}\n\n"
+                    f"💵 Kassa: {fmt(bal)} (~{bal*rate:,.0f} so'm)\n"
+                    f"📊 Kecha: {len(ys)} ta sotuv, {fmt(yrev)} tushum, {fmt(yprof)} foyda\n")
+            if low: head += f"⚠️ 1 ta qoldi: {', '.join(low[:6])}\n"
+            if out: head += f"🔴 Tugagan: {', '.join(out[:6])}\n"
+            if nel: head += f"❄️ 2+ oy sotilmagan: {len(nel)} ta ({', '.join(x['name'] for x in nel[:3])}...)\n"
+            if rem: head += "🔔 Bugun: " + "; ".join(r[1].split('] ', 1)[-1] for r in rem) + "\n"
+            prompt = ("Bu ertalabki xulosa. Egasiga 2-3 qatorda o'z fikringizni ayting: bugun nimaga e'tibor berish kerak. "
+                      "Raqamlarni takrorlamang, xulosa chiqaring.\n\n" + head)
+        else:
+            ts = get_sales(today()); trev = sum(s[6] for s in ts); tprof = sum(s[7] for s in ts)
+            m = get_sales(this_month()); mrev = sum(s[6] for s in m)
+            head = (f"🌙 Kun yakuni {_local_now().strftime('%d.%m')}\n\n"
+                    f"📦 Bugun: {len(ts)} ta sotuv — {fmt(trev)} / foyda {fmt(tprof)}\n"
+                    f"📈 Oy boshidan: {fmt(mrev)}\n💵 Kassa: {fmt(bal)}\n")
+            if ts: head += "• " + "\n• ".join(f"{s[3]} ×{s[4]} = {fmt(s[6])}" for s in ts[:8]) + "\n"
+            prompt = "Bu kechki xulosa. 1-2 qator izoh: kun qanday o'tdi, ertaga nima qilish kerak.\n\n" + head
+        try:
+            comment = await ai_agent(OWNER_ID, prompt, None, persist=False)
+        except Exception as e:
+            comment = ""
+            log.warning("briefing AI: %s", e)
+        text = head + ("\n💬 " + comment if comment else "")
+        await app.bot.send_message(chat_id=OWNER_ID, text=text)
+    except Exception:
+        log.exception("briefing")
+
+async def _scheduler(app):
+    log.info("Proaktiv xabarlar yoqildi: %s / %s (UTC%+d)", BRIEF_MORNING, BRIEF_EVENING, TZ_OFFSET)
+    sent = set()
+    while True:
+        now = _local_now(); key = now.strftime('%Y-%m-%d %H:%M')
+        if key.endswith(BRIEF_MORNING) and ('m' + key[:10]) not in sent:
+            sent.add('m' + key[:10]); await _briefing(app, 'morning')
+        if key.endswith(BRIEF_EVENING) and ('e' + key[:10]) not in sent:
+            sent.add('e' + key[:10]); await _briefing(app, 'evening')
+        if len(sent) > 50: sent.clear()
+        await asyncio.sleep(30)
+
+async def _post_init(app):
+    init_ai_tables()
+    asyncio.create_task(_scheduler(app))
+
+async def cmd_brief(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/brief — ertalabki xulosani hozir ko'rish"""
+    if not is_owner(u): return
+    await _briefing(ctx.application, 'evening' if _local_now().hour >= 15 else 'morning')
+
+
 # ── COMMAND HANDLERS ──────────────────────────────────────────────
 # Menyu tugmalari xaritalash
 MENU_MAP = {
@@ -940,7 +1520,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ["➕ Yangi tovar","↩️ Qayt etish"],
     ], resize_keyboard=True, is_persistent=True)
     await u.message.reply_text(
-        f"🏭 ThermoCrafts Bot v3.0\n💱 1 USD = {rate:,.0f} so'm",
+        f"🏭 ThermoCrafts v5.0 — {AI_NAME} bilan\n💱 1 USD = {rate:,.0f} so'm\n\nErkin yozing: \"tts20 ni Alisherga 450 ga nasiya berdim\" yoki \"bu oy eng ko'p nima ketdi?\"",
         reply_markup=kb)
 
 
@@ -1432,10 +2012,10 @@ async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = []
     for op in ops:
         data = json.loads(op[4])
-        label = f"#{op[0]} [{str(op[1])[:16]}] {op[2]}: "
-        if op[2] == 'sale': label += f"{data.get('product','')} {fmt(data.get('revenue',0))}"
-        elif op[2] == 'expense': label += f"{data.get('note','')} {fmt(data.get('amount',0))}"
-        elif op[2] == 'transit': label += f"{data.get('product','')} {fmt(data.get('total',0))}"
+        label = f"#{op[0]} [{op[1]} {op[2]}] {op[3]}: "
+        if op[3] == 'sale': label += f"{data.get('product','')} {fmt(data.get('price',0)*data.get('qty',1))}"
+        elif op[3] == 'expense': label += f"{data.get('note','')} {fmt(data.get('amount',0))}"
+        elif op[3] == 'transit': label += f"{data.get('product','')} {fmt(data.get('total',0))}"
         else: label += str(data)[:30]
         text += f"{label}\n"
         kb.append([InlineKeyboardButton(f"↩️ #{op[0]} qayt", callback_data=f"undo_{op[0]}")])
@@ -1723,6 +2303,17 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await u.message.chat.send_action('typing')
+    # ── TO'LIQ AI REJIMI ──
+    if AI_MODE == 'agent':
+        await ctx.bot.send_chat_action(chat_id=u.effective_chat.id, action='typing')
+        try:
+            reply = await ai_agent(u.effective_user.id, msg, ctx)
+        except Exception as e:
+            log.exception("agent")
+            reply = f"\u26a0\ufe0f AI xatosi: {str(e)[:200]}"
+        await u.message.reply_text(reply)
+        return
+
     parsed = ai_parse(msg, prods)
     action = parsed.get('action', 'unknown')
     log.info(f"Action: {action} | {parsed}")
@@ -2558,7 +3149,7 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     # Yangi tovar qo'shish (ConversationHandler)
     conv_handler = ConversationHandler(
@@ -2617,6 +3208,9 @@ def main():
     app.add_handler(CommandHandler('katalog', cmd_katalog))
     app.add_handler(CommandHandler('tayyor', handle_photo_done))
     app.add_handler(CommandHandler('update', cmd_update))
+    app.add_handler(CommandHandler('reset', cmd_ai_reset))
+    app.add_handler(CommandHandler('xotira', cmd_xotira))
+    app.add_handler(CommandHandler('brief', cmd_brief))
     app.add_handler(CommandHandler('stock_reset', cmd_stock_reset))
     app.add_handler(CommandHandler('oy_tafsil', cmd_oy_tafsil))
     app.add_handler(CommandHandler('kassa', cmd_kassa))
@@ -2624,7 +3218,7 @@ def main():
     app.add_handler(CommandHandler('eslatmalar', cmd_eslatmalar))
     app.add_handler(CommandHandler('reklama', cmd_reklama))
     app.add_handler(CommandHandler('reklama_preview', cmd_reklama_preview))
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.Document.ALL, handle_photo_post))
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.Document.ALL, handle_photo_ai))
     app.add_handler(MessageHandler(filters.VIDEO & ~filters.Document.ALL, handle_video_post))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CommandHandler('post', cmd_post_kanal))
