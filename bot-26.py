@@ -25,7 +25,7 @@ CHANNEL_ID    = os.getenv('CHANNEL_ID', '')   # @ThermoCrafts
 
 def get_channel_id():
     return os.getenv('CHANNEL_ID', '')
-DB_PATH       = 'thermocraft.db'
+DB_PATH       = os.getenv('DB_PATH', 'thermocraft.db')
 ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # Conversation states
