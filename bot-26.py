@@ -971,8 +971,16 @@ AI_TOOLS = [
          "type": {"type": "string", "enum": ["berildi", "olindi"]},
          "note": {"type": "string", "default": ""}}}},
     {"name": "get_transit",
-     "description": "Yo'ldagi tovarlar va zavod qarzi.",
+     "description": "Yo'ldagi tovarlar va zavod qarzi (id lar bilan).",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "pay_factory_debt",
+     "description": "Zavod qarzini to'laydi: qarz kamayadi va kassadan chiqim yoziladi. transit_id bermasa — supplier bo'yicha eng eski qarzdan boshlab yopadi. amount_usd bermasa — o'sha yetkazuvchiga bo'lgan butun qarz yopiladi.",
+     "input_schema": {"type": "object", "properties": {
+         "supplier": {"type": "string", "description": "Two Trees / Freesub / AlgoLaser"},
+         "transit_id": {"type": "integer", "description": "Aniq yozuv id (get_transit dan)"},
+         "amount_usd": {"type": "number", "description": "To'langan summa. Bo'sh = butun qarz"},
+         "from_cash": {"type": "boolean", "default": True, "description": "Kassadan chiqim yozilsinmi. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa — false"},
+         "note": {"type": "string", "default": ""}}}},
     {"name": "get_analytics",
      "description": "Tahlil: abc_xyz | nelikvid | trend | cashflow",
      "input_schema": {"type": "object", "required": ["kind"], "properties": {
@@ -1123,6 +1131,45 @@ async def execute_tool(name, inp, ctx=None):
             rows = c.fetchall(); conn.close()
             return _j([{"id": r[0], "date": r[1], "supplier": r[2], "product": r[3], "qty": r[4],
                         "unit_cost": r[5], "total": r[6], "deposit": r[7], "remaining": r[8], "status": r[9]} for r in rows])
+
+        if name == "pay_factory_debt":
+            sup = (inp.get("supplier") or "").strip()
+            tid = inp.get("transit_id")
+            amt = inp.get("amount_usd")
+            if amt is not None:
+                amt = float(amt)
+                if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
+            conn = db(); cc = conn.cursor()
+            if tid:
+                cc.execute("SELECT id,supplier,product,remaining FROM transit WHERE id=? AND remaining>0", (int(tid),))
+            elif sup:
+                cc.execute("SELECT id,supplier,product,remaining FROM transit WHERE supplier LIKE ? AND remaining>0 ORDER BY id", (f"%{sup}%",))
+            else:
+                cc.execute("SELECT id,supplier,product,remaining FROM transit WHERE remaining>0 ORDER BY id")
+            rows = cc.fetchall(); conn.close()
+            if not rows:
+                return _j({"error": "Ochiq qarz topilmadi" + (f" ({sup})" if sup else "")})
+            total_debt = sum(r[3] for r in rows)
+            pay = total_debt if amt is None else min(amt, total_debt)
+            left = pay; closed = []
+            for r in rows:
+                if left <= 0: break
+                part = min(left, r[3])
+                pay_transit_deposit(r[0], part)
+                closed.append({"id": r[0], "supplier": r[1], "item": r[2],
+                               "paid": round(part, 2), "still_owed": round(r[3] - part, 2)})
+                left -= part
+            from_cash = inp.get("from_cash", True)
+            if from_cash:
+                add_cash(pay, "chiqim", "zavod_qarz",
+                         inp.get("note") or f"{sup or 'zavod'} qarziga to'lov")
+            conn = db(); cc = conn.cursor()
+            cc.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
+            rest = cc.fetchone()[0]; conn.close()
+            return _j({"ok": True, "paid": round(pay, 2), "closed": closed,
+                       "remaining_total_debt": round(rest, 2),
+                       "cash_balance": get_cash_balance(),
+                       "cash_note": "kassadan chiqim yozildi" if from_cash else "kassaga tegilmadi"})
 
         if name == "get_analytics":
             k = inp.get("kind")
@@ -1306,6 +1353,7 @@ ISH QOIDALARI:
 7. Internetdan ma'lumot kerak bo'lsa (raqobatchi narxi, texnik xususiyat, yangi model) — web_search ishlating va manbani ayting.
 8. Raqamlar: $1,250 / 14,700,000 so'm.
 9. Egasi rasm yuborsa: chek bo'lsa — xarajat yozing; mahsulot bo'lsa — qaysi mahsulot ekanini ayting; boshqa bo'lsa — tavsiflab so'rang.
+10. Zavod qarzi to'langan desa — pay_factory_debt ishlating. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa, from_cash=false qo'ying (kassa ikki marta kamaymasin). To'lov hozir bo'lgan bo'lsa from_cash=true.
 """
 
 def _all_tools():
