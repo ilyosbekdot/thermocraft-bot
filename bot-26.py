@@ -3,7 +3,7 @@
 ThermoCrafts Biznes Bot v3.0
 21 Modul | IAS 2 | ABC/XYZ CV | Katalog | Kafolat | Marketing
 """
-import os, json, sqlite3, logging, math, re, requests, base64, asyncio
+import os, json, sqlite3, logging, math, re, requests, base64, asyncio, time
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -497,15 +497,16 @@ def reverse_sale(sale_id):
     if had_cash: add_cash(revenue, 'chiqim', 'qaytarish', f'{product} bekor (#{sale_id})')
     return True
 
-def add_expense(amount, category, expense_type='period', note=''):
-    now = datetime.now()
+def add_expense(amount, category, expense_type='period', note='', cash=True, date=None):
+    d = date or datetime.now().strftime('%Y-%m-%d')
     conn = db(); c = conn.cursor()
     c.execute('INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)',
-              (now.strftime('%Y-%m-%d'), amount, category, expense_type, note))
+              (d, amount, category, expense_type, note))
     eid = c.lastrowid
     conn.commit(); conn.close()
-    log_op('expense', {'id':eid,'amount':amount,'type':expense_type,'note':note})
-    add_cash(amount, 'chiqim', category, f'{note} (#x{eid})')
+    log_op('expense', {'id':eid,'amount':amount,'type':expense_type,'note':note,'cash':cash})
+    if cash:
+        add_cash(amount, 'chiqim', category, f'{note} (#x{eid})')
     return eid
 
 def add_transit(supplier, product, qty, unit_cost, deposit=0, bank_fee=0, delivery_fee=0, note=''):
@@ -924,11 +925,13 @@ AI_TOOLS = [
      "input_schema": {"type": "object", "required": ["product", "qty"], "properties": {
          "product": {"type": "string"}, "qty": {"type": "integer"}}}},
     {"name": "record_expense",
-     "description": "Xarajat yozadi va kassadan chiqim qiladi.",
+     "description": "Xarajat yozadi VA kassadan chiqim qiladi. Pul allaqachon kassadan chiqib bo'lgan bo'lsa (masalan ilgari record_cash orqali yozilgan) — from_cash=false qo'ying, aks holda kassa ikki marta kamayadi.",
      "input_schema": {"type": "object", "required": ["amount_usd", "category"], "properties": {
          "amount_usd": {"type": "number"},
-         "category": {"type": "string", "description": "reklama, transport, bank, ijara, boshqa..."},
+         "category": {"type": "string", "description": "reklama, transport, bank, ijara, ai_xizmat, boshqa..."},
          "expense_type": {"type": "string", "enum": ["period", "cogs_bank", "cogs_delivery"], "default": "period"},
+         "from_cash": {"type": "boolean", "default": True, "description": "Kassadan chiqim yozilsinmi. Eski yozuvni to'g'irlash bo'lsa false"},
+         "date": {"type": "string", "description": "YYYY-MM-DD. Bo'sh = bugun. O'tgan kun xarajatini yozish uchun"},
          "note": {"type": "string", "default": ""}}}},
     {"name": "record_cash",
      "description": "Kassaga kirim yoki chiqim (sotuv/xarajatdan tashqari: qarz qaytdi, shaxsiy oldi va h.k.)",
@@ -1058,8 +1061,11 @@ async def execute_tool(name, inp, ctx=None):
         if name == "record_expense":
             amt = float(inp.get("amount_usd", 0))
             if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
-            eid = add_expense(amt, inp.get("category", "boshqa"), inp.get("expense_type", "period"), inp.get("note", ""))
-            return _j({"ok": True, "expense_id": eid, "amount": amt, "cash_balance": get_cash_balance()})
+            eid = add_expense(amt, inp.get("category", "boshqa"), inp.get("expense_type", "period"),
+                              inp.get("note", ""), cash=inp.get("from_cash", True), date=inp.get("date"))
+            return _j({"ok": True, "expense_id": eid, "amount": amt,
+                       "cash_balance": get_cash_balance(),
+                       "cash_note": "kassadan chiqim yozildi" if inp.get("from_cash", True) else "kassaga tegilmadi"})
 
         if name == "record_cash":
             amt = float(inp.get("amount_usd", 0))
@@ -1354,6 +1360,12 @@ ISH QOIDALARI:
 8. Raqamlar: $1,250 / 14,700,000 so'm.
 9. Egasi rasm yuborsa: chek bo'lsa — xarajat yozing; mahsulot bo'lsa — qaysi mahsulot ekanini ayting; boshqa bo'lsa — tavsiflab so'rang.
 10. Zavod qarzi to'langan desa — pay_factory_debt ishlating. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa, from_cash=false qo'ying (kassa ikki marta kamaymasin). To'lov hozir bo'lgan bo'lsa from_cash=true.
+11. PUL CHIQIMI UCHUN QAYSI ASBOB (muhim, chalkashtirmang):
+    - record_expense — HAQIQIY XARAJAT: reklama, OLX, transport, ijara, bank komissiyasi, AI xizmati, yo'lkira. Bu kassadan ham chiqadi, xarajat hisobotida ham ko'rinadi. Chiqim bo'lsa DOIM shuni ishlating.
+    - pay_factory_debt — zavodga qarz to'lash. Bu xarajat EMAS (qarz kamayadi), shuning uchun xarajat hisobotiga tushmaydi.
+    - record_cash — faqat xarajat ham, qarz to'lovi ham bo'lmagan harakat uchun: shaxsiy pul olish, mijoz qarzini qaytarishi, kassa to'g'irlash.
+    Shubha bo'lsa record_expense tanlang. record_cash bilan chiqim yozsangiz, u xarajat hisobotida KO'RINMAYDI.
+12. Eski yozuvni to'g'irlashda (pul allaqachon kassadan chiqqan, faqat xarajat jurnalida yo'q) — record_expense ni from_cash=false bilan chaqiring va date bering. Aks holda kassa ikki marta kamayadi.
 """
 
 def _all_tools():
@@ -1486,6 +1498,15 @@ async def _scheduler(app):
         if key.endswith(BRIEF_EVENING) and ('e' + key[:10]) not in sent:
             sent.add('e' + key[:10]); await _briefing(app, 'evening')
         if len(sent) > 50: sent.clear()
+        # Baza o'zgargan bo'lsa avtomatik zaxira (kamida 10 daqiqada bir)
+        try:
+            if GITHUB_TOKEN and os.path.exists(DB_PATH):
+                mt = os.path.getmtime(DB_PATH)
+                if mt > _BK['last'] and (time.time() - _BK['last']) > BK_MIN_GAP:
+                    ok, msg = await asyncio.to_thread(db_backup_to_github, 'avto')
+                    log.info("Avto-zaxira: %s — %s", "OK" if ok else "XATO", msg)
+        except Exception:
+            log.exception("avto-zaxira")
         await asyncio.sleep(30)
 
 async def _post_init(app):
@@ -2896,6 +2917,105 @@ GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 GITHUB_REPO  = 'ilyosbekdot/thermocraft-bot'
 BOT_FILENAME = os.getenv('BOT_FILENAME', 'bot-20.py')
 
+# ── BAZA ZAXIRASI (GitHub) ────────────────────────────────────────
+DB_BACKUP_PATH = os.getenv('DB_BACKUP_PATH', 'data/thermocraft.db')
+_BK = {'last': 0.0}          # oxirgi zaxira vaqti
+BK_MIN_GAP = 600             # kamida 10 daqiqa oraliq
+
+def _gh_headers():
+    return {"Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+def db_backup_to_github(reason=''):
+    """Bazani GitHub repoga zaxiralaydi"""
+    if not GITHUB_TOKEN: return False, "GITHUB_TOKEN sozlanmagan"
+    try:
+        if not os.path.exists(DB_PATH): return False, "Baza fayli yo'q"
+        with open(DB_PATH, 'rb') as f: raw = f.read()
+        if len(raw) < 100: return False, "Baza bo'sh"
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_BACKUP_PATH}"
+        sha = None
+        r = requests.get(api, headers=_gh_headers(), timeout=20)
+        if r.status_code == 200: sha = r.json().get('sha')
+        payload = {"message": f"DB backup {datetime.now().strftime('%Y-%m-%d %H:%M')} {reason}".strip(),
+                   "content": base64.b64encode(raw).decode()}
+        if sha: payload["sha"] = sha
+        r2 = requests.put(api, json=payload, headers=_gh_headers(), timeout=90)
+        if r2.status_code in (200, 201):
+            _BK['last'] = time.time()
+            return True, f"{max(1, len(raw)//1024)} KB zaxiralandi"
+        try: err = r2.json().get('message', '')[:120]
+        except Exception: err = r2.text[:120]
+        return False, f"GitHub {r2.status_code}: {err}"
+    except Exception as e:
+        log.exception("db backup"); return False, str(e)[:150]
+
+def db_restore_from_github():
+    """GitHub dagi zaxiradan bazani tiklaydi"""
+    if not GITHUB_TOKEN: return False, "GITHUB_TOKEN sozlanmagan"
+    try:
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_BACKUP_PATH}"
+        r = requests.get(api, headers=_gh_headers(), timeout=60)
+        if r.status_code != 200: return False, f"Zaxira topilmadi ({r.status_code})"
+        j = r.json()
+        raw = base64.b64decode(j.get('content', '')) if j.get('content') else b''
+        if len(raw) < 100 and j.get('download_url'):
+            raw = requests.get(j['download_url'], timeout=60).content
+        if len(raw) < 100: return False, "Zaxira bo'sh"
+        d = os.path.dirname(DB_PATH)
+        if d: os.makedirs(d, exist_ok=True)
+        with open(DB_PATH, 'wb') as f: f.write(raw)
+        return True, f"{max(1, len(raw)//1024)} KB tiklandi"
+    except Exception as e:
+        log.exception("db restore"); return False, str(e)[:150]
+
+def db_is_empty():
+    """Baza yo'q yoki ma'lumotsizmi"""
+    if not os.path.exists(DB_PATH): return True
+    try:
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sales'")
+        if not c.fetchone(): conn.close(); return True
+        n = 0
+        for t in ('sales', 'cash_box', 'expenses'):
+            try:
+                c.execute(f"SELECT COUNT(*) FROM {t}"); n += c.fetchone()[0]
+            except Exception: pass
+        conn.close(); return n == 0
+    except Exception:
+        return True
+
+def db_autorestore():
+    """Ishga tushganda baza bo'sh bo'lsa GitHub dan tiklaydi"""
+    if not db_is_empty():
+        log.info("Baza joyida, tiklash shart emas"); return
+    ok, msg = db_restore_from_github()
+    log.info("Avtomatik tiklash: %s — %s", "OK" if ok else "XATO", msg)
+
+async def cmd_backup(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    await u.message.reply_text("⏳ Zaxiralanmoqda...")
+    ok, msg = db_backup_to_github('qo\'lda')
+    await u.message.reply_text(("✅ " if ok else "❌ ") + msg)
+
+async def cmd_restore(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    args = ctx.args or []
+    if not args or args[0].lower() not in ('ha', 'yes'):
+        await u.message.reply_text(
+            "⚠️ Bu hozirgi bazani GitHub dagi zaxira bilan ALMASHTIRADI.\n"
+            "Hozirgi ma'lumotlar yo'qoladi.\n\nTasdiqlash: /restore ha")
+        return
+    ok, msg = db_restore_from_github()
+    if ok:
+        init_db(); init_ai_tables()
+        await u.message.reply_text(f"✅ {msg}\nBaza tiklandi.")
+    else:
+        await u.message.reply_text(f"❌ {msg}")
+
+
+
 async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Bot o'zini yangilaydi — /update <raw_url>"""
     if not is_owner(u): return
@@ -2969,7 +3089,9 @@ async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("❌ GITHUB_TOKEN sozlanmagan!")
         return
 
-    await u.message.reply_text("⏳ Fayl qabul qilindi, GitHub ga yuklanmoqda...")
+    await u.message.reply_text("⏳ Fayl qabul qilindi. Avval baza zaxiralanmoqda...")
+    bok, bmsg = await asyncio.to_thread(db_backup_to_github, "yangilanishdan oldin")
+    await u.message.reply_text(("💾 " if bok else "⚠️ Zaxira: ") + bmsg + "\n⏳ Kod yuklanmoqda...")
 
     try:
         # 1. Telegram dan faylni yuklab olish
@@ -3204,6 +3326,7 @@ def main():
     if not ANTHROPIC_KEY: raise ValueError("ANTHROPIC_KEY yo'q!")
     if OWNER_ID == 0: raise ValueError("OWNER_ID yo'q!")
 
+    db_autorestore()
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
@@ -3268,6 +3391,8 @@ def main():
     app.add_handler(CommandHandler('reset', cmd_ai_reset))
     app.add_handler(CommandHandler('xotira', cmd_xotira))
     app.add_handler(CommandHandler('brief', cmd_brief))
+    app.add_handler(CommandHandler('backup', cmd_backup))
+    app.add_handler(CommandHandler('restore', cmd_restore))
     app.add_handler(CommandHandler('stock_reset', cmd_stock_reset))
     app.add_handler(CommandHandler('oy_tafsil', cmd_oy_tafsil))
     app.add_handler(CommandHandler('kassa', cmd_kassa))
