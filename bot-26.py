@@ -1513,6 +1513,96 @@ async def _post_init(app):
     init_ai_tables()
     asyncio.create_task(_scheduler(app))
 
+
+async def cmd_sync_sentyabr(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Sentyabr 2026 ni Excel jadvali bilan aniq sinxronlaydi"""
+    if not is_owner(u): return
+    args = ctx.args or []
+    if not args or args[0].lower() not in ('ha', 'yes'):
+        await u.message.reply_text(
+            "\u26a0\ufe0f Bu SENTYABR 2026 ma'lumotlarini Excel jadvali bilan almashtiradi:\n"
+            "\u2022 astatka (soni + sebest)\n\u2022 sentyabr sotuvlari\n\u2022 sentyabr xarajatlari\n"
+            "\u2022 kassa harakati\n\u2022 Two Trees qarzi yopiladi\n\n"
+            "Yanvar-avgust tarixi tegilmaydi.\n\nTasdiqlash: /sync_sentyabr ha")
+        return
+
+    # ── Excel jadvalidan (22.09.2026) ────────────────────────────
+    STOCK = [
+        (1, 2, 126), (2, 3, 166), (3, 3, 309), (4, 2, 87),  (5, 4, 107),
+        (6, 1, 91),  (7, 1, 91),  (8, 1, 65),  (9, 1, 65),  (10, 2, 23),
+        (11, 1, 23), (12, 2, 21), (13, 2, 41), (14, 1, 300),(15, 2, 160),
+        (16, 2, 100),(17, 1, 88), (18, 1, 89), (19, 1, 85), (20, 2, 53),
+        (21, 1, 15),
+    ]
+    ZERO = [22, 23, 24, 25, 26, 27, 28, 29, 30]
+    SALES = [
+        ('2026-09-15', 'TTS 55 Pro',      1, 126.0, 190.0, 64.0),
+        ('2026-09-20', '15 in 1 (SB400)', 1, 299.8, 330.0, 30.2),
+    ]
+    EXPENSES = [
+        ('2026-09-05', 110.0, 'yetkazuvchi', 'period', 'Abusaxiy'),
+        ('2026-09-08',  50.0, 'transport',   'period', "Yo'lkira"),
+        ('2026-09-10',  30.0, 'reklama',     'period', 'OLX'),
+        ('2026-09-18',  32.0, 'bank',        'cogs_bank', 'Bank komissiyasi'),
+        ('2026-09-21',  75.0, 'ai_xizmat',   'period', 'AI xizmatlari'),
+    ]
+    OTHER_CASH = [
+        ('2026-09-12', 805.0, 'zavod_qarz', 'Two Trees qarziga to\'lov'),
+        ('2026-09-14',  38.0, 'shaxsiy',    "O'zim uchun"),
+        ('2026-09-19',  17.0, 'shaxsiy',    "O'zim uchun"),
+    ]
+    START_CASH = 1080.0
+
+    conn = db(); c = conn.cursor()
+    # 1) Astatka
+    for pid, qty, cost in STOCK:
+        c.execute('UPDATE products SET qty=?, cost=? WHERE id=?', (qty, cost, pid))
+    for pid in ZERO:
+        c.execute('UPDATE products SET qty=0 WHERE id=?', (pid,))
+    # 2) Sentyabr yozuvlarini tozalash
+    c.execute("DELETE FROM sales    WHERE date LIKE '2026-09%'")
+    c.execute("DELETE FROM expenses WHERE date LIKE '2026-09%'")
+    c.execute("DELETE FROM cash_box WHERE date LIKE '2026-09%'")
+    # 3) Sotuvlar
+    for d, name, qty, cost, rev, prof in SALES:
+        c.execute("""INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type)
+                     VALUES (?,?,?,?,?,?,?,0,'','B2C')""", (d, '12:00', name, qty, cost, rev, prof))
+    # 4) Xarajatlar
+    for d, amt, cat, etype, note in EXPENSES:
+        c.execute('INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)',
+                  (d, amt, cat, etype, note))
+    # 5) Kassa
+    c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+              ('2026-09-01', '00:00', 'kirim', START_CASH, 'boshlangich', 'Sentyabr boshlangich qoldiq', 'naqd'))
+    for d, name, qty, cost, rev, prof in SALES:
+        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                  (d, '12:00', 'kirim', rev, 'sotuv', f'{name} x{qty}', 'naqd'))
+    for d, amt, cat, etype, note in EXPENSES:
+        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                  (d, '12:00', 'chiqim', amt, cat, note, 'naqd'))
+    for d, amt, cat, note in OTHER_CASH:
+        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                  (d, '12:00', 'chiqim', amt, cat, note, 'naqd'))
+    # 6) Two Trees qarzi yopildi
+    c.execute("UPDATE transit SET deposit=total_cost, remaining=0, status='tolangan' WHERE supplier LIKE '%Two Trees%' AND remaining>0")
+    conn.commit(); conn.close()
+
+    prods = get_products()
+    tovar = sum(p['qty'] * p['cost'] for p in prods)
+    bal   = get_cash_balance()
+    rev   = sum(s[4] for s in SALES); cost = sum(s[3] for s in SALES)
+    exp   = sum(e[1] for e in EXPENSES)
+    await u.message.reply_text(
+        f"\u2705 Sentyabr 2026 sinxronlandi\n\n"
+        f"\U0001F4E6 Tovar qoldig'i: {fmt(tovar)}\n"
+        f"\U0001F4B5 Kassa: {fmt(bal)}\n"
+        f"\U0001F4C8 Sotuv: {fmt(rev)} / tannarx {fmt(cost)} / foyda {fmt(rev-cost)}\n"
+        f"\U0001F4B8 Xarajat: {fmt(exp)}\n"
+        f"\U0001F3ED Two Trees qarzi: yopildi\n\n"
+        f"Tekshiring: Astatka, Kassa, /oy_tafsil 2026-09")
+    ok, msg = await asyncio.to_thread(db_backup_to_github, 'sentyabr sync')
+    await u.message.reply_text(("\U0001F4BE " if ok else "\u26a0\ufe0f ") + msg)
+
 async def cmd_brief(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/brief — ertalabki xulosani hozir ko'rish"""
     if not is_owner(u): return
@@ -3391,6 +3481,7 @@ def main():
     app.add_handler(CommandHandler('reset', cmd_ai_reset))
     app.add_handler(CommandHandler('xotira', cmd_xotira))
     app.add_handler(CommandHandler('brief', cmd_brief))
+    app.add_handler(CommandHandler('sync_sentyabr', cmd_sync_sentyabr))
     app.add_handler(CommandHandler('backup', cmd_backup))
     app.add_handler(CommandHandler('restore', cmd_restore))
     app.add_handler(CommandHandler('stock_reset', cmd_stock_reset))
