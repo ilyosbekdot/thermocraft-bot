@@ -984,6 +984,18 @@ AI_TOOLS = [
          "amount_usd": {"type": "number", "description": "To'langan summa. Bo'sh = butun qarz"},
          "from_cash": {"type": "boolean", "default": True, "description": "Kassadan chiqim yozilsinmi. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa — false"},
          "note": {"type": "string", "default": ""}}}},
+    {"name": "record_competitor_price",
+     "description": "Raqobatchining narxini yozib qo'yadi. Foydalanuvchi aytsa ham, web_search bilan o'zingiz topsangiz ham ishlating. Bir mahsulot uchun bir necha sotuvchi bo'lishi mumkin.",
+     "input_schema": {"type": "object", "required": ["competitor", "product", "their_price_usd"], "properties": {
+         "competitor": {"type": "string", "description": "Sotuvchi nomi yoki OLX profili, masalan apexmach"},
+         "product": {"type": "string", "description": "Mahsulot nomi (bizning astatkadagi kabi)"},
+         "their_price_usd": {"type": "number"},
+         "note": {"type": "string", "default": "", "description": "Havola, holati (yangi/b-u), izoh"}}}},
+    {"name": "get_competitor_analysis",
+     "description": "Raqobat tahlili: har mahsulot bo'yicha bizning narx, raqobatchi narxlari, o'rin (arzon/qimmat), marja zaxirasi. product bersangiz faqat o'shani.",
+     "input_schema": {"type": "object", "properties": {
+         "product": {"type": "string", "description": "Ixtiyoriy: bitta mahsulot"},
+         "days": {"type": "integer", "default": 90, "description": "Necha kunlik ma'lumot"}}}},
     {"name": "get_analytics",
      "description": "Tahlil: abc_xyz | nelikvid | trend | cashflow",
      "input_schema": {"type": "object", "required": ["kind"], "properties": {
@@ -1177,6 +1189,51 @@ async def execute_tool(name, inp, ctx=None):
                        "cash_balance": get_cash_balance(),
                        "cash_note": "kassadan chiqim yozildi" if from_cash else "kassaga tegilmadi"})
 
+        if name == "record_competitor_price":
+            prod = find_product(inp.get("product", ""))
+            pname = prod['name'] if prod else inp.get("product", "")
+            price = float(inp.get("their_price_usd", 0))
+            if price >= 5000: price = round(price / get_exchange_rate(), 2)
+            add_competitor(inp.get("competitor", ""), pname, price, inp.get("note", ""))
+            our = prod['price'] if prod else 0
+            return _j({"ok": True, "product": pname, "their_price": price, "our_price": our,
+                       "diff": round(our - price, 2) if our else None,
+                       "position": ("biz qimmat" if our and our > price else "biz arzon" if our else "bizda yo'q")})
+
+        if name == "get_competitor_analysis":
+            days = int(inp.get("days", 90))
+            since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            conn = db(); cc = conn.cursor()
+            pf = (inp.get("product") or "").strip()
+            if pf:
+                p = find_product(pf); pf = p['name'] if p else pf
+                cc.execute("SELECT product,competitor,their_price,date,note FROM competitors WHERE date>=? AND product LIKE ? ORDER BY date DESC", (since, f"%{pf}%"))
+            else:
+                cc.execute("SELECT product,competitor,their_price,date,note FROM competitors WHERE date>=? ORDER BY date DESC", (since,))
+            rows = cc.fetchall(); conn.close()
+            by = defaultdict(list)
+            for r in rows: by[r[0]].append(r)
+            out = []
+            for pname, lst in by.items():
+                p = find_product(pname)
+                prices = [r[2] for r in lst if r[2] and r[2] > 0]
+                if not prices: continue
+                mn, mx = min(prices), max(prices)
+                avg = round(sum(prices) / len(prices), 2)
+                our = p['price'] if p else 0
+                cost = p['cost'] if p else 0
+                item = {"product": pname, "our_price": our, "our_cost": cost,
+                        "market_min": mn, "market_avg": avg, "market_max": mx,
+                        "sellers": [{"who": r[1], "price": r[2], "date": r[3], "note": r[4]} for r in lst[:5]]}
+                if our:
+                    item["vs_min_pct"] = round((our - mn) / mn * 100, 1) if mn else None
+                    item["position"] = ("eng arzon" if our <= mn else "eng qimmat" if our >= mx else "o'rtacha")
+                    item["margin_now"] = round(our - cost, 2)
+                    item["margin_if_match_min"] = round(mn - cost, 2)
+                    item["in_stock"] = p['qty']
+                out.append(item)
+            return _j({"days": days, "products": out} if out else {"info": "Raqobatchi narxlari hali yozilmagan"})
+
         if name == "get_analytics":
             k = inp.get("kind")
             if k == "abc_xyz": return _j(abc_xyz_analysis())
@@ -1360,6 +1417,7 @@ ISH QOIDALARI:
 8. Raqamlar: $1,250 / 14,700,000 so'm.
 9. Egasi rasm yuborsa: chek bo'lsa — xarajat yozing; mahsulot bo'lsa — qaysi mahsulot ekanini ayting; boshqa bo'lsa — tavsiflab so'rang.
 10. Zavod qarzi to'langan desa — pay_factory_debt ishlating. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa, from_cash=false qo'ying (kassa ikki marta kamaymasin). To'lov hozir bo'lgan bo'lsa from_cash=true.
+13. RAQOBAT: egasi raqobatchi narxini aytsa — record_competitor_price bilan darhol yozing. "bozorda qancha?", "raqobatchilar qancha sotyapti?" desa — avval get_competitor_analysis; ma'lumot yo'q yoki eskirgan bo'lsa web_search bilan OLX/birbir dan qidiring, topganingizni record_competitor_price bilan saqlang, keyin xulosa ayting. Narx bo'yicha maslahat berganda marjani (narx - sebest) hisobga oling — sebestdan past taklif qilmang.
 11. PUL CHIQIMI UCHUN QAYSI ASBOB (muhim, chalkashtirmang):
     - record_expense — HAQIQIY XARAJAT: reklama, OLX, transport, ijara, bank komissiyasi, AI xizmati, yo'lkira. Bu kassadan ham chiqadi, xarajat hisobotida ham ko'rinadi. Chiqim bo'lsa DOIM shuni ishlating.
     - pay_factory_debt — zavodga qarz to'lash. Bu xarajat EMAS (qarz kamayadi), shuning uchun xarajat hisobotiga tushmaydi.
@@ -1468,6 +1526,19 @@ async def _briefing(app, kind):
             if out: head += f"🔴 Tugagan: {', '.join(out[:6])}\n"
             if nel: head += f"❄️ 2+ oy sotilmagan: {len(nel)} ta ({', '.join(x['name'] for x in nel[:3])}...)\n"
             if rem: head += "🔔 Bugun: " + "; ".join(r[1].split('] ', 1)[-1] for r in rem) + "\n"
+            try:
+                cn = db(); cx = cn.cursor()
+                cx.execute("SELECT product, MIN(their_price) FROM competitors WHERE date>=? GROUP BY product",
+                           ((_local_now() - timedelta(days=60)).strftime('%Y-%m-%d'),))
+                cheap = []
+                for pn, mp in cx.fetchall():
+                    pp = find_product(pn)
+                    if pp and pp['qty'] > 0 and mp and pp['price'] > mp:
+                        cheap.append(f"{pn} (bozor {fmt(mp)}, biz {fmt(pp['price'])})")
+                cn.close()
+                if cheap: head += "🔍 Bizdan arzon: " + "; ".join(cheap[:3]) + "\n"
+            except Exception:
+                pass
             prompt = ("Bu ertalabki xulosa. Egasiga 2-3 qatorda o'z fikringizni ayting: bugun nimaga e'tibor berish kerak. "
                       "Raqamlarni takrorlamang, xulosa chiqaring.\n\n" + head)
         else:
@@ -2148,26 +2219,53 @@ async def cmd_olx(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_raqobat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Raqobat tahlili — bizning narx vs bozor"""
     if not is_owner(u): return
+    since = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
     conn = db(); c = conn.cursor()
-    c.execute("SELECT * FROM competitors ORDER BY date DESC LIMIT 20")
+    c.execute("SELECT product,competitor,their_price,date,note FROM competitors WHERE date>=? ORDER BY date DESC", (since,))
     rows = c.fetchall(); conn.close()
     if not rows:
-        await u.message.reply_text("🔍 *Raqobatchilar*\n\nMa'lumot yo'q.", parse_mode='Markdown')
+        await u.message.reply_text(
+            "\U0001F50D RAQOBAT TAHLILI\n\nHali ma'lumot yo'q.\n\n"
+            "Qo'shish uchun shunchaki yozing:\n"
+            "\u2022 apexmach TTS 20 Pro ni 470 ga sotyapti\n"
+            "\u2022 CNC3018 bozorda qancha turibdi? (o'zim qidiraman)")
         return
-    text = "🔍 *RAQOBATCHI NARXLAR*\n\n"
-    by_prod = defaultdict(list)
-    for r in rows: by_prod[r[3]].append(r)
-    for prod, comps in by_prod.items():
-        our = find_product(prod)
-        our_p = our['price'] if our else 0
-        text += f"*{prod}:*\n"
-        for r in comps[:3]:
-            diff = our_p - r[4]
-            emoji = "✅" if diff >= 0 else "❌"
-            text += f"  {emoji} {r[2]}: {fmt(r[4])} (biz: {fmt(our_p)}, farq: {fmt(diff)})\n"
+
+    by = defaultdict(list)
+    for r in rows: by[r[0]].append(r)
+    text = "\U0001F50D RAQOBAT TAHLILI (90 kun)\n\n"
+    ogoh = []
+    for pname, lst in sorted(by.items()):
+        prices = [r[2] for r in lst if r[2] and r[2] > 0]
+        if not prices: continue
+        p = find_product(pname)
+        mn, mx = min(prices), max(prices)
+        avg = sum(prices) / len(prices)
+        our  = p['price'] if p else 0
+        cost = p['cost'] if p else 0
+        qty  = p['qty'] if p else 0
+        if not our:        mark, holat = "\u26AA", "bizda yo'q"
+        elif our <= mn:    mark, holat = "\U0001F7E2", "eng arzon"
+        else:              mark, holat = "\U0001F534", "biz qimmat"
+        text += f"{mark} {pname}" + (f"  ({qty} ta)\n" if p else "\n")
+        if our: text += f"   Biz: {fmt(our)} \u2022 {holat}\n"
+        text += f"   Bozor: {fmt(mn)} \u2013 {fmt(mx)} (o'rt. {fmt(avg)})\n"
+        for r in lst[:3]:
+            text += f"   \u2022 {r[1]}: {fmt(r[2])} ({r[3][5:]})\n"
+        if our and cost:
+            text += f"   Marja: {fmt(our-cost)}"
+            if our > mn:
+                text += f" \u2192 {fmt(mn)} ga tushsa {fmt(mn-cost)}"
+                if qty > 0: ogoh.append(f"{pname}: bozor {fmt(mn)}, biz {fmt(our)}")
+            text += "\n"
         text += "\n"
-    await u.message.reply_text(text, parse_mode='Markdown')
+
+    if ogoh:
+        text += "\u26A0\uFE0F Astatkada bor, bizdan arzonrog'i ham bor:\n"
+        for o in ogoh[:5]: text += f"\u2022 {o}\n"
+    await u.message.reply_text(text)
 
 async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
