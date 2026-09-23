@@ -548,15 +548,39 @@ def pay_transit_deposit(tid, amount):
               (amount, amount, tid))
     conn.commit(); conn.close()
 
-def add_customer(name, phone='', ctype='B2C', notes=''):
+def add_customer(name, phone='', ctype='', notes=''):
+    """Mijoz qo'shadi. Ism bir xil bo'lsa yangi ma'lumot bilan to'ldiradi.
+       Qaytaradi: ('qoshildi'|'yangilandi'|'xato', mijoz_id)"""
+    name = (name or '').strip()
+    if not name: return ('xato', None)
     conn = db(); c = conn.cursor()
-    c.execute('SELECT id FROM customers WHERE name LIKE ?', (f'%{name}%',))
-    if c.fetchone(): conn.close(); return False
+    c.execute('SELECT id,phone,type,notes FROM customers WHERE lower(trim(name))=lower(?)', (name,))
+    row = c.fetchone()
+    if row:
+        cid, old_ph, old_t, old_n = row
+        c.execute('UPDATE customers SET phone=?, type=?, notes=? WHERE id=?',
+                  (phone or old_ph or '', ctype or old_t or 'B2C', notes or old_n or '', cid))
+        conn.commit(); conn.close()
+        return ('yangilandi', cid)
     now = datetime.now().strftime('%Y-%m-%d')
-    c.execute('INSERT INTO customers (name,phone,type,notes,created) VALUES (?,?,?,?,?)',
-              (name, phone, ctype, notes, now))
+    c.execute('INSERT INTO customers (name,phone,type,notes,created,total_purchases) VALUES (?,?,?,?,?,0)',
+              (name, phone, ctype or 'B2C', notes, now))
+    cid = c.lastrowid
     conn.commit(); conn.close()
-    return True
+    return ('qoshildi', cid)
+
+def find_customers(q=''):
+    conn = db(); c = conn.cursor()
+    if q:
+        c.execute("SELECT id,name,phone,type,total_purchases,notes,created FROM customers WHERE name LIKE ? ORDER BY total_purchases DESC", (f'%{q}%',))
+    else:
+        c.execute("SELECT id,name,phone,type,total_purchases,notes,created FROM customers ORDER BY total_purchases DESC")
+    rows = c.fetchall(); conn.close(); return rows
+
+def delete_customer(name):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM customers WHERE lower(trim(name))=lower(?)", ((name or '').strip(),))
+    n = c.rowcount; conn.commit(); conn.close(); return n
 
 def add_debt(person, amount, dtype, note=''):
     now = datetime.now()
@@ -984,6 +1008,11 @@ AI_TOOLS = [
          "amount_usd": {"type": "number", "description": "To'langan summa. Bo'sh = butun qarz"},
          "from_cash": {"type": "boolean", "default": True, "description": "Kassadan chiqim yozilsinmi. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa — false"},
          "note": {"type": "string", "default": ""}}}},
+    {"name": "broadcast_customers",
+     "description": "Botga obuna bo'lgan mijozlarga xabar yuboradi. Faqat egasi aniq so'raganda ishlating. Avval matnni ko'rsatib tasdiq oling.",
+     "input_schema": {"type": "object", "required": ["text"], "properties": {
+         "text": {"type": "string", "description": "Xabar matni"},
+         "confirmed": {"type": "boolean", "default": False, "description": "Egasi tasdiqladimi. false bo'lsa faqat obunachilar soni qaytadi"}}}},
     {"name": "record_competitor_price",
      "description": "Raqobatchining narxini yozib qo'yadi. Foydalanuvchi aytsa ham, web_search bilan o'zingiz topsangiz ham ishlating. Bir mahsulot uchun bir necha sotuvchi bo'lishi mumkin.",
      "input_schema": {"type": "object", "required": ["competitor", "product", "their_price_usd"], "properties": {
@@ -1003,11 +1032,14 @@ AI_TOOLS = [
     {"name": "get_customers",
      "description": "Mijozlar ro'yxati.",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "delete_customer",
+     "description": "Mijozni o'chiradi (ism bo'yicha aniq moslik).",
+     "input_schema": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}},
     {"name": "add_customer",
-     "description": "Yangi mijoz qo'shish.",
+     "description": "Mijoz qo'shadi. Shu ismli mijoz bor bo'lsa ma'lumotini yangilaydi (telefon, tur, izoh).",
      "input_schema": {"type": "object", "required": ["name"], "properties": {
          "name": {"type": "string"}, "phone": {"type": "string", "default": ""},
-         "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "default": "B2C"},
+         "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "description": "Faqat aniq bilsangiz bering. Bo'sh qoldirilsa eski tur saqlanadi, yangi mijozga B2C qo'yiladi"},
          "notes": {"type": "string", "default": ""}}}},
     {"name": "get_rate",
      "description": "Joriy USD/UZS kursi (CBU).",
@@ -1189,6 +1221,23 @@ async def execute_tool(name, inp, ctx=None):
                        "cash_balance": get_cash_balance(),
                        "cash_note": "kassadan chiqim yozildi" if from_cash else "kassaga tegilmadi"})
 
+        if name == "broadcast_customers":
+            n = sub_count()
+            if not inp.get("confirmed"):
+                return _j({"subscribers": n, "need_confirm": True,
+                           "note": f"{n} ta obunachiga yuboriladi. Egasidan tasdiq so'rang, keyin confirmed=true bilan qayta chaqiring."})
+            if n == 0: return _j({"error": "Obunachi yo'q. /obunachilar dagi havolani mijozlarga tarqating."})
+            if ctx is None: return _j({"error": "ctx yo'q"})
+            full = f"\U0001F4E3 ThermoCrafts\n\n{inp.get('text','')}\n\n\U0001F4CD Yunusobod, Toshkent"
+            yub = blok = 0
+            for cid, *_ in sub_list():
+                try:
+                    await ctx.bot.send_message(chat_id=cid, text=full); yub += 1
+                except Exception:
+                    sub_off(cid); blok += 1
+                await asyncio.sleep(0.05)
+            return _j({"ok": True, "sent": yub, "blocked": blok})
+
         if name == "record_competitor_price":
             prod = find_product(inp.get("product", ""))
             pname = prod['name'] if prod else inp.get("product", "")
@@ -1245,13 +1294,23 @@ async def execute_tool(name, inp, ctx=None):
 
         if name == "get_customers":
             conn = db(); c = conn.cursor()
-            c.execute("SELECT name,phone,type,total_purchases,notes FROM customers ORDER BY total_purchases DESC LIMIT 30")
+            c.execute("SELECT id,name,phone,type,total_purchases,notes,created FROM customers ORDER BY total_purchases DESC LIMIT 50")
             rows = c.fetchall(); conn.close()
-            return _j([{"name": r[0], "phone": r[1], "type": r[2], "total": r[3], "notes": r[4]} for r in rows])
+            return _j({"count": len(rows),
+                       "customers": [{"id": r[0], "name": r[1], "phone": r[2], "type": r[3],
+                                      "total_purchases": r[4], "notes": r[5], "since": r[6]} for r in rows]})
 
         if name == "add_customer":
-            add_customer(inp.get("name", ""), inp.get("phone", ""), inp.get("customer_type", "B2C"), inp.get("notes", ""))
-            return _j({"ok": True})
+            nm = (inp.get("name") or "").strip()
+            if not nm: return _j({"error": "Mijoz ismi bo'sh"})
+            holat, cid = add_customer(nm, inp.get("phone") or "", inp.get("customer_type") or "", inp.get("notes") or "")
+            if holat == 'xato': return _j({"error": "Saqlanmadi"})
+            return _j({"ok": True, "status": holat, "id": cid, "name": nm,
+                       "jami_mijoz": len(find_customers())})
+
+        if name == "delete_customer":
+            n = delete_customer(inp.get("name", ""))
+            return _j({"ok": n > 0, "deleted": n})
 
         if name == "get_rate":
             return _j({"usd_uzs": get_exchange_rate(), "source": "cbu.uz"})
@@ -1306,6 +1365,43 @@ def _local_now():
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
 # ── Doimiy xotira (SQLite) ───────────────────────────────────────
+def init_sub_table():
+    conn = db(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS subscribers (
+        chat_id INTEGER PRIMARY KEY, name TEXT, username TEXT,
+        joined TEXT, active INTEGER DEFAULT 1, last_sent TEXT, source TEXT)""")
+    conn.commit(); conn.close()
+
+def sub_add(chat_id, name='', username='', source=''):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT chat_id FROM subscribers WHERE chat_id=?", (chat_id,))
+    if c.fetchone():
+        c.execute("UPDATE subscribers SET active=1, name=?, username=? WHERE chat_id=?",
+                  (name, username, chat_id))
+        new = False
+    else:
+        c.execute("INSERT INTO subscribers (chat_id,name,username,joined,active,source) VALUES (?,?,?,?,1,?)",
+                  (chat_id, name, username, today(), source))
+        new = True
+    conn.commit(); conn.close(); return new
+
+def sub_list(active_only=True):
+    conn = db(); c = conn.cursor()
+    q = "SELECT chat_id,name,username,joined,active FROM subscribers"
+    if active_only: q += " WHERE active=1"
+    c.execute(q + " ORDER BY joined DESC")
+    rows = c.fetchall(); conn.close(); return rows
+
+def sub_off(chat_id):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE subscribers SET active=0 WHERE chat_id=?", (chat_id,))
+    conn.commit(); conn.close()
+
+def sub_count():
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM subscribers WHERE active=1")
+    n = c.fetchone()[0]; conn.close(); return n
+
 def init_ai_tables():
     conn = db(); c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS ai_messages (
@@ -1582,6 +1678,7 @@ async def _scheduler(app):
 
 async def _post_init(app):
     init_ai_tables()
+    init_sub_table()
     asyncio.create_task(_scheduler(app))
 
 
@@ -1740,6 +1837,63 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
             parse_mode='Markdown')
     return True
 
+
+async def cmd_start_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Mijoz /start bosganda — ro'yxatga oladi va katalog ko'rsatadi"""
+    us = u.effective_user
+    nomi = (us.first_name or '') + ((' ' + us.last_name) if us.last_name else '')
+    yangi = sub_add(us.id, nomi.strip(), us.username or '', 'start')
+    prods = [p for p in get_products() if p['qty'] > 0]
+    rate = get_exchange_rate()
+    text = ("\U0001F3ED ThermoCrafts \u2014 lazer, CNC va termopress uskunalari\n"
+            "\U0001F4CD Yunusobod, Toshkent\n\n")
+    if prods:
+        tt = [p for p in prods if p['sup'] == 'Two Trees']
+        fs = [p for p in prods if p['sup'] == 'Freesub']
+        text += "\U0001F4E6 HOZIR MAVJUD:\n\n"
+        if tt:
+            text += "\U0001F535 Lazer va CNC:\n"
+            for p in tt: text += f"  \u2022 {p['name']} \u2014 {fmt(p['price'])}\n"
+            text += "\n"
+        if fs:
+            text += "\U0001F7E0 Termopress va sublimatsiya:\n"
+            for p in fs: text += f"  \u2022 {p['name']} \u2014 {fmt(p['price'])}\n"
+            text += "\n"
+        text += f"\U0001F4B1 1 USD = {rate:,.0f} so'm\n\n"
+    text += ("\U0001F4DE Buyurtma va savollar uchun yozing \u2014 javob beramiz.\n"
+             "\U0001F4E2 Kanal: @ThermoCrafts\n\n")
+    text += ("\u2705 Yangi tovar va chegirmalar haqida xabar beramiz."
+             if yangi else "\u2705 Siz allaqachon obunasiz.")
+    text += "\n\nObunani bekor qilish: /stop"
+    await u.message.reply_text(text)
+    if yangi:
+        try:
+            await ctx.bot.send_message(OWNER_ID,
+                f"\U0001F464 Yangi obunachi: {nomi.strip() or 'ismsiz'}"
+                + (f" (@{us.username})" if us.username else "")
+                + f"\nJami: {sub_count()} ta")
+        except Exception: pass
+
+async def cmd_stop_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_owner(u): return
+    sub_off(u.effective_user.id)
+    await u.message.reply_text("Obuna bekor qilindi. Qaytish uchun /start bosing.")
+
+async def handle_text_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Mijoz yozganda — egasiga yetkazadi"""
+    us = u.effective_user
+    sub_add(us.id, ((us.first_name or '') + (' ' + us.last_name if us.last_name else '')).strip(),
+            us.username or '', 'message')
+    await u.message.reply_text(
+        "Rahmat! Xabaringiz qabul qilindi \u2014 tez orada javob beramiz.\n\n"
+        "Mahsulotlar ro'yxati: /start")
+    try:
+        await ctx.bot.send_message(OWNER_ID,
+            f"\U0001F4AC Mijozdan xabar\n"
+            f"\U0001F464 {us.first_name or ''} "
+            + (f"(@{us.username})" if us.username else f"(id: {us.id})")
+            + f"\n\n{u.message.text[:600]}")
+    except Exception: pass
 
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
@@ -2719,13 +2873,15 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == 'add_customer':
         name = parsed.get('name', '')
         phone = parsed.get('phone', '')
-        ctype = parsed.get('ctype', 'B2C')
+        ctype = parsed.get('ctype', '')
         if name:
-            ok = add_customer(name, phone, ctype)
-            if ok:
-                await u.message.reply_text(f"👤 *{name} ({ctype}) qo'shildi!*", parse_mode='Markdown')
+            holat, _cid = add_customer(name, phone, ctype)
+            if holat == 'qoshildi':
+                await u.message.reply_text(f"👤 {name} ({ctype}) qo'shildi!")
+            elif holat == 'yangilandi':
+                await u.message.reply_text(f"👤 {name} ma'lumoti yangilandi")
             else:
-                await u.message.reply_text(f"ℹ️ {name} allaqachon bor")
+                await u.message.reply_text("❌ Saqlanmadi — ism bo'sh")
         else:
             await u.message.reply_text("❌ Ism kiriting")
 
@@ -2995,54 +3151,69 @@ async def cmd_eslatmalar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_reklama(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Barcha mijozlarga reklama xabar yuborish"""
+    """Obunachilarga xabar yuborish"""
     if not is_owner(u): return
+    n = sub_count()
     if not ctx.args:
+        me = await ctx.bot.get_me()
         await u.message.reply_text(
-            "📣 *Mijozlarga reklama yuborish*\n\n"
-            "Format: `/reklama Xabar matni`\n\n"
-            "Misol:\n"
-            "`/reklama Salom! ThermoCrafts da yangi TTS 20 Pro keldi! $490 dan. Qiziqsangiz yozing!`\n\n"
-            "_Barcha saqlangan mijozlarga Telegram orqali yuboriladi_",
-            parse_mode='Markdown')
+            f"\U0001F4E3 Mijozlarga xabar\n\n"
+            f"\U0001F465 Obunachilar: {n} ta\n\n"
+            f"Yuborish: /reklama Xabar matni\n"
+            f"Misol: /reklama Yangi TTS 20 Pro keldi! Narx $490\n\n"
+            f"\U0001F517 Obuna havolasi (mijozlarga tarqating):\n"
+            f"https://t.me/{me.username}\n\n"
+            f"Mijoz shu havolaga kirib Start bossa \u2014 obunachi bo'ladi va xabar oladi.\n"
+            f"Telegram qoidasiga ko'ra bot faqat shunday odamlarga yoza oladi.")
+        return
+    if n == 0:
+        me = await ctx.bot.get_me()
+        await u.message.reply_text(
+            f"\u274C Obunachi yo'q.\n\nMijozlarga shu havolani yuboring:\n"
+            f"https://t.me/{me.username}\n\nStart bosgach xabar ola boshlaydi.")
         return
 
-    reklama_text = ' '.join(ctx.args)
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT * FROM customers WHERE phone IS NOT NULL AND phone != ''")
-    customers = c.fetchall(); conn.close()
+    matn = ' '.join(ctx.args)
+    full = f"\U0001F4E3 ThermoCrafts\n\n{matn}\n\n\U0001F4CD Yunusobod, Toshkent\n\U0001F4DE Savollar uchun shu yerga yozing"
+    await u.message.reply_text(f"\u23F3 {n} ta obunachiga yuborilmoqda...")
+    yub = xato = blok = 0
+    for chat_id, nomi, uname, joined, act in sub_list():
+        try:
+            await ctx.bot.send_message(chat_id=chat_id, text=full)
+            yub += 1
+        except Exception as e:
+            s = str(e).lower()
+            if 'blocked' in s or 'not found' in s or 'deactivated' in s or 'initiate' in s:
+                sub_off(chat_id); blok += 1
+            else:
+                xato += 1
+        await asyncio.sleep(0.05)
+    conn = db(); cc = conn.cursor()
+    cc.execute("UPDATE subscribers SET last_sent=? WHERE active=1", (today(),))
+    conn.commit(); conn.close()
+    res = f"\U0001F4E3 Natija\n\n\u2705 Yuborildi: {yub} ta"
+    if blok: res += f"\n\U0001F6AB Bloklagan: {blok} ta (ro'yxatdan chiqarildi)"
+    if xato: res += f"\n\u26A0\uFE0F Xato: {xato} ta"
+    await u.message.reply_text(res)
 
-    if not customers:
-        await u.message.reply_text("❌ Mijozlar bazasida telefon raqami yo'q!\n\nAvval mijoz qo'shing: `Jahongir mijoz 998901234567`", parse_mode='Markdown')
+async def cmd_obunachilar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Obunachilar ro'yxati"""
+    if not is_owner(u): return
+    subs = sub_list()
+    me = await ctx.bot.get_me()
+    if not subs:
+        await u.message.reply_text(
+            f"\U0001F465 Obunachi yo'q.\n\nHavola:\nhttps://t.me/{me.username}\n\n"
+            f"Buni OLX e'lonlaringizga, kanal tavsifiga va mijozlarga yuboring.")
         return
-
-    sent = 0; failed = 0
-    full_text = (
-        f"📣 *ThermoCrafts*\n\n"
-        f"{reklama_text}\n\n"
-        f"📍 Yunusobod, Toshkent\n"
-        f"#ThermoCrafts"
-    )
-
-    await u.message.reply_text(f"⏳ {len(customers)} ta mijozga yuborilmoqda...")
-
-    for cust in customers:
-        phone = cust[2]
-        if phone and phone.startswith('@'):
-            try:
-                await ctx.bot.send_message(chat_id=phone, text=full_text, parse_mode='Markdown')
-                sent += 1
-            except:
-                failed += 1
-        else:
-            failed += 1
-
-    await u.message.reply_text(
-        f"📣 *Reklama natijasi:*\n\n"
-        f"✅ Yuborildi: {sent} ta\n"
-        f"❌ Yuborilmadi: {failed} ta\n\n"
-        f"_Eslatma: Faqat @username saqlangan mijozlarga yuboriladi_",
-        parse_mode='Markdown')
+    text = f"\U0001F465 OBUNACHILAR: {len(subs)} ta\n\n"
+    for cid, nomi, uname, joined, act in subs[:40]:
+        text += f"\u2022 {nomi or 'ismsiz'}"
+        if uname: text += f" (@{uname})"
+        text += f" \u2014 {joined}\n"
+    if len(subs) > 40: text += f"\n...va yana {len(subs)-40} ta\n"
+    text += f"\n\U0001F517 https://t.me/{me.username}"
+    await u.message.reply_text(text)
 
 async def cmd_reklama_preview(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reklama ko'rinishini oldindan ko'rish"""
@@ -3519,10 +3690,12 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
+    OWNER = filters.User(user_id=OWNER_ID)
+
     # Yangi tovar qo'shish (ConversationHandler)
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('yangi_tovar', conv_start),
+            CommandHandler('yangi_tovar', conv_start, filters=filters.User(user_id=OWNER_ID)),
             CallbackQueryHandler(conv_start, pattern='^new_product$'),
         ],
         states={
@@ -3551,7 +3724,9 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler('start', cmd_start))
+    app.add_handler(CommandHandler('start', cmd_start, filters=OWNER))
+    app.add_handler(CommandHandler('start', cmd_start_public, filters=~OWNER))
+    app.add_handler(CommandHandler('stop', cmd_stop_public, filters=~OWNER))
     app.add_handler(CommandHandler('help', cmd_yordam))
     app.add_handler(CommandHandler('yordam', cmd_yordam))
     app.add_handler(CommandHandler('astatka', cmd_astatka))
@@ -3589,6 +3764,7 @@ def main():
     app.add_handler(CommandHandler('eslatmalar', cmd_eslatmalar))
     app.add_handler(CommandHandler('reklama', cmd_reklama))
     app.add_handler(CommandHandler('reklama_preview', cmd_reklama_preview))
+    app.add_handler(CommandHandler('obunachilar', cmd_obunachilar))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.Document.ALL, handle_photo_ai))
     app.add_handler(MessageHandler(filters.VIDEO & ~filters.Document.ALL, handle_video_post))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -3597,7 +3773,8 @@ def main():
     app.add_handler(CommandHandler('post_taklif', cmd_post_taklif))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & OWNER, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~OWNER, handle_text_public))
 
     _install_safe_reply()
     app.add_error_handler(on_error)
