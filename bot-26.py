@@ -1008,6 +1008,32 @@ AI_TOOLS = [
          "amount_usd": {"type": "number", "description": "To'langan summa. Bo'sh = butun qarz"},
          "from_cash": {"type": "boolean", "default": True, "description": "Kassadan chiqim yozilsinmi. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa — false"},
          "note": {"type": "string", "default": ""}}}},
+    {"name": "get_financial_statements",
+     "description": "Moliyaviy hisobot: P&L (tushum, tannarx, yalpi va sof foyda), Balans (aktiv/passiv/kapital), Cash Flow. Egasi 'moliyaviy hisobot', 'balans', 'foyda qancha', 'biznes qiymati' desa ishlating.",
+     "input_schema": {"type": "object", "properties": {
+         "period": {"type": "string", "description": "YYYY-MM yoki YYYY. Bo'sh = joriy oy"}}}},
+    {"name": "get_aging",
+     "description": "Qarzdorlik yoshi: kim necha kundan beri qarzdor (0-30/31-60/61-90/90+), biz kimga qarzdormiz, zavod qarzi.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_inventory_turnover",
+     "description": "Tovar aylanishi: har mahsulot uchun band kapital, zaxira necha kunga yetadi, qaysi tovar harakatsiz, qaysisiga qayta buyurtma kerak.",
+     "input_schema": {"type": "object", "properties": {
+         "days": {"type": "integer", "default": 90}}}},
+    {"name": "close_period",
+     "description": "Oyni yopadi \u2014 o'sha oyga yangi yozuv kiritib bo'lmaydi. Egasidan tasdiq oling.",
+     "input_schema": {"type": "object", "required": ["period"], "properties": {
+         "period": {"type": "string", "description": "YYYY-MM"},
+         "reopen": {"type": "boolean", "default": False, "description": "true \u2014 yopilgan oyni qayta ochadi"}}}},
+    {"name": "create_document",
+     "description": "Mijozga hisob-faktura yoki chek yaratib yuboradi (PDF).",
+     "input_schema": {"type": "object", "required": ["customer", "lines"], "properties": {
+         "doc_type": {"type": "string", "enum": ["faktura", "chek"], "default": "faktura"},
+         "customer": {"type": "string"},
+         "lines": {"type": "array", "description": "Mahsulotlar",
+                   "items": {"type": "object", "required": ["product", "qty"], "properties": {
+                       "product": {"type": "string"}, "qty": {"type": "integer"},
+                       "price_usd": {"type": "number", "description": "Bo'sh = ro'yxat narxi"}}}},
+         "note": {"type": "string", "default": ""}}}},
     {"name": "send_dashboard",
      "description": "Biznes holatini chiroyli HTML dashboard fayl qilib yuboradi: kassa, astatka, oylik savdo grafigi, xarajatlar, nelikvid, raqobat. Egasi 'dashboard', 'umumiy holat', 'hisobot fayl' desa ishlating.",
      "input_schema": {"type": "object", "properties": {}}},
@@ -1058,6 +1084,15 @@ AI_TOOLS = [
 
 # ── Asboblarni bajarish ──────────────────────────────────────────
 async def execute_tool(name, inp, ctx=None):
+    # ── Yopilgan davrga yozishni taqiqlash ──
+    YOZUV = {"record_sale", "record_expense", "record_cash", "add_debt",
+             "pay_factory_debt", "undo_operation", "add_stock"}
+    if name in YOZUV:
+        _s = inp.get("date") or today()
+        if is_closed(_s):
+            return _j({"error": f"{str(_s)[:7]} davri yopilgan \u2014 yozuv kiritib bo'lmaydi. "
+                                f"Ochish uchun close_period ni reopen=true bilan chaqiring yoki /och {str(_s)[:7]}"})
+
     try:
         if name == "get_stock":
             q = (inp.get("query") or "").lower()
@@ -1223,6 +1258,54 @@ async def execute_tool(name, inp, ctx=None):
                        "remaining_total_debt": round(rest, 2),
                        "cash_balance": get_cash_balance(),
                        "cash_note": "kassadan chiqim yozildi" if from_cash else "kassaga tegilmadi"})
+
+        if name == "get_financial_statements":
+            per = (inp.get("period") or this_month()).strip()
+            return _j({"pl": pl_hisobot(per), "balans": balans(), "cash_flow": cash_flow(per),
+                       "yopiq": is_closed(per + "-01")})
+
+        if name == "get_aging":
+            return _j(qarz_yoshi())
+
+        if name == "get_inventory_turnover":
+            return _j(aylanish(int(inp.get("days", 90))))
+
+        if name == "close_period":
+            per = (inp.get("period") or "").strip()
+            if not re.match(r"^\\d{4}-\\d{2}$", per):
+                return _j({"error": "Format: YYYY-MM"})
+            if inp.get("reopen"):
+                return _j({"ok": open_period(per), "period": per, "holat": "ochildi"})
+            if is_closed(per + "-01"):
+                return _j({"error": f"{per} allaqachon yopilgan"})
+            pl = pl_hisobot(per)
+            close_period(per)
+            return _j({"ok": True, "period": per, "holat": "yopildi", "snapshot": pl})
+
+        if name == "create_document":
+            if ctx is None: return _j({"error": "ctx yo'q"})
+            lines = inp.get("lines") or []
+            qatorlar = []
+            for ln in lines:
+                p = find_product(ln.get("product", ""))
+                if not p: return _j({"error": f"Mahsulot topilmadi: {ln.get('product')}"})
+                narx = float(ln.get("price_usd") or 0) or p["price"]
+                if narx >= 5000: narx = round(narx / get_exchange_rate(), 2)
+                qatorlar.append((p["name"], int(ln.get("qty", 1)), narx))
+            if not qatorlar: return _j({"error": "Mahsulot ko'rsatilmagan"})
+            base = f"/tmp/doc_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+            p_, raqam, jami, is_pdf = await asyncio.to_thread(
+                build_hujjat, base, inp.get("doc_type", "faktura"),
+                inp.get("customer", ""), qatorlar, inp.get("note", ""))
+            with open(p_, "rb") as fh:
+                await ctx.bot.send_document(
+                    chat_id=OWNER_ID, document=fh,
+                    filename=f"{raqam}.{'pdf' if is_pdf else 'html'}",
+                    caption=f"\U0001F4C4 {raqam} \u00b7 {fmt(jami)}")
+            try: os.remove(p_)
+            except Exception: pass
+            return _j({"ok": True, "raqam": raqam, "jami": jami, "format": "pdf" if is_pdf else "html",
+                       "eslatma": "" if is_pdf else "PDF uchun egasi /deps buyrug'ini berishi kerak"})
 
         if name == "send_dashboard":
             if ctx is None: return _j({"error": "ctx yo'q"})
@@ -1529,6 +1612,8 @@ ISH QOIDALARI:
 8. Raqamlar: $1,250 / 14,700,000 so'm.
 9. Egasi rasm yuborsa: chek bo'lsa — xarajat yozing; mahsulot bo'lsa — qaysi mahsulot ekanini ayting; boshqa bo'lsa — tavsiflab so'rang.
 10. Zavod qarzi to'langan desa — pay_factory_debt ishlating. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa, from_cash=false qo'ying (kassa ikki marta kamaymasin). To'lov hozir bo'lgan bo'lsa from_cash=true.
+14. MOLIYA: 'foyda qancha', 'balans', 'biznes qancha turadi' — get_financial_statements. 'kim qarzdor', 'qachondan beri' — get_aging. 'qaysi tovar turib qoldi', 'qayta buyurtma' — get_inventory_turnover. Hisobotlarni izohlab bering: shunchaki raqam emas, xulosa ayting.
+15. HUJJAT: mijozga faktura/chek kerak bo'lsa create_document. Oy yopish so'ralsa close_period — avval o'sha oy hisobotini ko'rsatib tasdiq oling.
 13. RAQOBAT: egasi raqobatchi narxini aytsa — record_competitor_price bilan darhol yozing. "bozorda qancha?", "raqobatchilar qancha sotyapti?" desa — avval get_competitor_analysis; ma'lumot yo'q yoki eskirgan bo'lsa web_search bilan OLX/birbir dan qidiring, topganingizni record_competitor_price bilan saqlang, keyin xulosa ayting. Narx bo'yicha maslahat berganda marjani (narx - sebest) hisobga oling — sebestdan past taklif qilmang.
 11. PUL CHIQIMI UCHUN QAYSI ASBOB (muhim, chalkashtirmang):
     - record_expense — HAQIQIY XARAJAT: reklama, OLX, transport, ijara, bank komissiyasi, AI xizmati, yo'lkira. Bu kassadan ham chiqadi, xarajat hisobotida ham ko'rinadi. Chiqim bo'lsa DOIM shuni ishlating.
@@ -1695,6 +1780,7 @@ async def _scheduler(app):
 async def _post_init(app):
     init_ai_tables()
     init_sub_table()
+    init_erp_tables()
     asyncio.create_task(_scheduler(app))
 
 
@@ -1928,6 +2014,171 @@ footer{margin-top:28px;color:var(--ink3);font-size:11.5px;text-align:center}
 </script>
 </body></html>"""
 
+
+
+# ══════════════════════════════════════════════════════════════════
+# MOLIYA — P&L, Balans, Cash Flow, oy yopish, qarz yoshi, aylanish
+# ══════════════════════════════════════════════════════════════════
+
+def init_erp_tables():
+    conn = db(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS closed_periods (
+        period TEXT PRIMARY KEY, closed_at TEXT, snapshot TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, raqam TEXT, turi TEXT,
+        sana TEXT, mijoz TEXT, summa REAL, sale_id INTEGER, izoh TEXT)""")
+    conn.commit(); conn.close()
+
+
+# ── Oy yopish ─────────────────────────────────────────────────────
+def is_closed(sana):
+    """Shu sanadagi oy yopilganmi"""
+    if not sana: return False
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT 1 FROM closed_periods WHERE period=?", (str(sana)[:7],))
+    r = c.fetchone(); conn.close(); return bool(r)
+
+def closed_list():
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT period, closed_at FROM closed_periods ORDER BY period")
+    r = c.fetchall(); conn.close(); return r
+
+def close_period(period):
+    snap = json.dumps(pl_hisobot(period), ensure_ascii=False, default=str)
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO closed_periods (period,closed_at,snapshot) VALUES (?,?,?)",
+              (period, now_t(), snap))
+    conn.commit(); conn.close()
+
+def open_period(period):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM closed_periods WHERE period=?", (period,))
+    n = c.rowcount; conn.commit(); conn.close(); return n > 0
+
+
+# ── P&L (Daromad va xarajatlar) ───────────────────────────────────
+def pl_hisobot(davr):
+    """davr: 'YYYY-MM' yoki 'YYYY'"""
+    conn = db(); c = conn.cursor()
+    f = davr + '%'
+    c.execute("SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(unit_cost*qty),0), COUNT(*), COALESCE(SUM(qty),0) "
+              "FROM sales WHERE date LIKE ? AND reversed=0", (f,))
+    tushum, cogs, adet, dona = c.fetchone()
+    c.execute("SELECT expense_type, category, COALESCE(SUM(amount),0) FROM expenses "
+              "WHERE date LIKE ? AND reversed=0 GROUP BY expense_type, category", (f,))
+    rows = c.fetchall(); conn.close()
+
+    togri = {}   # cogs_bank, cogs_delivery
+    davr_x = {}  # period
+    for et, cat, amt in rows:
+        (togri if et in ('cogs_bank', 'cogs_delivery') else davr_x)[cat] = \
+            (togri if et in ('cogs_bank', 'cogs_delivery') else davr_x).get(cat, 0) + amt
+    t_togri = sum(togri.values()); t_davr = sum(davr_x.values())
+    yalpi = tushum - cogs - t_togri
+    sof = yalpi - t_davr
+    return {'davr': davr, 'tushum': tushum, 'cogs': cogs, 'togri_xarajat': t_togri,
+            'togri_tafsil': togri, 'yalpi_foyda': yalpi, 'davr_xarajat': t_davr,
+            'davr_tafsil': davr_x, 'sof_foyda': sof, 'sotuv_soni': adet, 'dona': dona,
+            'marja_pct': round(yalpi / tushum * 100, 1) if tushum else 0,
+            'sof_pct': round(sof / tushum * 100, 1) if tushum else 0}
+
+
+# ── Balans ────────────────────────────────────────────────────────
+def balans(sanagacha=None):
+    sana = sanagacha or today()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(CASE WHEN type='kirim' THEN amount ELSE -amount END),0) "
+              "FROM cash_box WHERE date<=?", (sana,))
+    naqd = c.fetchone()[0] or 0
+    c.execute("SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type='berildi' AND date<=?", (sana,))
+    debitor = c.fetchone()[0] or 0
+    c.execute("SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type='olindi' AND date<=?", (sana,))
+    kreditor = c.fetchone()[0] or 0
+    c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
+    zavod = c.fetchone()[0] or 0
+    c.execute("SELECT COALESCE(SUM(deposit),0) FROM transit WHERE status='yolda'")
+    yolda = c.fetchone()[0] or 0
+    conn.close()
+    tovar = sum(p['qty'] * p['cost'] for p in get_products())
+    aktiv = naqd + tovar + debitor + yolda
+    passiv = kreditor + zavod
+    return {'sana': sana, 'naqd': naqd, 'tovar': tovar, 'debitor': debitor, 'yolda': yolda,
+            'aktiv': aktiv, 'kreditor': kreditor, 'zavod_qarzi': zavod, 'passiv': passiv,
+            'kapital': aktiv - passiv}
+
+
+# ── Cash Flow ─────────────────────────────────────────────────────
+def cash_flow(davr):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(CASE WHEN type='kirim' THEN amount ELSE -amount END),0) "
+              "FROM cash_box WHERE date < ?", (davr + '-01' if len(davr) == 7 else davr + '-01-01',))
+    boshi = c.fetchone()[0] or 0
+    c.execute("SELECT type, category, COALESCE(SUM(amount),0) FROM cash_box "
+              "WHERE date LIKE ? GROUP BY type, category", (davr + '%',))
+    rows = c.fetchall(); conn.close()
+    kirim = {}; chiqim = {}
+    for t, cat, amt in rows:
+        (kirim if t == 'kirim' else chiqim)[cat or 'boshqa'] = amt
+    tk = sum(kirim.values()); tc = sum(chiqim.values())
+    return {'davr': davr, 'boshi': boshi, 'kirim': kirim, 'chiqim': chiqim,
+            'jami_kirim': tk, 'jami_chiqim': tc, 'oxiri': boshi + tk - tc}
+
+
+# ── Qarz yoshi ────────────────────────────────────────────────────
+def qarz_yoshi():
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id,date,person,amount,type,note FROM debts WHERE paid=0 ORDER BY date")
+    debts = c.fetchall()
+    c.execute("SELECT id,date,supplier,product,remaining FROM transit WHERE remaining>0 ORDER BY date")
+    tr = c.fetchall(); conn.close()
+    bugun = datetime.now()
+
+    def guruh(rows, kim_i, sum_i, sana_i=1, izoh=None):
+        out = {'0-30': [], '31-60': [], '61-90': [], '90+': []}
+        for r in rows:
+            try: kun = (bugun - datetime.strptime(r[sana_i], '%Y-%m-%d')).days
+            except Exception: kun = 0
+            b = '0-30' if kun <= 30 else '31-60' if kun <= 60 else '61-90' if kun <= 90 else '90+'
+            out[b].append({'kim': r[kim_i], 'summa': r[sum_i], 'kun': kun,
+                           'izoh': r[izoh] if izoh is not None else ''})
+        return out
+
+    bizga = guruh([d for d in debts if d[4] == 'berildi'], 2, 3, 1, 5)
+    bizdan = guruh([d for d in debts if d[4] == 'olindi'], 2, 3, 1, 5)
+    zavod = guruh(tr, 2, 4, 1, 3)
+    def jami(g): return sum(x['summa'] for b in g.values() for x in b)
+    return {'bizga_qarzdor': bizga, 'biz_qarzdormiz': bizdan, 'zavod': zavod,
+            'jami_debitor': jami(bizga), 'jami_kreditor': jami(bizdan) + jami(zavod)}
+
+
+# ── Tovar aylanishi ───────────────────────────────────────────────
+def aylanish(kun=90):
+    since = (datetime.now() - timedelta(days=kun)).strftime('%Y-%m-%d')
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT product, SUM(qty), SUM(revenue), SUM(unit_cost*qty), MAX(date) FROM sales "
+              "WHERE date>=? AND reversed=0 GROUP BY product", (since,))
+    sot = {r[0]: (r[1], r[2], r[3], r[4]) for r in c.fetchall()}
+    conn.close()
+    out = []
+    for p in get_products():
+        q, rev, cogs, oxirgi = sot.get(p['name'], (0, 0, 0, None))
+        kunlik = q / kun if q else 0
+        zaxira_kun = round(p['qty'] / kunlik) if kunlik > 0 else (None if p['qty'] > 0 else 0)
+        band = p['qty'] * p['cost']
+        out.append({'nom': p['name'], 'sup': p['sup'], 'qoldiq': p['qty'],
+                    'sotildi': q, 'tushum': rev, 'cogs': cogs, 'band_kapital': band,
+                    'kunlik': round(kunlik, 3), 'zaxira_kun': zaxira_kun,
+                    'oxirgi_sotuv': oxirgi, 'marja': p['price'] - p['cost'],
+                    'holat': ('tez' if zaxira_kun is not None and zaxira_kun < 30 else
+                              'normal' if zaxira_kun is not None and zaxira_kun <= 90 else
+                              'sekin' if zaxira_kun is not None else 'harakatsiz')})
+    out.sort(key=lambda x: -x['band_kapital'])
+    jami_band = sum(x['band_kapital'] for x in out)
+    jami_cogs = sum(x['cogs'] for x in out)
+    return {'kun': kun, 'mahsulotlar': out, 'jami_band_kapital': jami_band,
+            'davr_cogs': jami_cogs,
+            'aylanish_koef': round(jami_cogs / jami_band, 2) if jami_band else 0,
+            'ortacha_zaxira_kun': round(jami_band / (jami_cogs / kun)) if jami_cogs else None}
 
 # ══════════════════════════════════════════════════════════════════
 # DASHBOARD — bitta ekranda butun biznes (HTML fayl)
@@ -2177,6 +2428,363 @@ async def cmd_dashboard(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"⚠️ Xato: {str(e)[:250]}")
 
 
+
+
+# ── HUJJAT (hisob-faktura / chek) ─────────────────────────────────
+FIRMA = {
+    'nom': os.getenv('FIRMA_NOM', 'ThermoCrafts'),
+    'manzil': os.getenv('FIRMA_MANZIL', "Yunusobod tumani, Toshkent"),
+    'tel': os.getenv('FIRMA_TEL', ''),
+    'stir': os.getenv('FIRMA_STIR', ''),
+    'hisob': os.getenv('FIRMA_HISOB', ''),
+}
+
+def _lat(s):
+    """PDF uchun matnni latin-1 ga moslashtiradi"""
+    s = str(s)
+    for a, b in (('ʻ', "'"), ('ʼ', "'"), ('‘', "'"), ('’', "'"),
+                 ('—', '-'), ('–', '-'), ('…', '...')):
+        s = s.replace(a, b)
+    return s.encode('latin-1', 'replace').decode('latin-1')
+
+def keyingi_raqam(turi):
+    conn = db(); c = conn.cursor()
+    yil = datetime.now().strftime('%Y')
+    c.execute("SELECT COUNT(*) FROM documents WHERE turi=? AND sana LIKE ?", (turi, yil + '%'))
+    n = c.fetchone()[0] + 1; conn.close()
+    pref = {'faktura': 'HF', 'chek': 'CH'}.get(turi, 'DOC')
+    return f"{pref}-{yil}-{n:04d}"
+
+def hujjat_yoz(raqam, turi, mijoz, summa, sale_id=None, izoh=''):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO documents (raqam,turi,sana,mijoz,summa,sale_id,izoh) VALUES (?,?,?,?,?,?,?)",
+              (raqam, turi, today(), mijoz, summa, sale_id, izoh))
+    conn.commit(); conn.close()
+
+def build_hujjat(path, turi, mijoz, qatorlar, izoh=''):
+    """qatorlar: [(nom, soni, narx)]  -> PDF yoki HTML fayl yaratadi"""
+    raqam = keyingi_raqam(turi)
+    rate = get_exchange_rate()
+    jami = sum(q * n for _, q, n in qatorlar)
+    sarlavha = 'HISOB-FAKTURA' if turi == 'faktura' else 'CHEK'
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        p2 = path.rsplit('.', 1)[0] + '.html'
+        _hujjat_html(p2, raqam, sarlavha, mijoz, qatorlar, jami, rate, izoh)
+        hujjat_yoz(raqam, turi, mijoz, jami, None, izoh)
+        return p2, raqam, jami, False
+
+    pdf = FPDF(); pdf.add_page(); pdf.set_auto_page_break(True, 18)
+    pdf.set_font('helvetica', 'B', 17)
+    pdf.cell(0, 9, _lat(FIRMA['nom']), ln=1)
+    pdf.set_font('helvetica', '', 9)
+    for k in ('manzil', 'tel', 'stir', 'hisob'):
+        if FIRMA[k]:
+            yor = {'manzil': '', 'tel': 'Tel: ', 'stir': 'STIR: ', 'hisob': 'H/r: '}[k]
+            pdf.cell(0, 4.6, _lat(yor + FIRMA[k]), ln=1)
+    pdf.ln(4)
+    pdf.set_draw_color(200, 200, 200); pdf.set_line_width(0.3)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y()); pdf.ln(5)
+
+    pdf.set_font('helvetica', 'B', 13)
+    pdf.cell(0, 7, _lat(f"{sarlavha}  {raqam}"), ln=1)
+    pdf.set_font('helvetica', '', 10)
+    pdf.cell(0, 5.5, _lat(f"Sana: {datetime.now().strftime('%d.%m.%Y')}"), ln=1)
+    if mijoz: pdf.cell(0, 5.5, _lat(f"Mijoz: {mijoz}"), ln=1)
+    pdf.ln(4)
+
+    w = (95, 20, 35, 35)
+    pdf.set_font('helvetica', 'B', 9); pdf.set_fill_color(240, 240, 238)
+    for t, wd, al in zip(('Mahsulot', 'Soni', 'Narx', 'Summa'), w, 'LCRR'):
+        pdf.cell(wd, 8, _lat(t), border='B', align=al, fill=True)
+    pdf.ln()
+    pdf.set_font('helvetica', '', 9.5)
+    for nom, soni, narx in qatorlar:
+        pdf.cell(w[0], 7.5, _lat(nom)[:52], border='B')
+        pdf.cell(w[1], 7.5, str(soni), border='B', align='C')
+        pdf.cell(w[2], 7.5, f"${narx:,.2f}", border='B', align='R')
+        pdf.cell(w[3], 7.5, f"${soni*narx:,.2f}", border='B', align='R')
+        pdf.ln()
+    pdf.set_font('helvetica', 'B', 11)
+    pdf.cell(w[0] + w[1] + w[2], 10, _lat('JAMI'), align='R')
+    pdf.cell(w[3], 10, f"${jami:,.2f}", align='R'); pdf.ln()
+    pdf.set_font('helvetica', '', 9)
+    pdf.cell(0, 5.5, _lat(f"({jami*rate:,.0f} so'm,  kurs 1 USD = {rate:,.0f})"), align='R', ln=1)
+
+    if izoh:
+        pdf.ln(4); pdf.set_font('helvetica', '', 9)
+        pdf.multi_cell(0, 5, _lat(izoh))
+    pdf.ln(12)
+    pdf.set_font('helvetica', '', 9)
+    pdf.cell(95, 6, _lat('Topshirdi: ____________________'))
+    pdf.cell(95, 6, _lat('Qabul qildi: ____________________'), ln=1)
+    pdf.output(path)
+    hujjat_yoz(raqam, turi, mijoz, jami, None, izoh)
+    return path, raqam, jami, True
+
+
+def _hujjat_html(path, raqam, sarlavha, mijoz, qatorlar, jami, rate, izoh):
+    rek = ''.join(f'<div>{v}</div>' for k, v in FIRMA.items() if v and k != 'nom')
+    rows = ''.join(
+        f'<tr><td>{n}</td><td class=c>{q}</td><td class=r>${p:,.2f}</td>'
+        f'<td class=r>${q*p:,.2f}</td></tr>' for n, q, p in qatorlar)
+    html = f"""<!DOCTYPE html><html lang=uz><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>{raqam}</title><style>
+body{{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:0 auto;padding:28px 18px;color:#111}}
+h1{{font-size:20px;margin:0 0 3px}} .rek{{color:#555;font-size:12px}}
+hr{{border:0;border-top:1px solid #ddd;margin:16px 0}}
+h2{{font-size:16px;margin:0 0 6px}} .meta{{color:#555;font-size:13px;margin-bottom:14px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{text-align:left;background:#f4f4f2;padding:8px 6px;border-bottom:1px solid #ddd;font-size:11px;
+text-transform:uppercase;letter-spacing:.04em}}
+td{{padding:8px 6px;border-bottom:1px solid #eee}} .c{{text-align:center}} .r{{text-align:right}}
+.jami td{{font-weight:700;font-size:15px;border-top:2px solid #333;border-bottom:0}}
+.uzs{{text-align:right;color:#555;font-size:12px;margin-top:4px}}
+.imzo{{display:flex;justify-content:space-between;margin-top:46px;color:#555;font-size:13px}}
+@media print{{body{{padding:0}}}}
+</style></head><body>
+<h1>{FIRMA['nom']}</h1><div class=rek>{rek}</div><hr>
+<h2>{sarlavha} &nbsp;{raqam}</h2>
+<div class=meta>Sana: {datetime.now().strftime('%d.%m.%Y')}{f'<br>Mijoz: {mijoz}' if mijoz else ''}</div>
+<table><thead><tr><th>Mahsulot</th><th class=c>Soni</th><th class=r>Narx</th><th class=r>Summa</th></tr></thead>
+<tbody>{rows}<tr class=jami><td colspan=3 class=r>JAMI</td><td class=r>${jami:,.2f}</td></tr></tbody></table>
+<div class=uzs>({jami*rate:,.0f} so'm, kurs 1 USD = {rate:,.0f})</div>
+{f'<p>{izoh}</p>' if izoh else ''}
+<div class=imzo><span>Topshirdi: ____________</span><span>Qabul qildi: ____________</span></div>
+</body></html>"""
+    with open(path, 'w', encoding='utf-8') as f: f.write(html)
+
+
+# ── BUYRUQLAR ─────────────────────────────────────────────────────
+async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/moliya [YYYY-MM|yil] — P&L, balans, cash flow"""
+    if not is_owner(u): return
+    a = (ctx.args or [])
+    davr = a[0] if a else this_month()
+    if davr.lower() in ('yil', 'year'): davr = datetime.now().strftime('%Y')
+    pl = pl_hisobot(davr); bl = balans(); cf = cash_flow(davr)
+    yopiq = ' \U0001F512' if is_closed(davr + '-01') else ''
+
+    t = f"\U0001F4C8 MOLIYAVIY HISOBOT — {davr}{yopiq}\n\n"
+    t += "── DAROMAD VA XARAJATLAR ──\n"
+    t += f"Tushum               {fmt(pl['tushum'])}\n"
+    t += f"Tovar tannarxi      -{fmt(pl['cogs'])}\n"
+    if pl['togri_xarajat']:
+        t += f"Bank + dostavka     -{fmt(pl['togri_xarajat'])}\n"
+    t += f"────────────────────\n"
+    t += f"Yalpi foyda          {fmt(pl['yalpi_foyda'])}  ({pl['marja_pct']}%)\n\n"
+    if pl['davr_tafsil']:
+        t += "Davr xarajatlari:\n"
+        for k, v in sorted(pl['davr_tafsil'].items(), key=lambda x: -x[1]):
+            t += f"  {k:<16} -{fmt(v)}\n"
+        t += f"  {'jami':<16} -{fmt(pl['davr_xarajat'])}\n\n"
+    t += f"✅ SOF FOYDA          {fmt(pl['sof_foyda'])}  ({pl['sof_pct']}%)\n"
+    t += f"   {pl['sotuv_soni']} ta sotuv · {pl['dona']} dona\n\n"
+
+    t += "── BALANS ──\n"
+    t += f"AKTIV\n"
+    t += f"  Kassa              {fmt(bl['naqd'])}\n"
+    t += f"  Tovar (sebest)     {fmt(bl['tovar'])}\n"
+    if bl['debitor']: t += f"  Debitorlik         {fmt(bl['debitor'])}\n"
+    if bl['yolda']:   t += f"  Yo'ldagi avans     {fmt(bl['yolda'])}\n"
+    t += f"  Jami aktiv         {fmt(bl['aktiv'])}\n\n"
+    t += f"PASSIV\n"
+    if bl['zavod_qarzi']: t += f"  Zavod qarzi        {fmt(bl['zavod_qarzi'])}\n"
+    if bl['kreditor']:    t += f"  Boshqa qarzlar     {fmt(bl['kreditor'])}\n"
+    t += f"  Jami passiv        {fmt(bl['passiv'])}\n\n"
+    t += f"\U0001F4B0 SOF KAPITAL        {fmt(bl['kapital'])}\n\n"
+
+    t += "── PUL OQIMI ──\n"
+    t += f"Boshida              {fmt(cf['boshi'])}\n"
+    t += f"Kirim               +{fmt(cf['jami_kirim'])}\n"
+    t += f"Chiqim              -{fmt(cf['jami_chiqim'])}\n"
+    t += f"Oxirida              {fmt(cf['oxiri'])}\n"
+    await u.message.reply_text(t)
+
+
+async def cmd_qarz_yosh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/qarz_yosh — qarzdorlik yoshi bo'yicha"""
+    if not is_owner(u): return
+    q = qarz_yoshi()
+    def blok(g, sarlavha, emoji):
+        jami = sum(x['summa'] for b in g.values() for x in b)
+        if jami == 0: return ''
+        s = f"{emoji} {sarlavha}: {fmt(jami)}\n"
+        for b in ('0-30', '31-60', '61-90', '90+'):
+            if not g[b]: continue
+            bs = sum(x['summa'] for x in g[b])
+            mark = '\U0001F7E2' if b == '0-30' else '\U0001F7E1' if b == '31-60' else '\U0001F534'
+            s += f"  {mark} {b} kun: {fmt(bs)}\n"
+            for x in sorted(g[b], key=lambda y: -y['kun'])[:6]:
+                s += f"     • {x['kim']} — {fmt(x['summa'])} ({x['kun']} kun)\n"
+        return s + "\n"
+    t = "\U0001F4CB QARZDORLIK YOSHI\n\n"
+    t += blok(q['bizga_qarzdor'], "Bizga qarzdor", "\U0001F4E5")
+    t += blok(q['biz_qarzdormiz'], "Biz qarzdormiz", "\U0001F4E4")
+    t += blok(q['zavod'], "Zavod qarzi", "\U0001F3ED")
+    if q['jami_debitor'] == 0 and q['jami_kreditor'] == 0:
+        t += "Ochiq qarz yo'q — hammasi toza."
+    else:
+        t += f"────────────────\n"
+        t += f"Debitor {fmt(q['jami_debitor'])} · Kreditor {fmt(q['jami_kreditor'])}\n"
+        t += f"Sof: {fmt(q['jami_debitor'] - q['jami_kreditor'])}"
+    await u.message.reply_text(t)
+
+
+async def cmd_aylanish(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/aylanish — tovar aylanishi va band kapital"""
+    if not is_owner(u): return
+    a = aylanish(90)
+    t = "\U0001F504 TOVAR AYLANISHI (90 kun)\n\n"
+    t += f"Band kapital: {fmt(a['jami_band_kapital'])}\n"
+    t += f"Davr tannarxi: {fmt(a['davr_cogs'])}\n"
+    t += f"Aylanish koeffitsienti: {a['aylanish_koef']}\n"
+    if a['ortacha_zaxira_kun']:
+        t += f"O'rtacha zaxira: {a['ortacha_zaxira_kun']} kun\n"
+    t += "\n"
+    guruh = {'tez': [], 'normal': [], 'sekin': [], 'harakatsiz': []}
+    for x in a['mahsulotlar']:
+        if x['qoldiq'] > 0: guruh[x['holat']].append(x)
+    nom = {'tez': ('\U0001F7E2 Tez ketadi (<30 kun)', 'Qayta buyurtma kerak'),
+           'normal': ('\U0001F535 Normal (30-90 kun)', ''),
+           'sekin': ('\U0001F7E1 Sekin (>90 kun)', ''),
+           'harakatsiz': ('\U0001F534 Harakatsiz', '90 kunda sotilmagan')}
+    for k in ('tez', 'normal', 'sekin', 'harakatsiz'):
+        if not guruh[k]: continue
+        sarl, izoh = nom[k]
+        band = sum(x['band_kapital'] for x in guruh[k])
+        t += f"{sarl} — {fmt(band)}"
+        t += f"  • {izoh}\n" if izoh else "\n"
+        for x in sorted(guruh[k], key=lambda y: -y['band_kapital'])[:8]:
+            zk = f"{x['zaxira_kun']} kun" if x['zaxira_kun'] is not None else "—"
+            t += f"   {x['nom']}: {x['qoldiq']} ta · {fmt(x['band_kapital'])} · {zk}\n"
+        t += "\n"
+    await u.message.reply_text(t)
+
+
+async def cmd_yop(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/yop YYYY-MM — oyni yopadi"""
+    if not is_owner(u): return
+    a = ctx.args or []
+    if not a:
+        yop = closed_list()
+        t = "\U0001F512 YOPILGAN DAVRLAR\n\n"
+        t += ("\n".join(f"• {p} — {c}" for p, c in yop) if yop else "Yopilgan davr yo'q.")
+        t += "\n\nYopish: /yop 2026-09\nOchish: /och 2026-09"
+        await u.message.reply_text(t); return
+    davr = a[0]
+    if is_closed(davr + '-01'):
+        await u.message.reply_text(f"{davr} allaqachon yopilgan."); return
+    pl = pl_hisobot(davr)
+    close_period(davr)
+    await u.message.reply_text(
+        f"\U0001F512 {davr} yopildi\n\n"
+        f"Tushum: {fmt(pl['tushum'])}\nSof foyda: {fmt(pl['sof_foyda'])}\n\n"
+        f"Bu oyga yangi yozuv kiritib bo'lmaydi.\nOchish: /och {davr}")
+
+
+async def cmd_och(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    a = ctx.args or []
+    if not a: await u.message.reply_text("Format: /och 2026-09"); return
+    ok = open_period(a[0])
+    await u.message.reply_text(f"\U0001F513 {a[0]} ochildi." if ok else f"{a[0]} yopilmagan edi.")
+
+
+async def cmd_hujjat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/hujjat [faktura|chek] Mijoz | Mahsulot x soni"""
+    if not is_owner(u): return
+    a = ctx.args or []
+    if not a:
+        await u.message.reply_text(
+            "\U0001F4C4 Hujjat yaratish\n\n"
+            "Oxirgi sotuv uchun:\n  /hujjat oxirgi\n\n"
+            "Qo'lda:\n  /hujjat faktura Alisher | TTS 20 Pro x1\n\n"
+            "Rekvizitlarni Railway Variables da sozlang:\n"
+            "FIRMA_NOM, FIRMA_MANZIL, FIRMA_TEL, FIRMA_STIR, FIRMA_HISOB")
+        return
+
+    turi = 'faktura'
+    matn = ' '.join(a)
+    if a[0].lower() in ('faktura', 'chek'):
+        turi = a[0].lower(); matn = ' '.join(a[1:])
+
+    if matn.strip().lower() in ('oxirgi', 'last'):
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT product,qty,revenue,customer FROM sales WHERE reversed=0 ORDER BY id DESC LIMIT 1")
+        r = c.fetchone(); conn.close()
+        if not r: await u.message.reply_text("Sotuv topilmadi."); return
+        mijoz = r[3] or ''
+        qatorlar = [(r[0], r[1], r[2] / max(1, r[1]))]
+    else:
+        qism = matn.split('|')
+        mijoz = qism[0].strip()
+        qatorlar = []
+        for q in qism[1:]:
+            q = q.strip()
+            if not q: continue
+            m = re.match(r'(.+?)\s*[xх\*]\s*(\d+)\s*$', q, re.I)
+            nom, soni = (m.group(1).strip(), int(m.group(2))) if m else (q, 1)
+            p = find_product(nom)
+            if not p:
+                await u.message.reply_text(f"Mahsulot topilmadi: {nom}"); return
+            qatorlar.append((p['name'], soni, p['price']))
+        if not qatorlar:
+            await u.message.reply_text("Mahsulot ko'rsatilmagan.\nMisol: /hujjat faktura Alisher | TTS 20 Pro x1"); return
+
+    await u.message.reply_text("⏳ Hujjat tayyorlanmoqda...")
+    try:
+        base = f"/tmp/doc_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+        p, raqam, jami, is_pdf = await asyncio.to_thread(build_hujjat, base, turi, mijoz, qatorlar)
+        with open(p, 'rb') as fh:
+            await ctx.bot.send_document(
+                chat_id=u.effective_chat.id, document=fh,
+                filename=f"{raqam}.{'pdf' if is_pdf else 'html'}",
+                caption=f"\U0001F4C4 {raqam} · {fmt(jami)}" +
+                        ("" if is_pdf else "\n\n⚠️ PDF uchun /deps buyrug'ini bering"))
+        try: os.remove(p)
+        except Exception: pass
+    except Exception as e:
+        log.exception("hujjat")
+        await u.message.reply_text(f"⚠️ Xato: {str(e)[:250]}")
+
+
+async def cmd_deps(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/deps — PDF kutubxonasini GitHub requirements.txt ga qo'shadi"""
+    if not is_owner(u): return
+    if not GITHUB_TOKEN:
+        await u.message.reply_text("GITHUB_TOKEN sozlanmagan."); return
+    try:
+        from fpdf import FPDF
+        await u.message.reply_text("✅ PDF kutubxonasi allaqachon o'rnatilgan."); return
+    except ImportError:
+        pass
+    await u.message.reply_text("⏳ requirements.txt yangilanmoqda...")
+    try:
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/requirements.txt"
+        r = requests.get(api, headers=_gh_headers(), timeout=20)
+        if r.status_code != 200:
+            await u.message.reply_text(f"requirements.txt topilmadi ({r.status_code})"); return
+        j = r.json()
+        cur = base64.b64decode(j['content']).decode('utf-8')
+        if 'fpdf' in cur.lower():
+            await u.message.reply_text("fpdf2 allaqachon ro'yxatda. Railway qayta deploy qiling."); return
+        yangi = cur.rstrip() + "\nfpdf2>=2.7.0\n"
+        r2 = requests.put(api, headers=_gh_headers(), timeout=30, json={
+            "message": "fpdf2 qo'shildi (PDF hujjatlar uchun)",
+            "content": base64.b64encode(yangi.encode()).decode(), "sha": j['sha']})
+        if r2.status_code in (200, 201):
+            await u.message.reply_text(
+                "✅ fpdf2 qo'shildi\n\U0001F680 Railway qayta deploy qilmoqda...\n"
+                "⏳ 2-3 daqiqadan keyin /hujjat PDF beradi.")
+        else:
+            await u.message.reply_text(f"Xato: {r2.status_code}")
+    except Exception as e:
+        log.exception("deps")
+        await u.message.reply_text(f"Xato: {str(e)[:200]}")
+
+
 async def cmd_brief(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/brief — ertalabki xulosani hozir ko'rish"""
     if not is_owner(u): return
@@ -2209,6 +2817,9 @@ MENU_MAP = {
     "🔔 Eslatmalar": "eslatmalar",
     "📣 Reklama": "reklama_menu",
     "📊 Dashboard": "dashboard",
+    "📈 Moliya": "moliya",
+    "🔄 Aylanish": "aylanish",
+    "📋 Qarz yoshi": "qarz_yosh",
     "🔍 Raqobat": "raqobat",
 }
 
@@ -2234,6 +2845,9 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'cashflow':      await cmd_cashflow(u, ctx)
     elif action == 'olx':           await cmd_olx(u, ctx)
     elif action == 'dashboard':     await cmd_dashboard(u, ctx)
+    elif action == 'moliya':        await cmd_moliya(u, ctx)
+    elif action == 'aylanish':      await cmd_aylanish(u, ctx)
+    elif action == 'qarz_yosh':     await cmd_qarz_yosh(u, ctx)
     elif action == 'raqobat':       await cmd_raqobat(u, ctx)
     elif action == 'undo_list':     await cmd_undo_list(u, ctx)
     elif action == 'kassa':         await cmd_kassa(u, ctx)
@@ -2319,6 +2933,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ["🔧 Kafolat",    "📈 Trend"],
         ["📣 Reklama",    "🔔 Eslatmalar"],
         ["📊 Dashboard",  "🔍 Raqobat"],
+        ["📈 Moliya",     "🔄 Aylanish"],
         ["💵 Cash Flow",  "📢 OLX"],
         ["➕ Yangi tovar","↩️ Qayt etish"],
     ], resize_keyboard=True, is_persistent=True)
@@ -4166,6 +4781,13 @@ def main():
     app.add_handler(CommandHandler('xotira', cmd_xotira))
     app.add_handler(CommandHandler('brief', cmd_brief))
     app.add_handler(CommandHandler('dashboard', cmd_dashboard))
+    app.add_handler(CommandHandler('moliya', cmd_moliya))
+    app.add_handler(CommandHandler('qarz_yosh', cmd_qarz_yosh))
+    app.add_handler(CommandHandler('aylanish', cmd_aylanish))
+    app.add_handler(CommandHandler('yop', cmd_yop))
+    app.add_handler(CommandHandler('och', cmd_och))
+    app.add_handler(CommandHandler('hujjat', cmd_hujjat))
+    app.add_handler(CommandHandler('deps', cmd_deps))
     app.add_handler(CommandHandler('sync_sentyabr', cmd_sync_sentyabr))
     app.add_handler(CommandHandler('backup', cmd_backup))
     app.add_handler(CommandHandler('restore', cmd_restore))
