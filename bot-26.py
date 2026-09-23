@@ -1008,6 +1008,9 @@ AI_TOOLS = [
          "amount_usd": {"type": "number", "description": "To'langan summa. Bo'sh = butun qarz"},
          "from_cash": {"type": "boolean", "default": True, "description": "Kassadan chiqim yozilsinmi. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa — false"},
          "note": {"type": "string", "default": ""}}}},
+    {"name": "send_dashboard",
+     "description": "Biznes holatini chiroyli HTML dashboard fayl qilib yuboradi: kassa, astatka, oylik savdo grafigi, xarajatlar, nelikvid, raqobat. Egasi 'dashboard', 'umumiy holat', 'hisobot fayl' desa ishlating.",
+     "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast_customers",
      "description": "Botga obuna bo'lgan mijozlarga xabar yuboradi. Faqat egasi aniq so'raganda ishlating. Avval matnni ko'rsatib tasdiq oling.",
      "input_schema": {"type": "object", "required": ["text"], "properties": {
@@ -1220,6 +1223,19 @@ async def execute_tool(name, inp, ctx=None):
                        "remaining_total_debt": round(rest, 2),
                        "cash_balance": get_cash_balance(),
                        "cash_note": "kassadan chiqim yozildi" if from_cash else "kassaga tegilmadi"})
+
+        if name == "send_dashboard":
+            if ctx is None: return _j({"error": "ctx yo'q"})
+            p = f"/tmp/TC_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            await asyncio.to_thread(build_dashboard, p)
+            with open(p, 'rb') as fh:
+                await ctx.bot.send_document(
+                    chat_id=OWNER_ID, document=fh,
+                    filename=f"ThermoCrafts_{datetime.now().strftime('%d.%m.%Y')}.html",
+                    caption="\U0001F4CA Biznes holati")
+            try: os.remove(p)
+            except Exception: pass
+            return _j({"ok": True, "note": "Dashboard fayl yuborildi"})
 
         if name == "broadcast_customers":
             n = sub_count()
@@ -1771,6 +1787,396 @@ async def cmd_sync_sentyabr(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ok, msg = await asyncio.to_thread(db_backup_to_github, 'sentyabr sync')
     await u.message.reply_text(("\U0001F4BE " if ok else "\u26a0\ufe0f ") + msg)
 
+_DASH_TPL = r"""<!DOCTYPE html>
+<html lang="uz"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ThermoCrafts</title>
+<style>
+:root{
+  color-scheme:dark;
+  --surface:#1a1a19; --card:#232322; --line:#383835;
+  --ink:#ffffff; --ink2:#c3c2b7; --ink3:#8a8a80;
+  --s1:#3987e5; --s2:#d95926;
+  --good:#0ca30c; --warning:#fab219; --critical:#d03b3b;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    color-scheme:light;
+    --surface:#fcfcfb; --card:#ffffff; --line:#e5e4e0;
+    --ink:#0b0b0b; --ink2:#52514e; --ink3:#78776f;
+    --s1:#2a78d6; --s2:#eb6834;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:20px 16px 48px;background:var(--surface);color:var(--ink);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  -webkit-text-size-adjust:100%}
+.wrap{max-width:760px;margin:0 auto}
+header{margin-bottom:20px}
+h1{font-size:21px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:16px;margin:28px 0 10px;letter-spacing:-.01em}
+h3{font-size:14px;margin:18px 0 8px;font-weight:600}
+h3 .sub{font-weight:400}
+.sub{color:var(--ink2);font-size:13px}
+.pad{margin:6px 0 8px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.tile .k{font-size:12px;color:var(--ink2);margin-bottom:5px}
+.tile .v{font-size:21px;font-weight:650;letter-spacing:-.02em;line-height:1.15}
+.tile .sub{font-size:11px;margin-top:3px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 12px;margin-top:10px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;color:var(--ink2);font-size:11px;
+  text-transform:uppercase;letter-spacing:.04em;padding:0 0 6px;border-bottom:1px solid var(--line)}
+td{padding:7px 0;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.muted{color:var(--ink2)}
+.jami td{font-weight:650;border-top:1px solid var(--line)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px;vertical-align:1px}
+.dot.good{background:var(--good)} .dot.warning{background:var(--warning)} .dot.critical{background:var(--critical)}
+.good{color:var(--good)} .warning{color:var(--warning)} .critical{color:var(--critical)}
+.tag{display:inline-block;margin-left:7px;padding:1px 6px;border-radius:5px;font-size:10.5px;
+  border:1px solid var(--line);color:var(--ink2)}
+.tag.warn{border-color:var(--warning)}
+.tag.warn::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--warning);margin-right:5px;vertical-align:1px}
+.bosh{color:var(--ink2);font-size:13px;padding:6px 0}
+.legend{display:flex;gap:16px;margin:2px 0 8px;font-size:12px;color:var(--ink2)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:0}
+.chart{position:relative}
+svg{display:block;overflow:visible}
+.grid-l{stroke:var(--line);stroke-width:1}
+.axis{stroke:var(--line);stroke-width:1}
+.ax{fill:var(--ink3);font-size:9.5px;font-family:inherit}
+.lbl{fill:var(--ink2);font-size:10px;font-weight:600;font-family:inherit}
+.s1{fill:var(--s1)} .s2{fill:var(--s2)}
+.hit{fill:transparent;cursor:pointer}
+.hit:hover,.hit.on{fill:var(--ink);opacity:.055}
+#tip{position:absolute;display:none;background:var(--card);border:1px solid var(--line);
+  border-radius:9px;padding:7px 10px;font-size:12px;pointer-events:none;white-space:nowrap;
+  box-shadow:0 4px 14px rgba(0,0,0,.28);z-index:5}
+#tip b{display:block;margin-bottom:3px;font-size:11px;color:var(--ink2);font-weight:500}
+#tip s{display:block;text-decoration:none;font-variant-numeric:tabular-nums}
+details{margin-top:8px}
+summary{font-size:12px;color:var(--ink2);cursor:pointer;padding:4px 0}
+footer{margin-top:28px;color:var(--ink3);font-size:11.5px;text-align:center}
+@media(min-width:620px){.grid{grid-template-columns:repeat(4,1fr)}}
+</style></head><body><div class="wrap">
+
+<header>
+  <h1>ThermoCrafts</h1>
+  <div class="sub">{{SANA}} &middot; 1 USD = {{RATE}} so&#8216;m</div>
+</header>
+
+<div class="grid">{{KPI}}</div>
+
+<h2>Oylik savdo &mdash; {{YIL}}</h2>
+<div class="card">
+  <div class="legend">
+    <span><i style="background:var(--s1)"></i>Tushum</span>
+    <span><i style="background:var(--s2)"></i>Foyda</span>
+  </div>
+  <div class="chart" id="ch">{{CHART}}<div id="tip"></div></div>
+  <div class="sub pad">Yil boshidan: tushum <b>${{YILTUSH}}</b> &middot; foyda <b>${{YILFOYD}}</b></div>
+  <details><summary>Jadval ko&#8216;rinishi</summary>
+    <table><thead><tr><th>Oy</th><th class="num">Sotuv</th><th class="num">Tushum</th><th class="num">Foyda</th></tr></thead>
+    <tbody>{{OYROWS}}</tbody></table>
+  </details>
+</div>
+
+<h2>Astatka</h2>
+<div class="card">{{ASTATKA}}</div>
+
+<h2>Bu oy sotuvlar</h2>
+<div class="card">{{SOTUV}}</div>
+
+<h2>Bu oy xarajatlar</h2>
+<div class="card">{{XARAJAT}}</div>
+
+<h2>Nelikvid &mdash; 2+ oy sotilmagan</h2>
+<div class="card">{{NELIKVID}}</div>
+
+<footer>ThermoCrafts &middot; Yunusobod, Toshkent</footer>
+</div>
+<script>
+(function(){
+  var ch=document.getElementById('ch'),tip=document.getElementById('tip');
+  if(!ch||!tip)return;
+  var cur=null;
+  function fmt(n){return '$'+Number(n).toLocaleString('en-US');}
+  function show(el,ev){
+    if(cur)cur.classList.remove('on');
+    el.classList.add('on');cur=el;
+    tip.innerHTML='<b>'+el.dataset.oy+'</b>'+
+      '<s>Tushum: '+fmt(el.dataset.t)+'</s><s>Foyda: '+fmt(el.dataset.f)+'</s>';
+    tip.style.display='block';
+    var r=ch.getBoundingClientRect(),b=el.getBoundingClientRect();
+    var x=b.left-r.left+b.width/2-tip.offsetWidth/2;
+    x=Math.max(2,Math.min(x,r.width-tip.offsetWidth-2));
+    tip.style.left=x+'px';tip.style.top='4px';
+  }
+  function hide(){tip.style.display='none';if(cur){cur.classList.remove('on');cur=null;}}
+  ch.querySelectorAll('.hit').forEach(function(el){
+    el.addEventListener('mouseenter',function(e){show(el,e);});
+    el.addEventListener('click',function(e){e.stopPropagation();
+      if(cur===el){hide();}else{show(el,e);}});
+  });
+  ch.addEventListener('mouseleave',hide);
+  document.addEventListener('click',hide);
+})();
+</script>
+</body></html>"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# DASHBOARD — bitta ekranda butun biznes (HTML fayl)
+# ══════════════════════════════════════════════════════════════════
+OY_NOM = ['Yan','Fev','Mar','Apr','May','Iyn','Iyl','Avg','Sen','Okt','Noy','Dek']
+
+def _dash_data():
+    """Dashboard uchun barcha ma'lumotni bazadan yig'adi"""
+    yil = datetime.now().strftime('%Y')
+    conn = db(); c = conn.cursor()
+
+    c.execute("""SELECT substr(date,1,7) AS oy, SUM(revenue), SUM(profit), COUNT(*)
+                 FROM sales WHERE date LIKE ? AND reversed=0
+                 GROUP BY oy ORDER BY oy""", (yil + '%',))
+    oylik = {r[0]: (r[1] or 0, r[2] or 0, r[3]) for r in c.fetchall()}
+
+    c.execute("""SELECT substr(date,1,7) AS oy, SUM(amount) FROM expenses
+                 WHERE date LIKE ? AND reversed=0 GROUP BY oy""", (yil + '%',))
+    xar_oy = {r[0]: (r[1] or 0) for r in c.fetchall()}
+
+    c.execute("""SELECT date,product,qty,revenue,profit FROM sales
+                 WHERE date LIKE ? AND reversed=0 ORDER BY date DESC""", (this_month() + '%',))
+    bu_oy_sotuv = c.fetchall()
+
+    c.execute("""SELECT category,SUM(amount) FROM expenses
+                 WHERE date LIKE ? AND reversed=0 GROUP BY category ORDER BY SUM(amount) DESC""",
+              (this_month() + '%',))
+    bu_oy_xar = c.fetchall()
+
+    c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
+    qarz = c.fetchone()[0] or 0
+
+    c.execute("""SELECT product, MIN(their_price) FROM competitors
+                 WHERE date>=? GROUP BY product""",
+              ((datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d'),))
+    raq = {r[0]: r[1] for r in c.fetchall() if r[1]}
+    conn.close()
+
+    return {'yil': yil, 'oylik': oylik, 'xar_oy': xar_oy,
+            'bu_oy_sotuv': bu_oy_sotuv, 'bu_oy_xar': bu_oy_xar,
+            'qarz': qarz, 'raq': raq,
+            'prods': get_products(), 'kassa': get_cash_balance(),
+            'nelikvid': get_nelikvid(60), 'rate': get_exchange_rate()}
+
+
+def _bar(x, y, w, h, r=4):
+    """Yuqori burchaklari yumaloq ustun (asosga bog'langan)"""
+    if h <= 0: return ''
+    r = min(r, w / 2, h)
+    return (f'M{x:.1f},{y+h:.1f} V{y+r:.1f} Q{x:.1f},{y:.1f} {x+r:.1f},{y:.1f} '
+            f'H{x+w-r:.1f} Q{x+w:.1f},{y:.1f} {x+w:.1f},{y+r:.1f} V{y+h:.1f} Z')
+
+
+def _chart(oylik, xar_oy, yil):
+    """Oylik tushum va foyda — guruhlangan ustunlar"""
+    oylar = [f"{yil}-{m:02d}" for m in range(1, 13)]
+    oylar = [o for o in oylar if o in oylik] or oylar[:1]
+    tush = [oylik.get(o, (0, 0, 0))[0] for o in oylar]
+    foyd = [oylik.get(o, (0, 0, 0))[1] for o in oylar]
+    cap = max(tush + foyd + [1])
+
+    # o'lchamlar
+    W, H = 360, 190
+    L, R, T, B = 36, 8, 12, 30
+    pw, ph = W - L - R, H - T - B
+    n = len(oylar)
+    gw = pw / n
+    bw = min(13.0, (gw - 8) / 2)
+    gap = 2
+
+    # y-o'qi
+    def nice(v):
+        import math
+        e = 10 ** math.floor(math.log10(v)) if v > 0 else 1
+        for m in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+            if v <= e * m: return e * m
+        return e * 10
+    ymax = nice(cap)
+    svg = []
+    for i in range(5):
+        v = ymax * i / 4
+        y = T + ph - (v / ymax) * ph
+        svg.append(f'<line class="grid-l" x1="{L}" y1="{y:.1f}" x2="{W-R}" y2="{y:.1f}"/>')
+        svg.append(f'<text class="ax" x="{L-6}" y="{y+3:.1f}" text-anchor="end">'
+                   f'{"0" if v == 0 else f"{v/1000:.1f}k" if v >= 1000 else f"{v:.0f}"}</text>')
+
+    hits = []
+    for i, o in enumerate(oylar):
+        cx = L + gw * i + gw / 2
+        x1 = cx - bw - gap / 2
+        x2 = cx + gap / 2
+        h1 = (tush[i] / ymax) * ph
+        h2 = (foyd[i] / ymax) * ph
+        svg.append(f'<path class="s1" d="{_bar(x1, T+ph-h1, bw, h1)}"/>')
+        svg.append(f'<path class="s2" d="{_bar(x2, T+ph-h2, bw, h2)}"/>')
+        oy_i = int(o.split('-')[1]) - 1
+        svg.append(f'<text class="ax" x="{cx:.1f}" y="{T+ph+14}" text-anchor="middle">{OY_NOM[oy_i]}</text>')
+        hits.append(f'<rect class="hit" x="{L+gw*i:.1f}" y="{T}" width="{gw:.1f}" height="{ph}" '
+                    f'data-oy="{OY_NOM[oy_i]}" data-t="{tush[i]:.0f}" data-f="{foyd[i]:.0f}"/>')
+
+    # eng baland ustunga to'g'ridan yorliq
+    if tush:
+        bi = tush.index(max(tush))
+        cx = L + gw * bi + gw / 2 - bw / 2 - gap / 2
+        y = T + ph - (tush[bi] / ymax) * ph
+        svg.append(f'<text class="lbl" x="{cx+bw/2:.1f}" y="{y-5:.1f}" text-anchor="middle">${tush[bi]:,.0f}</text>')
+
+    svg.append(f'<line class="axis" x1="{L}" y1="{T+ph}" x2="{W-R}" y2="{T+ph}"/>')
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
+            f'aria-label="Oylik tushum va foyda">{"".join(svg)}{"".join(hits)}</svg>')
+
+
+def build_dashboard(path):
+    """Dashboard HTML faylini yaratadi"""
+    d = _dash_data()
+    rate = d['rate']
+    prods = d['prods']
+    tovar = sum(p['qty'] * p['cost'] for p in prods)
+    bu_oy = d['oylik'].get(this_month(), (0, 0, 0))
+    bu_xar = d['xar_oy'].get(this_month(), 0)
+    sof = bu_oy[1] - bu_xar
+    yil_tush = sum(v[0] for v in d['oylik'].values())
+    yil_foyd = sum(v[1] for v in d['oylik'].values())
+
+    def uzs(v): return f"{v*rate:,.0f} so'm"
+    def esc(s): return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+    # ── KPI plitkalari ──
+    kpi = [
+        ('Kassa', f"${d['kassa']:,.0f}", uzs(d['kassa']), 'good' if d['kassa'] > 0 else 'critical'),
+        ('Tovar qoldig‘i', f"${tovar:,.0f}", f"{sum(p['qty'] for p in prods)} dona", ''),
+        ('Zavod qarzi', f"${d['qarz']:,.0f}", 'to‘langan' if d['qarz'] == 0 else 'ochiq', 'good' if d['qarz'] == 0 else 'warning'),
+        ('Bu oy sof foyda', f"${sof:,.0f}", f"tushum ${bu_oy[0]:,.0f}", 'good' if sof > 0 else 'critical'),
+    ]
+    kpi_html = ''.join(
+        f'<div class="tile"><div class="k">{esc(k)}</div>'
+        f'<div class="v {st}">{esc(v)}</div><div class="sub">{esc(s)}</div></div>'
+        for k, v, s, st in kpi)
+
+    # ── Astatka ──
+    def blok(sup, nom):
+        ps = sorted([p for p in prods if p['sup'] == sup], key=lambda x: -x['qty'] * x['cost'])
+        if not ps: return ''
+        bor = [p for p in ps if p['qty'] > 0]
+        qm = sum(p['qty'] * p['cost'] for p in ps)
+        rows = ''
+        for p in bor:
+            st = 'critical' if p['qty'] == 0 else 'warning' if p['qty'] == 1 else 'good'
+            mr = p['price'] - p['cost']
+            rq = d['raq'].get(p['name'])
+            raq_s = ''
+            if rq and p['price'] > rq:
+                raq_s = f'<span class="tag warn">bozor ${rq:,.0f}</span>'
+            rows += (f'<tr><td><span class="dot {st}"></span>{esc(p["name"])}{raq_s}</td>'
+                     f'<td class="num">{p["qty"]}</td>'
+                     f'<td class="num">${p["price"]:,.0f}</td>'
+                     f'<td class="num muted">+${mr:,.0f}</td></tr>')
+        yoq = [p['name'] for p in ps if p['qty'] == 0]
+        foot = (f'<div class="sub pad">Tugagan: {esc(", ".join(yoq))}</div>' if yoq else '')
+        return (f'<h3>{esc(nom)} <span class="sub">{sum(p["qty"] for p in bor)} dona · ${qm:,.0f}</span></h3>'
+                f'<table><thead><tr><th>Mahsulot</th><th class="num">Soni</th>'
+                f'<th class="num">Narx</th><th class="num">Marja</th></tr></thead>'
+                f'<tbody>{rows}</tbody></table>{foot}')
+
+    astatka = blok('Two Trees', '\U0001F535 Two Trees') + blok('Freesub', '\U0001F7E0 Freesub')
+
+    # ── Bu oy sotuvlar ──
+    if d['bu_oy_sotuv']:
+        sot = ''.join(f'<tr><td>{esc(r[0][5:])}</td><td>{esc(r[1])}</td>'
+                      f'<td class="num">{r[2]}</td><td class="num">${r[3]:,.0f}</td>'
+                      f'<td class="num good">+${r[4]:,.0f}</td></tr>' for r in d['bu_oy_sotuv'])
+        sotuv_html = (f'<table><thead><tr><th>Sana</th><th>Mahsulot</th><th class="num">Soni</th>'
+                      f'<th class="num">Summa</th><th class="num">Foyda</th></tr></thead>'
+                      f'<tbody>{sot}</tbody></table>')
+    else:
+        sotuv_html = '<div class="bosh">Bu oy hali sotuv yo‘q</div>'
+
+    # ── Xarajatlar ──
+    if d['bu_oy_xar']:
+        xr = ''.join(f'<tr><td>{esc(r[0])}</td><td class="num">${r[1]:,.0f}</td></tr>'
+                     for r in d['bu_oy_xar'])
+        xar_html = (f'<table><tbody>{xr}'
+                    f'<tr class="jami"><td>Jami</td><td class="num">${bu_xar:,.0f}</td></tr>'
+                    f'</tbody></table>')
+    else:
+        xar_html = '<div class="bosh">Bu oy xarajat yo‘q</div>'
+
+    # ── Nelikvid ──
+    nl = d['nelikvid']
+    if nl:
+        muz = sum(x['qty'] * x['cost'] for x in nl)
+        nl_rows = ''.join(f'<tr><td>{esc(x["name"])}</td><td class="num">{x["qty"]}</td>'
+                          f'<td class="num muted">{str(x["days_since"]) + " kun" if x["days_since"] < 900 else "hech sotilmagan"}</td></tr>'
+                          for x in nl[:12])
+        nel_html = (f'<div class="sub pad">Muzlatilgan kapital: <b>${muz:,.0f}</b></div>'
+                    f'<table><thead><tr><th>Mahsulot</th><th class="num">Soni</th>'
+                    f'<th class="num">Sotilmagan</th></tr></thead><tbody>{nl_rows}</tbody></table>')
+    else:
+        nel_html = '<div class="bosh">Nelikvid yo‘q — hammasi harakatda</div>'
+
+    # ── Grafik jadvali (kirish imkoniyati) ──
+    oy_rows = ''
+    for o in sorted(d['oylik'].keys()):
+        t, f_, n = d['oylik'][o]
+        oy_rows += (f'<tr><td>{OY_NOM[int(o.split("-")[1])-1]}</td>'
+                    f'<td class="num">{n}</td><td class="num">${t:,.0f}</td>'
+                    f'<td class="num">${f_:,.0f}</td></tr>')
+
+    html = _DASH_TPL
+    for k, v in {
+        '{{SANA}}': datetime.now().strftime('%d.%m.%Y %H:%M'),
+        '{{RATE}}': f"{rate:,.0f}",
+        '{{KPI}}': kpi_html,
+        '{{CHART}}': _chart(d['oylik'], d['xar_oy'], d['yil']),
+        '{{YIL}}': d['yil'],
+        '{{YILTUSH}}': f"{yil_tush:,.0f}",
+        '{{YILFOYD}}': f"{yil_foyd:,.0f}",
+        '{{OYROWS}}': oy_rows,
+        '{{ASTATKA}}': astatka,
+        '{{SOTUV}}': sotuv_html,
+        '{{XARAJAT}}': xar_html,
+        '{{NELIKVID}}': nel_html,
+    }.items():
+        html = html.replace(k, v)
+
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    return path
+
+
+async def cmd_dashboard(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/dashboard — biznes holatini bitta HTML faylda yuboradi"""
+    if not is_owner(u): return
+    await u.message.reply_text("⏳ Dashboard tayyorlanmoqda...")
+    try:
+        p = f"/tmp/ThermoCrafts_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
+        await asyncio.to_thread(build_dashboard, p)
+        with open(p, 'rb') as f:
+            await ctx.bot.send_document(
+                chat_id=u.effective_chat.id, document=f,
+                filename=f"ThermoCrafts_{datetime.now().strftime('%d.%m.%Y')}.html",
+                caption="\U0001F4CA Biznes holati — faylni bosib brauzerda oching")
+        try: os.remove(p)
+        except Exception: pass
+    except Exception as e:
+        log.exception("dashboard")
+        await u.message.reply_text(f"⚠️ Xato: {str(e)[:250]}")
+
+
 async def cmd_brief(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/brief — ertalabki xulosani hozir ko'rish"""
     if not is_owner(u): return
@@ -1802,6 +2208,8 @@ MENU_MAP = {
     "📉 Nelikvid": "nelikvid",
     "🔔 Eslatmalar": "eslatmalar",
     "📣 Reklama": "reklama_menu",
+    "📊 Dashboard": "dashboard",
+    "🔍 Raqobat": "raqobat",
 }
 
 async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
@@ -1825,6 +2233,8 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'trend':         await cmd_trend(u, ctx)
     elif action == 'cashflow':      await cmd_cashflow(u, ctx)
     elif action == 'olx':           await cmd_olx(u, ctx)
+    elif action == 'dashboard':     await cmd_dashboard(u, ctx)
+    elif action == 'raqobat':       await cmd_raqobat(u, ctx)
     elif action == 'undo_list':     await cmd_undo_list(u, ctx)
     elif action == 'kassa':         await cmd_kassa(u, ctx)
     elif action == 'nelikvid':      await cmd_nelikvid(u, ctx)
@@ -1908,6 +2318,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ["💸 Xarajatlar", "🎯 Maqsad"],
         ["🔧 Kafolat",    "📈 Trend"],
         ["📣 Reklama",    "🔔 Eslatmalar"],
+        ["📊 Dashboard",  "🔍 Raqobat"],
         ["💵 Cash Flow",  "📢 OLX"],
         ["➕ Yangi tovar","↩️ Qayt etish"],
     ], resize_keyboard=True, is_persistent=True)
@@ -3754,6 +4165,7 @@ def main():
     app.add_handler(CommandHandler('reset', cmd_ai_reset))
     app.add_handler(CommandHandler('xotira', cmd_xotira))
     app.add_handler(CommandHandler('brief', cmd_brief))
+    app.add_handler(CommandHandler('dashboard', cmd_dashboard))
     app.add_handler(CommandHandler('sync_sentyabr', cmd_sync_sentyabr))
     app.add_handler(CommandHandler('backup', cmd_backup))
     app.add_handler(CommandHandler('restore', cmd_restore))
