@@ -468,14 +468,19 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
             end = (now + timedelta(days=prod['warranty'])).strftime('%Y-%m-%d')
             c.execute('INSERT INTO warranties (sale_id,product,customer,start_date,end_date) VALUES (?,?,?,?,?)',
                       (sale_id, pname, customer, start, end))
-        # Mijoz yangilash
-        if customer:
-            c.execute('SELECT id FROM customers WHERE name LIKE ?', (f'%{customer}%',))
-            row = c.fetchone()
-            if row:
-                c.execute('UPDATE customers SET total_purchases=total_purchases+?, last_purchase=? WHERE id=?',
-                          (price*qty, now.strftime('%Y-%m-%d'), row[0]))
     conn.commit(); conn.close()
+    # Mijozga bog'lash (aniq moslik bo'yicha, yo'q bo'lsa yaratadi)
+    if ok and customer:
+        try:
+            cid = mijoz_id(customer, create=True, ctype=ctype)
+            if cid:
+                conn = db(); c = conn.cursor()
+                c.execute('UPDATE sales SET customer_id=? WHERE id=?', (cid, sale_id))
+                conn.commit(); conn.close()
+                yangila_jami(cid)
+                reorder_yangila(cid, pname, now.strftime('%Y-%m-%d'))
+        except Exception as e:
+            log.warning(f'mijozga boglash: {e}')
     if ok:
         log_op('sale', {'sale_id':sale_id,'product':pname,'qty':qty,'price':price,'profit':profit})
         if cash: add_cash(price*qty, 'kirim', 'sotuv', f'{pname} x{qty} (#{sale_id})', method)
@@ -1034,6 +1039,46 @@ AI_TOOLS = [
                        "product": {"type": "string"}, "qty": {"type": "integer"},
                        "price_usd": {"type": "number", "description": "Bo'sh = ro'yxat narxi"}}}},
          "note": {"type": "string", "default": ""}}}},
+    {"name": "get_customer_card",
+     "description": "Mijoz kartasi: barcha xaridlari, jami tushum va foyda, qarzi, kanali, qayta buyurtma vaqti kelgan rasxodniklari, aloqa tarixi. 'Alisher kim', 'Alisher nima olgan', 'Alisher qancha olib bergan' kabi savollarga shuni ishlating.",
+     "input_schema": {"type": "object", "required": ["name"], "properties": {
+         "name": {"type": "string", "description": "Mijoz ismi"}}}},
+    {"name": "link_customers",
+     "description": "Eski sotuv va qarz yozuvlaridagi ism-matnlarni mijoz kartalariga bog'laydi, dublikatlarni ko'rsatadi. Mijoz tarixi bo'sh chiqsa shuni ishlating.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "merge_customers",
+     "description": "Ikki mijoz kartasini birlashtiradi (dublikat). Birinchisi ikkinchisiga qo'shilib o'chadi. Avval egasidan tasdiq oling.",
+     "input_schema": {"type": "object", "required": ["from_name", "to_name"], "properties": {
+         "from_name": {"type": "string", "description": "O'chadigan (eski/noto'liq ism)"},
+         "to_name": {"type": "string", "description": "Qoladigan (to'g'ri ism)"}}}},
+    {"name": "set_customer_channel",
+     "description": "Mijoz qaysi kanaldan kelganini belgilaydi: olx, instagram, telegram, tavsiya, b2b, boshqa. Yangi mijoz qo'shganda albatta so'rang.",
+     "input_schema": {"type": "object", "required": ["name", "channel"], "properties": {
+         "name": {"type": "string"},
+         "channel": {"type": "string", "enum": ["olx", "instagram", "telegram", "tavsiya", "b2b", "boshqa"]}}}},
+    {"name": "get_channel_report",
+     "description": "Qaysi kanal qancha foyda keltirgani: OLX, Instagram, tavsiya va hokazo. Reklamaga qayerga pul sarflashni hal qilishda ishlating.",
+     "input_schema": {"type": "object", "properties": {
+         "period": {"type": "string", "description": "YYYY-MM yoki YYYY. Bo'sh = hamma vaqt"}}}},
+    {"name": "get_reorders",
+     "description": "Qayta buyurtma vaqti kelgan mijozlar: kim qaysi rasxodnikni qachon olgan va tugagan bo'lishi kerak. Takroriy savdo uchun asosiy asbob.",
+     "input_schema": {"type": "object", "properties": {
+         "days_ahead": {"type": "integer", "default": 5, "description": "Necha kun oldindan ogohlantirish"}}}},
+    {"name": "set_consumable",
+     "description": "Mahsulotni rasxodnik deb belgilaydi: necha kunda tugaydi. Masalan sublimatsiya qog'ozi 30 kun. Shundan keyin uni olgan mijozlarga avtomat eslatma chiqadi. days=0 kuzatuvdan chiqaradi.",
+     "input_schema": {"type": "object", "required": ["product", "days"], "properties": {
+         "product": {"type": "string"},
+         "days": {"type": "integer", "description": "Necha kunda tugaydi. 0 = rasxodnik emas"}}}},
+    {"name": "log_contact",
+     "description": "Mijoz bilan bo'lgan suhbat yoki kelishuvni yozib qo'yadi. Egasi 'Alisherga aytdim', 'Sardor qo'ng'iroq qildi' desa ishlating.",
+     "input_schema": {"type": "object", "required": ["name", "text"], "properties": {
+         "name": {"type": "string"},
+         "text": {"type": "string", "description": "Nima gaplashildi"},
+         "kind": {"type": "string", "default": "suhbat", "description": "suhbat | qongiroq | taklif | shikoyat"}}}},
+    {"name": "create_statement",
+     "description": "Solishtirish dalolatnomasi: mijozning barcha xaridlari va qarz qoldig'i PDF holida. B2B mijoz imzolashi uchun.",
+     "input_schema": {"type": "object", "required": ["name"], "properties": {
+         "name": {"type": "string"}}}},
     {"name": "send_dashboard",
      "description": "Biznes holatini chiroyli HTML dashboard fayl qilib yuboradi: kassa, astatka, oylik savdo grafigi, xarajatlar, nelikvid, raqobat. Egasi 'dashboard', 'umumiy holat', 'hisobot fayl' desa ishlating.",
      "input_schema": {"type": "object", "properties": {}}},
@@ -1069,7 +1114,9 @@ AI_TOOLS = [
      "input_schema": {"type": "object", "required": ["name"], "properties": {
          "name": {"type": "string"}, "phone": {"type": "string", "default": ""},
          "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "description": "Faqat aniq bilsangiz bering. Bo'sh qoldirilsa eski tur saqlanadi, yangi mijozga B2C qo'yiladi"},
-         "notes": {"type": "string", "default": ""}}}},
+         "notes": {"type": "string", "default": ""},
+         "channel": {"type": "string", "enum": ["olx", "instagram", "telegram", "tavsiya", "b2b", "boshqa"],
+                     "description": "Qayerdan keldi. Yangi mijozda albatta so'rang"}}}},
     {"name": "get_rate",
      "description": "Joriy USD/UZS kursi (CBU).",
      "input_schema": {"type": "object", "properties": {}}},
@@ -1307,6 +1354,69 @@ async def execute_tool(name, inp, ctx=None):
             return _j({"ok": True, "raqam": raqam, "jami": jami, "format": "pdf" if is_pdf else "html",
                        "eslatma": "" if is_pdf else "PDF uchun egasi /deps buyrug'ini berishi kerak"})
 
+        if name == "get_customer_card":
+            k = mijoz_karta(inp.get("name", ""))
+            if not k:
+                oxshash = mijoz_qidir(inp.get("name", ""))
+                return _j({"error": f"Mijoz topilmadi: {inp.get('name')}",
+                           "oxshash": [x["nom"] for x in oxshash[:5]]})
+            k["sotuvlar"] = k["sotuvlar"][:20]
+            return _j(k)
+
+        if name == "link_customers":
+            r = bogla_hammasi()
+            r["dublikatlar"] = dublikatlar()
+            return _j(r)
+
+        if name == "merge_customers":
+            return _j(birlashtir(inp.get("from_name", ""), inp.get("to_name", "")))
+
+        if name == "set_customer_channel":
+            return _j(kanal_belgila(inp.get("name", ""), inp.get("channel", "")))
+
+        if name == "get_channel_report":
+            return _j({"kanallar": kanal_hisobot((inp.get("period") or "").strip())})
+
+        if name == "get_reorders":
+            lst = qayta_buyurtma(int(inp.get("days_ahead", 5)))
+            return _j({"soni": len(lst), "royxat": lst[:25],
+                       "kuzatuvdagi_rasxodniklar": rasxodniklar()})
+
+        if name == "set_consumable":
+            return _j(rasxodnik_belgila(inp.get("product", ""), int(inp.get("days", 0))))
+
+        if name == "log_contact":
+            cid = mijoz_id(inp.get("name", ""), create=True)
+            if not cid: return _j({"error": "Mijoz aniqlanmadi"})
+            log_qosh(cid, inp.get("kind", "suhbat"), inp.get("text", ""))
+            return _j({"ok": True, "mijoz": inp.get("name"), "sana": today()})
+
+        if name == "create_statement":
+            if ctx is None: return _j({"error": "ctx yo'q"})
+            k = mijoz_karta(inp.get("name", ""))
+            if not k: return _j({"error": f"Mijoz topilmadi: {inp.get('name')}"})
+            if not k["sotuvlar"]: return _j({"error": "Bu mijozda xarid yo'q"})
+            qatorlar = []
+            for s in reversed(k["sotuvlar"]):
+                sn = s["sana"][8:10] + "." + s["sana"][5:7] + "." + s["sana"][:4]
+                dn = max(1, s["dona"])
+                qatorlar.append((sn + " - " + s["mahsulot"], dn, round(s["summa"] / dn, 2)))
+            izoh = f"Xaridlar soni: {k['sotuv_soni']}."
+            if k["bizga_qarzdor"]:
+                izoh += f" Qarz qoldigi: {k['bizga_qarzdor']:.2f} USD."
+            base = f"/tmp/sd_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+            p_, raqam, jami, is_pdf = await asyncio.to_thread(
+                build_hujjat, base, "dalolatnoma", k["nom"], qatorlar, izoh)
+            with open(p_, "rb") as fh:
+                await ctx.bot.send_document(
+                    chat_id=OWNER_ID, document=fh,
+                    filename=f"{raqam}.{'pdf' if is_pdf else 'html'}",
+                    caption=f"\U0001F4C4 {raqam} \u00b7 {k['nom']} \u00b7 {fmt(jami)}")
+            try: os.remove(p_)
+            except Exception: pass
+            log_qosh(k["id"], "hujjat", f"Dalolatnoma {raqam}")
+            return _j({"ok": True, "raqam": raqam, "jami": jami})
+
         if name == "send_dashboard":
             if ctx is None: return _j({"error": "ctx yo'q"})
             p = f"/tmp/TC_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
@@ -1404,7 +1514,9 @@ async def execute_tool(name, inp, ctx=None):
             if not nm: return _j({"error": "Mijoz ismi bo'sh"})
             holat, cid = add_customer(nm, inp.get("phone") or "", inp.get("customer_type") or "", inp.get("notes") or "")
             if holat == 'xato': return _j({"error": "Saqlanmadi"})
+            if inp.get("channel"): kanal_belgila(nm, inp.get("channel"))
             return _j({"ok": True, "status": holat, "id": cid, "name": nm,
+                       "kanal": inp.get("channel") or "",
                        "jami_mijoz": len(find_customers())})
 
         if name == "delete_customer":
@@ -1612,6 +1724,9 @@ ISH QOIDALARI:
 8. Raqamlar: $1,250 / 14,700,000 so'm.
 9. Egasi rasm yuborsa: chek bo'lsa — xarajat yozing; mahsulot bo'lsa — qaysi mahsulot ekanini ayting; boshqa bo'lsa — tavsiflab so'rang.
 10. Zavod qarzi to'langan desa — pay_factory_debt ishlating. Qarz ilgari to'langan bo'lib faqat tizimda ochiq qolgan bo'lsa, from_cash=false qo'ying (kassa ikki marta kamaymasin). To'lov hozir bo'lgan bo'lsa from_cash=true.
+16. MIJOZ: 'Alisher kim', 'nima olgan', 'qancha foyda bergan' - get_customer_card. Mijoz tarixi bo'sh chiqsa avval link_customers. Yangi mijoz qo'shganda kanalini so'rang (olx/instagram/tavsiya/b2b) - set_customer_channel yoki add_customer ning channel maydoni.
+17. TAKRORIY SAVDO: rasxodnik (qog'oz, krujka, futbolka, siyoh) sotilsa set_consumable bilan necha kunda tugashini belgilang. get_reorders - kimga qayta taklif qilish vaqti kelgan. Egasi mijoz bilan gaplashganini aytsa log_contact bilan yozib qo'ying.
+18. KANAL: get_channel_report - qaysi kanal ko'p foyda beryapti. Reklama byudjeti haqida savol bo'lsa shundan boshlang.
 14. MOLIYA: 'foyda qancha', 'balans', 'biznes qancha turadi' — get_financial_statements. 'kim qarzdor', 'qachondan beri' — get_aging. 'qaysi tovar turib qoldi', 'qayta buyurtma' — get_inventory_turnover. Hisobotlarni izohlab bering: shunchaki raqam emas, xulosa ayting.
 15. HUJJAT: mijozga faktura/chek kerak bo'lsa create_document. Oy yopish so'ralsa close_period — avval o'sha oy hisobotini ko'rsatib tasdiq oling.
 13. RAQOBAT: egasi raqobatchi narxini aytsa — record_competitor_price bilan darhol yozing. "bozorda qancha?", "raqobatchilar qancha sotyapti?" desa — avval get_competitor_analysis; ma'lumot yo'q yoki eskirgan bo'lsa web_search bilan OLX/birbir dan qidiring, topganingizni record_competitor_price bilan saqlang, keyin xulosa ayting. Narx bo'yicha maslahat berganda marjani (narx - sebest) hisobga oling — sebestdan past taklif qilmang.
@@ -1736,6 +1851,13 @@ async def _briefing(app, kind):
                 if cheap: head += "🔍 Bizdan arzon: " + "; ".join(cheap[:3]) + "\n"
             except Exception:
                 pass
+            try:
+                qb = qayta_buyurtma(0)
+                if qb:
+                    head += "\U0001F501 Qayta buyurtma: " + "; ".join(
+                        f"{x['mijoz']} - {x['mahsulot']} ({x['otgan']} kun)" for x in qb[:3]) + "\n"
+            except Exception:
+                pass
             prompt = ("Bu ertalabki xulosa. Egasiga 2-3 qatorda o'z fikringizni ayting: bugun nimaga e'tibor berish kerak. "
                       "Raqamlarni takrorlamang, xulosa chiqaring.\n\n" + head)
         else:
@@ -1781,6 +1903,7 @@ async def _post_init(app):
     init_ai_tables()
     init_sub_table()
     init_erp_tables()
+    init_crm_tables()
     asyncio.create_task(_scheduler(app))
 
 
@@ -2180,6 +2303,398 @@ def aylanish(kun=90):
             'aylanish_koef': round(jami_cogs / jami_band, 2) if jami_band else 0,
             'ortacha_zaxira_kun': round(jami_band / (jami_cogs / kun)) if jami_cogs else None}
 
+
+# ══════════════════════════════════════════════════════════════════
+# MIJOZLAR (CRM) — karta, ID bog'lash, kanal, qayta buyurtma
+# ══════════════════════════════════════════════════════════════════
+
+KANALLAR = ['olx', 'instagram', 'telegram', 'tavsiya', 'b2b', 'boshqa']
+
+
+def init_crm_tables():
+    conn = db(); c = conn.cursor()
+    for ddl in [
+        "ALTER TABLE customers ADD COLUMN channel TEXT DEFAULT ''",
+        "ALTER TABLE customers ADD COLUMN last_contact TEXT DEFAULT ''",
+        "ALTER TABLE customers ADD COLUMN chat_id INTEGER DEFAULT 0",
+        "ALTER TABLE sales ADD COLUMN customer_id INTEGER DEFAULT 0",
+        "ALTER TABLE debts ADD COLUMN customer_id INTEGER DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN reorder_days INTEGER DEFAULT 0",
+    ]:
+        try: c.execute(ddl)
+        except Exception: pass
+    c.execute("""CREATE TABLE IF NOT EXISTS customer_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER,
+        sana TEXT, turi TEXT, matn TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS reorder (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER,
+        product TEXT, last_date TEXT, cycle_days INTEGER DEFAULT 30,
+        active INTEGER DEFAULT 1, last_remind TEXT DEFAULT '')""")
+    try: c.execute("CREATE INDEX IF NOT EXISTS ix_sales_cid ON sales(customer_id)")
+    except Exception: pass
+    try: c.execute("CREATE INDEX IF NOT EXISTS ix_debts_cid ON debts(customer_id)")
+    except Exception: pass
+    conn.commit(); conn.close()
+
+
+# ── Ism normalizatsiyasi ──────────────────────────────────────────
+_TASH = ["'", '"', '‘', '’', 'ʻ', 'ʼ', '`', '.', ',', '-', '_', '(', ')']
+
+def norm_ism(s):
+    s = (s or '').lower().strip()
+    for ch in _TASH:
+        s = s.replace(ch, '')
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def mijoz_id(name, create=False, channel='', ctype=''):
+    """Ism bo'yicha mijoz ID. create=True — topilmasa yaratadi. 0 = topilmadi."""
+    n = norm_ism(name)
+    if not n: return 0
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, name FROM customers")
+    rows = c.fetchall()
+    for cid, nm in rows:
+        if norm_ism(nm) == n:
+            conn.close(); return cid
+    # Biri ikkinchisining boshi: "Alisher" <-> "Alisher Zargarov"
+    nomzod = [cid for cid, nm in rows
+              if norm_ism(nm).startswith(n + ' ') or n.startswith(norm_ism(nm) + ' ')]
+    if len(nomzod) == 1:
+        conn.close(); return nomzod[0]
+    if not create:
+        conn.close(); return 0
+    c.execute("INSERT INTO customers (name,phone,type,total_purchases,notes,created,last_purchase,"
+              "channel,last_contact,chat_id) VALUES (?,'',?,0,'',?,'',?,'',0)",
+              ((name or '').strip(), ctype or 'B2C', today(), (channel or '').lower()))
+    cid = c.lastrowid
+    conn.commit(); conn.close()
+    return cid
+
+
+def mijoz_qidir(q):
+    """Qismiy moslik bo'yicha ro'yxat"""
+    n = norm_ism(q)
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id,name,phone,type FROM customers ORDER BY total_purchases DESC")
+    rows = c.fetchall(); conn.close()
+    if not n: return [{'id': r[0], 'nom': r[1], 'tel': r[2], 'tur': r[3]} for r in rows]
+    return [{'id': r[0], 'nom': r[1], 'tel': r[2], 'tur': r[3]}
+            for r in rows if n in norm_ism(r[1]) or n in norm_ism(r[2] or '')]
+
+
+def yangila_jami(cid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(revenue),0), MAX(date) FROM sales WHERE customer_id=? AND reversed=0", (cid,))
+    jami, oxirgi = c.fetchone()
+    c.execute("UPDATE customers SET total_purchases=?, last_purchase=? WHERE id=?",
+              (jami or 0, oxirgi or '', cid))
+    conn.commit(); conn.close()
+
+
+def log_qosh(cid, turi, matn):
+    if not cid: return
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO customer_log (customer_id,sana,turi,matn) VALUES (?,?,?,?)",
+              (cid, today(), turi, matn))
+    c.execute("UPDATE customers SET last_contact=? WHERE id=?", (today(), cid))
+    conn.commit(); conn.close()
+
+
+# ── Eski yozuvlarni bog'lash ──────────────────────────────────────
+def bogla_hammasi():
+    """sales.customer / debts.person matnlarini customer_id ga bog'laydi"""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT DISTINCT customer FROM sales WHERE COALESCE(customer_id,0)=0 "
+              "AND TRIM(COALESCE(customer,''))<>''")
+    s_ism = [r[0] for r in c.fetchall()]
+    c.execute("SELECT DISTINCT person FROM debts WHERE COALESCE(customer_id,0)=0 "
+              "AND TRIM(COALESCE(person,''))<>''")
+    d_ism = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    n_s = n_d = yangi = 0
+    for nm in s_ism:
+        bor = mijoz_id(nm)
+        cid = bor or mijoz_id(nm, create=True)
+        if not cid: continue
+        if not bor: yangi += 1
+        conn = db(); c = conn.cursor()
+        c.execute("UPDATE sales SET customer_id=? WHERE COALESCE(customer_id,0)=0 AND customer=?", (cid, nm))
+        n_s += c.rowcount; conn.commit(); conn.close()
+        yangila_jami(cid)
+    for nm in d_ism:
+        bor = mijoz_id(nm)
+        cid = bor or mijoz_id(nm, create=True)
+        if not cid: continue
+        if not bor: yangi += 1
+        conn = db(); c = conn.cursor()
+        c.execute("UPDATE debts SET customer_id=? WHERE COALESCE(customer_id,0)=0 AND person=?", (cid, nm))
+        n_d += c.rowcount; conn.commit(); conn.close()
+    return {'sotuv': n_s, 'qarz': n_d, 'yangi_mijoz': yangi}
+
+
+def sub_bogla(chat_id=None, nomi=''):
+    """Obunachini (yoki hammasini) mijoz kartasiga ism bo'yicha bog'laydi"""
+    conn = db(); c = conn.cursor()
+    if chat_id:
+        subs = [(chat_id, nomi or '')]
+    else:
+        c.execute("SELECT chat_id, name FROM subscribers")
+        subs = c.fetchall()
+    c.execute("SELECT id, name, COALESCE(chat_id,0) FROM customers")
+    custs = c.fetchall()
+    conn.close()
+    band = {x[2] for x in custs if x[2]}
+    n = 0
+    for chid, nm in subs:
+        if not chid or chid in band: continue
+        nn = norm_ism(nm)
+        if not nn: continue
+        bosh = [x[0] for x in custs if not x[2] and norm_ism(x[1]) == nn]
+        if len(bosh) != 1:
+            bosh = [x[0] for x in custs if not x[2] and
+                    (norm_ism(x[1]).startswith(nn + ' ') or nn.startswith(norm_ism(x[1]) + ' '))]
+        if len(bosh) == 1:
+            conn = db(); c = conn.cursor()
+            c.execute("UPDATE customers SET chat_id=? WHERE id=?", (chid, bosh[0]))
+            conn.commit(); conn.close()
+            band.add(chid); n += 1
+    return n
+
+
+def sub_ulash(name, chat_id):
+    """Mijozni obunachiga qo'lda ulash"""
+    cid = mijoz_id(name)
+    if not cid: return {'error': f"Mijoz topilmadi: {name}"}
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT name FROM subscribers WHERE chat_id=?", (int(chat_id),))
+    r = c.fetchone()
+    if not r:
+        conn.close(); return {'error': "Bunday obunachi yo'q"}
+    # Bitta chat_id faqat bitta mijozda bo'lishi kerak
+    c.execute("UPDATE customers SET chat_id=0 WHERE chat_id=? AND id<>?", (int(chat_id), cid))
+    olindi = c.rowcount
+    c.execute("UPDATE customers SET chat_id=? WHERE id=?", (int(chat_id), cid))
+    conn.commit(); conn.close()
+    return {'ok': True, 'mijoz': name, 'obunachi': r[0], 'chat_id': int(chat_id),
+            'boshqadan_olindi': olindi}
+
+
+def birlashtir(manba, nishon):
+    """manba mijozni nishon ichiga qo'shib yuboradi, manba o'chadi"""
+    a = mijoz_id(manba); b = mijoz_id(nishon)
+    if not a: return {'error': f"Topilmadi: {manba}"}
+    if not b: return {'error': f"Topilmadi: {nishon}"}
+    if a == b: return {'error': "Bir xil mijoz"}
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT name,phone,notes,channel,chat_id FROM customers WHERE id=?", (a,))
+    an, ap, anot, ach, acid = c.fetchone()
+    c.execute("SELECT name,phone,notes,channel,chat_id FROM customers WHERE id=?", (b,))
+    bn, bp, bnot, bch, bcid = c.fetchone()
+    c.execute("UPDATE sales SET customer_id=? WHERE customer_id=?", (b, a)); ns = c.rowcount
+    c.execute("UPDATE debts SET customer_id=? WHERE customer_id=?", (b, a)); nd = c.rowcount
+    c.execute("UPDATE customer_log SET customer_id=? WHERE customer_id=?", (b, a))
+    c.execute("UPDATE reorder SET customer_id=? WHERE customer_id=?", (b, a))
+    izoh = bnot or ''
+    if anot and anot not in izoh:
+        izoh = (izoh + ' | ' + anot).strip(' |')
+    c.execute("UPDATE customers SET phone=?, notes=?, channel=?, chat_id=? WHERE id=?",
+              (bp or ap or '', izoh, bch or ach or '', bcid or acid or 0, b))
+    c.execute("DELETE FROM customers WHERE id=?", (a,))
+    conn.commit(); conn.close()
+    yangila_jami(b)
+    return {'ok': True, 'manba': an, 'nishon': bn, 'sotuv': ns, 'qarz': nd}
+
+
+def dublikatlar():
+    """Ehtimoliy dublikat juftliklar"""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id,name,phone FROM customers")
+    rows = c.fetchall(); conn.close()
+    juft = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = rows[i], rows[j]
+            na, nb = norm_ism(a[1]), norm_ism(b[1])
+            tel = (a[2] or '').replace(' ', '') and (a[2] or '').replace(' ', '') == (b[2] or '').replace(' ', '')
+            if tel or na.startswith(nb + ' ') or nb.startswith(na + ' '):
+                juft.append({'a': a[1], 'b': b[1], 'sabab': 'telefon' if tel else 'ism'})
+    return juft
+
+
+# ── Mijoz kartasi ─────────────────────────────────────────────────
+def mijoz_karta(kim):
+    cid = kim if isinstance(kim, int) else mijoz_id(kim)
+    if not cid: return None
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id,name,phone,type,total_purchases,notes,created,last_purchase,"
+              "COALESCE(channel,''),COALESCE(last_contact,''),COALESCE(chat_id,0) "
+              "FROM customers WHERE id=?", (cid,))
+    r = c.fetchone()
+    if not r:
+        conn.close(); return None
+    c.execute("SELECT date,product,qty,revenue,profit FROM sales "
+              "WHERE customer_id=? AND reversed=0 ORDER BY date DESC", (cid,))
+    sot = [{'sana': x[0], 'mahsulot': x[1], 'dona': x[2], 'summa': x[3], 'foyda': x[4]}
+           for x in c.fetchall()]
+    c.execute("SELECT id,date,amount,type,note FROM debts WHERE customer_id=? AND paid=0 ORDER BY date", (cid,))
+    qarz = [{'id': x[0], 'sana': x[1], 'summa': x[2], 'turi': x[3], 'izoh': x[4]} for x in c.fetchall()]
+    c.execute("SELECT sana,turi,matn FROM customer_log WHERE customer_id=? ORDER BY id DESC LIMIT 6", (cid,))
+    log = [{'sana': x[0], 'turi': x[1], 'matn': x[2]} for x in c.fetchall()]
+    c.execute("SELECT product,last_date,cycle_days FROM reorder WHERE customer_id=? AND active=1", (cid,))
+    qayta = []
+    for pr, ld, cyc in c.fetchall():
+        try: otgan = (datetime.now() - datetime.strptime(ld, '%Y-%m-%d')).days
+        except Exception: otgan = 0
+        qayta.append({'mahsulot': pr, 'oxirgi': ld, 'sikl': cyc, 'otgan': otgan,
+                      'muddati_keldi': otgan >= (cyc or 30)})
+    obuna = None; chid = r[10]
+    if chid:
+        c.execute("SELECT active FROM subscribers WHERE chat_id=?", (chid,))
+        x = c.fetchone()
+        if x: obuna = bool(x[0])
+    else:
+        # chat_id qo'yilmagan bo'lsa ism bo'yicha topishga urinish
+        c.execute("SELECT chat_id, name, active FROM subscribers WHERE chat_id NOT IN "
+                  "(SELECT COALESCE(chat_id,0) FROM customers WHERE COALESCE(chat_id,0)>0)")
+        subs = c.fetchall(); n_ = norm_ism(r[1])
+        mos = [s for s in subs if norm_ism(s[1]) == n_]
+        if len(mos) != 1:
+            mos = [s for s in subs if norm_ism(s[1]) and
+                   (n_.startswith(norm_ism(s[1]) + ' ') or norm_ism(s[1]).startswith(n_ + ' '))]
+        if len(mos) == 1:
+            chid = mos[0][0]; obuna = bool(mos[0][2])
+    conn.close()
+
+    bizga = sum(q['summa'] for q in qarz if q['turi'] == 'berildi')
+    bizdan = sum(q['summa'] for q in qarz if q['turi'] == 'olindi')
+    kunlar = None
+    if len(sot) >= 2:
+        try:
+            s1 = datetime.strptime(sot[0]['sana'], '%Y-%m-%d')
+            s2 = datetime.strptime(sot[-1]['sana'], '%Y-%m-%d')
+            kunlar = round((s1 - s2).days / max(1, len(sot) - 1))
+        except Exception: pass
+    return {
+        'id': r[0], 'nom': r[1], 'tel': r[2] or '', 'tur': r[3] or 'B2C',
+        'izoh': r[5] or '', 'royxatga': r[6] or '', 'oxirgi_xarid': r[7] or '',
+        'kanal': r[8] or '', 'oxirgi_aloqa': r[9] or '', 'chat_id': chid or 0,
+        'obuna': obuna, 'sotuvlar': sot, 'sotuv_soni': len(sot),
+        'jami_tushum': sum(x['summa'] for x in sot),
+        'jami_foyda': sum(x['foyda'] for x in sot),
+        'ortacha_chek': round(sum(x['summa'] for x in sot) / len(sot), 2) if sot else 0,
+        'xarid_oraligi_kun': kunlar,
+        'qarzlar': qarz, 'bizga_qarzdor': bizga, 'biz_qarzdormiz': bizdan,
+        'qayta_buyurtma': qayta, 'tarix': log}
+
+
+# ── Kanal hisoboti ────────────────────────────────────────────────
+def kanal_hisobot(davr=''):
+    conn = db(); c = conn.cursor()
+    c.execute("""SELECT CASE WHEN COALESCE(s.customer_id,0)=0 THEN 'mijozsiz'
+                             ELSE COALESCE(NULLIF(TRIM(LOWER(cu.channel)),''),'nomalum') END AS k,
+                        COUNT(DISTINCT s.customer_id), COUNT(*),
+                        COALESCE(SUM(s.revenue),0), COALESCE(SUM(s.profit),0)
+                 FROM sales s LEFT JOIN customers cu ON cu.id=s.customer_id
+                 WHERE s.reversed=0 AND s.date LIKE ?
+                 GROUP BY k ORDER BY 5 DESC""", ((davr or '') + '%',))
+    rows = c.fetchall(); conn.close()
+    jami_f = sum(r[4] for r in rows) or 1
+    return [{'kanal': r[0], 'mijoz': r[1], 'sotuv': r[2], 'tushum': r[3], 'foyda': r[4],
+             'ulush_pct': round(r[4] / jami_f * 100, 1)} for r in rows]
+
+
+def kanal_belgila(name, kanal):
+    cid = mijoz_id(name)
+    if not cid: return {'error': f"Mijoz topilmadi: {name}"}
+    k = (kanal or '').lower().strip()
+    if k not in KANALLAR:
+        return {'error': f"Kanal noto'g'ri. Mumkin: {', '.join(KANALLAR)}"}
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE customers SET channel=? WHERE id=?", (k, cid))
+    conn.commit(); conn.close()
+    return {'ok': True, 'mijoz': name, 'kanal': k}
+
+
+# ── Qayta buyurtma ────────────────────────────────────────────────
+def reorder_yangila(cid, pname, sana=None):
+    """Sotuvdan keyin chaqiriladi. Mahsulotda reorder_days>0 bo'lsa kuzatuvga oladi."""
+    if not cid or not pname: return
+    sana = sana or today()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(reorder_days,0) FROM products WHERE name=?", (pname,))
+    r = c.fetchone()
+    kun = (r[0] or 0) if r else 0
+    if kun <= 0:
+        conn.close(); return
+    c.execute("SELECT id,last_date FROM reorder WHERE customer_id=? AND product=?", (cid, pname))
+    row = c.fetchone()
+    if row:
+        oq = 0
+        try:
+            oq = (datetime.strptime(sana, '%Y-%m-%d') - datetime.strptime(row[1], '%Y-%m-%d')).days
+        except Exception: pass
+        sikl = oq if 5 <= oq <= 365 else kun
+        c.execute("UPDATE reorder SET last_date=?, cycle_days=?, active=1, last_remind='' WHERE id=?",
+                  (sana, sikl, row[0]))
+    else:
+        c.execute("INSERT INTO reorder (customer_id,product,last_date,cycle_days) VALUES (?,?,?,?)",
+                  (cid, pname, sana, kun))
+    conn.commit(); conn.close()
+
+
+def qayta_buyurtma(oldindan=3):
+    """Muddati kelgan (yoki oldindan N kun qolgan) qayta buyurtmalar"""
+    conn = db(); c = conn.cursor()
+    c.execute("""SELECT r.id,r.customer_id,cu.name,cu.phone,COALESCE(cu.chat_id,0),
+                        r.product,r.last_date,r.cycle_days,COALESCE(r.last_remind,'')
+                 FROM reorder r JOIN customers cu ON cu.id=r.customer_id
+                 WHERE r.active=1""")
+    rows = c.fetchall(); conn.close()
+    bugun = datetime.now(); out = []
+    for rid, cid, nm, ph, chid, pr, ld, cyc, lr in rows:
+        try: otgan = (bugun - datetime.strptime(ld, '%Y-%m-%d')).days
+        except Exception: continue
+        sikl = cyc or 30
+        if otgan >= sikl - oldindan:
+            out.append({'id': rid, 'customer_id': cid, 'mijoz': nm, 'tel': ph or '',
+                        'chat_id': chid, 'mahsulot': pr, 'oxirgi': ld, 'otgan': otgan,
+                        'sikl': sikl, 'kechikkan': otgan - sikl, 'eslatilgan': lr})
+    out.sort(key=lambda x: -x['kechikkan'])
+    return out
+
+
+def reorder_eslatildi(rid):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE reorder SET last_remind=? WHERE id=?", (today(), rid))
+    conn.commit(); conn.close()
+
+
+def reorder_ochir(name, product):
+    cid = mijoz_id(name)
+    if not cid: return {'error': f"Mijoz topilmadi: {name}"}
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE reorder SET active=0 WHERE customer_id=? AND product LIKE ?", (cid, f'%{product}%'))
+    n = c.rowcount; conn.commit(); conn.close()
+    return {'ok': True, 'ochirildi': n}
+
+
+def rasxodnik_belgila(pname, kun):
+    p = find_product(pname)
+    if not p: return {'error': f"Mahsulot topilmadi: {pname}"}
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE products SET reorder_days=? WHERE id=?", (int(kun), p['id']))
+    conn.commit(); conn.close()
+    return {'ok': True, 'mahsulot': p['name'], 'sikl_kun': int(kun)}
+
+
+def rasxodniklar():
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT name, reorder_days FROM products WHERE COALESCE(reorder_days,0)>0 ORDER BY name")
+    r = c.fetchall(); conn.close()
+    return [{'mahsulot': x[0], 'sikl_kun': x[1]} for x in r]
+
 # ══════════════════════════════════════════════════════════════════
 # DASHBOARD — bitta ekranda butun biznes (HTML fayl)
 # ══════════════════════════════════════════════════════════════════
@@ -2452,7 +2967,7 @@ def keyingi_raqam(turi):
     yil = datetime.now().strftime('%Y')
     c.execute("SELECT COUNT(*) FROM documents WHERE turi=? AND sana LIKE ?", (turi, yil + '%'))
     n = c.fetchone()[0] + 1; conn.close()
-    pref = {'faktura': 'HF', 'chek': 'CH'}.get(turi, 'DOC')
+    pref = {'faktura': 'HF', 'chek': 'CH', 'dalolatnoma': 'SD'}.get(turi, 'DOC')
     return f"{pref}-{yil}-{n:04d}"
 
 def hujjat_yoz(raqam, turi, mijoz, summa, sale_id=None, izoh=''):
@@ -2466,7 +2981,8 @@ def build_hujjat(path, turi, mijoz, qatorlar, izoh=''):
     raqam = keyingi_raqam(turi)
     rate = get_exchange_rate()
     jami = sum(q * n for _, q, n in qatorlar)
-    sarlavha = 'HISOB-FAKTURA' if turi == 'faktura' else 'CHEK'
+    sarlavha = ('HISOB-FAKTURA' if turi == 'faktura' else
+                'SOLISHTIRISH DALOLATNOMASI' if turi == 'dalolatnoma' else 'CHEK')
     try:
         from fpdf import FPDF
     except ImportError:
@@ -2785,6 +3301,363 @@ async def cmd_deps(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"Xato: {str(e)[:200]}")
 
 
+
+# ══════════════════════════════════════════════════════════════════
+# MIJOZLAR — buyruqlar
+# ══════════════════════════════════════════════════════════════════
+
+def _md(s):
+    for ch in ('*', '_', '`', '['):
+        s = str(s).replace(ch, '')
+    return s
+
+_KAN_EMOJI = {'olx': '\U0001F4E6', 'instagram': '\U0001F4F8', 'telegram': '✈️',
+              'tavsiya': '\U0001F91D', 'b2b': '\U0001F3E2', 'boshqa': '•',
+              'nomalum': '❓', 'mijozsiz': '⚪'}
+
+
+async def cmd_mijoz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    q = ' '.join(ctx.args).strip() if ctx.args else ''
+    if not q:
+        await u.message.reply_text(
+            "\U0001F464 *Mijoz kartasi*\n\n`/mijoz Alisher`\n\n"
+            "Ro'yxat uchun — /mijozlar", parse_mode='Markdown')
+        return
+    k = mijoz_karta(q)
+    if not k:
+        top = mijoz_qidir(q)
+        if not top:
+            await u.message.reply_text(f"❌ Topilmadi: {_md(q)}")
+            return
+        if len(top) > 1:
+            t = "\U0001F50D Bir nechta mijoz topildi:\n\n"
+            t += "\n".join(f"• {_md(x['nom'])}" for x in top[:10])
+            await u.message.reply_text(t)
+            return
+        k = mijoz_karta(top[0]['id'])
+
+    tur = "\U0001F3E2 B2B" if k['tur'] == 'B2B' else "\U0001F464 B2C"
+    t = f"*{_md(k['nom'])}*\n{tur}"
+    if k['kanal']: t += f"  ·  {_KAN_EMOJI.get(k['kanal'], '')} {k['kanal']}"
+    t += "\n"
+    if k['tel']: t += f"\U0001F4DE `{k['tel']}`\n"
+    if k['obuna'] is True: t += "✅ Botga obuna — xabar yuborish mumkin\n"
+    elif k['chat_id']: t += "⚪ Botdan chiqib ketgan\n"
+    t += "\n"
+
+    t += (f"\U0001F4B0 *{k['sotuv_soni']} ta xarid · {fmt(k['jami_tushum'])}*\n"
+          f"Foyda: {fmt(k['jami_foyda'])}")
+    if k['jami_tushum']:
+        t += f"  ({round(k['jami_foyda'] / k['jami_tushum'] * 100)}%)"
+    t += f"\nO'rtacha chek: {fmt(k['ortacha_chek'])}\n"
+    if k['xarid_oraligi_kun']:
+        t += f"Xarid oralig'i: ~{k['xarid_oraligi_kun']} kun\n"
+    t += "\n"
+
+    if k['bizga_qarzdor']:
+        t += f"\U0001F534 *Bizga qarzi: {fmt(k['bizga_qarzdor'])}*\n"
+    if k['biz_qarzdormiz']:
+        t += f"\U0001F535 Biz qarzdormiz: {fmt(k['biz_qarzdormiz'])}\n"
+    if k['bizga_qarzdor'] or k['biz_qarzdormiz']: t += "\n"
+
+    kelgan = [x for x in k['qayta_buyurtma'] if x['muddati_keldi']]
+    if kelgan:
+        t += "\U0001F501 *Qayta buyurtma vaqti:*\n"
+        for x in kelgan[:5]:
+            t += f"• {_md(x['mahsulot'])} — {x['otgan']} kun oldin\n"
+        t += "\n"
+
+    if k['sotuvlar']:
+        t += "\U0001F4CB *Xaridlar:*\n"
+        for s in k['sotuvlar'][:8]:
+            sana = s['sana'][8:10] + '.' + s['sana'][5:7]
+            dona = f" x{s['dona']}" if s['dona'] > 1 else ""
+            t += f"`{sana}` {_md(s['mahsulot'])}{dona} — {fmt(s['summa'])}\n"
+        if len(k['sotuvlar']) > 8:
+            t += f"_...yana {len(k['sotuvlar']) - 8} ta_\n"
+        t += "\n"
+
+    if k['tarix']:
+        t += "\U0001F4DD *Aloqa tarixi:*\n"
+        for g in k['tarix'][:4]:
+            t += f"`{g['sana'][5:]}` {_md(g['matn'])[:60]}\n"
+        t += "\n"
+
+    if k['izoh']: t += f"\U0001F4AC {_md(k['izoh'])}\n"
+    if k['oxirgi_aloqa']: t += f"\nOxirgi aloqa: {k['oxirgi_aloqa']}"
+    await u.message.reply_text(t, parse_mode='Markdown')
+
+
+async def cmd_mijozlar_yangi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    conn = db(); c = conn.cursor()
+    c.execute("""SELECT cu.id, cu.name, cu.phone, cu.type, COALESCE(cu.channel,''),
+                        COUNT(s.id), COALESCE(SUM(s.revenue),0), COALESCE(SUM(s.profit),0),
+                        MAX(s.date)
+                 FROM customers cu LEFT JOIN sales s
+                      ON s.customer_id=cu.id AND s.reversed=0
+                 GROUP BY cu.id ORDER BY 8 DESC, 7 DESC""")
+    rows = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM sales WHERE COALESCE(customer_id,0)=0 AND reversed=0 "
+              "AND TRIM(COALESCE(customer,''))<>''")
+    bogsiz = c.fetchone()[0]
+    conn.close()
+    if not rows:
+        await u.message.reply_text("\U0001F465 Hali mijoz qo'shilmagan.")
+        return
+
+    qarzlar = {}
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT customer_id, SUM(amount) FROM debts "
+              "WHERE paid=0 AND type='berildi' AND COALESCE(customer_id,0)>0 GROUP BY customer_id")
+    for cid, s in c.fetchall(): qarzlar[cid] = s
+    conn.close()
+
+    b2b = [r for r in rows if r[3] == 'B2B']
+    b2c = [r for r in rows if r[3] != 'B2B']
+    jami_f = sum(r[7] for r in rows)
+    t = f"\U0001F465 *MIJOZLAR · {len(rows)} ta*\nJami foyda: {fmt(jami_f)}\n\n"
+
+    def blok(lst, sarlavha):
+        s = f"*{sarlavha}*\n"
+        for r in lst[:12]:
+            kan = _KAN_EMOJI.get(r[4], '') if r[4] else ''
+            s += f"• {_md(r[1])} {kan}\n"
+            s += f"  {r[5]} xarid · {fmt(r[6])} · foyda {fmt(r[7])}"
+            if qarzlar.get(r[0]):
+                s += f" · \U0001F534 qarz {fmt(qarzlar[r[0]])}"
+            s += "\n"
+        return s + "\n"
+
+    if b2b: t += blok(b2b, "\U0001F3E2 B2B")
+    if b2c: t += blok(b2c, "\U0001F464 B2C")
+    if bogsiz:
+        t += f"⚠️ {bogsiz} ta sotuv mijozga bog'lanmagan — /bogla\n"
+    t += "\nBatafsil: `/mijoz Ism`"
+    await u.message.reply_text(t, parse_mode='Markdown')
+
+
+async def cmd_bogla(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    msg = await u.message.reply_text("⏳ Bog'lanmoqda...")
+    r = await asyncio.to_thread(bogla_hammasi)
+    nsub = await asyncio.to_thread(sub_bogla)
+    d = await asyncio.to_thread(dublikatlar)
+    t = (f"✅ *Bog'landi*\n\n"
+         f"Sotuvlar: {r['sotuv']} ta\nQarzlar: {r['qarz']} ta\n"
+         f"Yangi mijoz kartasi: {r['yangi_mijoz']} ta\n"
+         f"Botdagi obunachiga ulandi: {nsub} ta\n")
+    if d:
+        t += f"\n⚠️ *{len(d)} ta ehtimoliy dublikat:*\n"
+        for x in d[:8]:
+            t += f"• {_md(x['a'])} ↔ {_md(x['b'])} ({x['sabab']})\n"
+        t += "\nBirlashtirish: `/birlashtir Eski | Yangi`"
+    await msg.edit_text(t, parse_mode='Markdown')
+
+
+async def cmd_birlashtir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    arg = ' '.join(ctx.args) if ctx.args else ''
+    if '|' not in arg:
+        await u.message.reply_text(
+            "\U0001F517 *Mijozlarni birlashtirish*\n\n"
+            "`/birlashtir Alisher | Alisher Zargarov`\n\n"
+            "Chapdagi o'ngdagiga qo'shiladi va o'chadi.", parse_mode='Markdown')
+        return
+    a, b = [x.strip() for x in arg.split('|', 1)]
+    r = await asyncio.to_thread(birlashtir, a, b)
+    if r.get('error'):
+        await u.message.reply_text(f"❌ {r['error']}")
+        return
+    await u.message.reply_text(
+        f"✅ *{_md(r['manba'])}* → *{_md(r['nishon'])}*\n\n"
+        f"Ko'chirildi: {r['sotuv']} sotuv, {r['qarz']} qarz", parse_mode='Markdown')
+
+
+async def cmd_ulash(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Mijoz kartasini botdagi obunachiga ulash"""
+    if not is_owner(u): return
+    args = ctx.args or []
+    if len(args) < 2 or not args[-1].lstrip('-').isdigit():
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT s.chat_id, s.name, s.username, "
+                  "(SELECT name FROM customers WHERE chat_id=s.chat_id) "
+                  "FROM subscribers s WHERE s.active=1 ORDER BY s.joined DESC LIMIT 20")
+        rows = c.fetchall(); conn.close()
+        t = "\U0001F517 *Mijozni botdagi obunachiga ulash*\n\n`/ulash Alisher Zargarov 555001`\n\n"
+        if rows:
+            t += "*Obunachilar:*\n"
+            for chid, nm, un, mij in rows:
+                t += f"`{chid}` {_md(nm or '?')}"
+                if un: t += f" @{un}"
+                t += f" → {_md(mij)}" if mij else " — _ulanmagan_"
+                t += "\n"
+        else:
+            t += "Hali obunachi yo'q."
+        await u.message.reply_text(t, parse_mode='Markdown')
+        return
+    chid = int(args[-1]); ism = ' '.join(args[:-1])
+    r = await asyncio.to_thread(sub_ulash, ism, chid)
+    if r.get('error'):
+        await u.message.reply_text(f"❌ {r['error']}")
+        return
+    await u.message.reply_text(
+        f"✅ {_md(r['mijoz'])} ↔ {_md(r['obunachi'])}\n\nEndi unga botdan xabar yuborish mumkin.")
+
+
+async def cmd_kanal(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    if len(ctx.args or []) < 2:
+        await u.message.reply_text(
+            "\U0001F4E1 *Mijoz kanali*\n\n`/kanal Alisher instagram`\n\n"
+            f"Kanallar: {', '.join(KANALLAR)}", parse_mode='Markdown')
+        return
+    kanal = ctx.args[-1]
+    ism = ' '.join(ctx.args[:-1])
+    r = await asyncio.to_thread(kanal_belgila, ism, kanal)
+    if r.get('error'):
+        await u.message.reply_text(f"❌ {r['error']}")
+        return
+    await u.message.reply_text(f"✅ {_md(r['mijoz'])} → {_KAN_EMOJI.get(r['kanal'],'')} {r['kanal']}")
+
+
+async def cmd_kanallar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    davr = (ctx.args[0] if ctx.args else '').strip()
+    rows = await asyncio.to_thread(kanal_hisobot, davr)
+    if not rows:
+        await u.message.reply_text("Sotuv yo'q.")
+        return
+    sarl = "\U0001F4E1 *KANALLAR"
+    if davr: sarl += " · " + davr
+    t = sarl + "*\n\n"
+    for r in rows:
+        em = _KAN_EMOJI.get(r['kanal']) or "•"
+        t += (f"{em} *{r['kanal']}*\n"
+              f"  {r['sotuv']} sotuv · {r['mijoz']} mijoz\n"
+              f"  Tushum {fmt(r['tushum'])} · foyda {fmt(r['foyda'])} ({r['ulush_pct']}%)\n\n")
+    nom = next((r for r in rows if r['kanal'] == 'nomalum'), None)
+    if nom and nom['ulush_pct'] > 15:
+        t += ("⚠️ Kanali belgilanmagan mijozlar bor.\n"
+              "`/kanal Ism olx` bilan belgilang.\n")
+    ms = next((r for r in rows if r['kanal'] == 'mijozsiz'), None)
+    if ms:
+        t += ("\n_mijozsiz — eski sotuvlar, ismi yozilmagan. "
+              "Bundan keyin har sotuvda mijoz ismini ayting._")
+    await u.message.reply_text(t, parse_mode='Markdown')
+
+
+async def cmd_qayta(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    lst = await asyncio.to_thread(qayta_buyurtma, 5)
+    rx = await asyncio.to_thread(rasxodniklar)
+    if not lst:
+        t = "\U0001F501 *Qayta buyurtma*\n\nHozircha muddati kelgani yo'q.\n\n"
+        if rx:
+            t += "Kuzatuvdagi rasxodniklar:\n"
+            t += "\n".join(f"• {_md(x['mahsulot'])} — {x['sikl_kun']} kun" for x in rx)
+        else:
+            t += ("Hali rasxodnik belgilanmagan.\n\n"
+                  "`/rasxodnik Sublimatsiya qog'ozi 30`\n"
+                  "— shu mahsulot har 30 kunda tugaydi deb hisoblanadi. "
+                  "Mijoz uni sotib olsa, vaqti kelganda eslatib turaman.")
+        await u.message.reply_text(t, parse_mode='Markdown')
+        return
+    t = f"\U0001F501 *QAYTA BUYURTMA · {len(lst)} ta*\n\n"
+    for x in lst[:15]:
+        belgi = "\U0001F534" if x['kechikkan'] > 7 else "\U0001F7E1" if x['kechikkan'] >= 0 else "⚪"
+        t += f"{belgi} *{_md(x['mijoz'])}* — {_md(x['mahsulot'])}\n"
+        t += f"   {x['otgan']} kun oldin olgan (sikl {x['sikl']} kun)"
+        if x['tel']: t += f"\n   \U0001F4DE `{x['tel']}`"
+        if x['chat_id']: t += "  ✅ botda"
+        t += "\n\n"
+    t += "To'xtatish: `/qayta_ochir Ism | Mahsulot`"
+    await u.message.reply_text(t, parse_mode='Markdown')
+
+
+async def cmd_qayta_ochir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    arg = ' '.join(ctx.args) if ctx.args else ''
+    if '|' not in arg:
+        await u.message.reply_text("`/qayta_ochir Alisher | qog'oz`", parse_mode='Markdown')
+        return
+    a, b = [x.strip() for x in arg.split('|', 1)]
+    r = await asyncio.to_thread(reorder_ochir, a, b)
+    if r.get('error'):
+        await u.message.reply_text(f"❌ {r['error']}")
+        return
+    await u.message.reply_text(f"✅ {r['ochirildi']} ta kuzatuv o'chirildi.")
+
+
+async def cmd_rasxodnik(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    args = ctx.args or []
+    if len(args) < 2 or not args[-1].isdigit():
+        rx = await asyncio.to_thread(rasxodniklar)
+        t = ("\U0001F504 *Rasxodnik belgilash*\n\n"
+             "`/rasxodnik Sublimatsiya qog'ozi 30`\n"
+             "— oxirgi raqam: necha kunda tugaydi.\n\n"
+             "0 qo'ysangiz kuzatuvdan chiqadi.\n\n")
+        if rx:
+            t += "*Hozirgi ro'yxat:*\n" + "\n".join(
+                f"• {_md(x['mahsulot'])} — {x['sikl_kun']} kun" for x in rx)
+        await u.message.reply_text(t, parse_mode='Markdown')
+        return
+    kun = int(args[-1]); nom = ' '.join(args[:-1])
+    r = await asyncio.to_thread(rasxodnik_belgila, nom, kun)
+    if r.get('error'):
+        await u.message.reply_text(f"❌ {r['error']}")
+        return
+    if kun == 0:
+        await u.message.reply_text(f"✅ {_md(r['mahsulot'])} kuzatuvdan chiqdi.")
+    else:
+        await u.message.reply_text(
+            f"✅ *{_md(r['mahsulot'])}* — har {kun} kunda tugaydi.\n\n"
+            f"Endi kim sotib olsa, {kun} kundan keyin eslataman.", parse_mode='Markdown')
+
+
+async def cmd_dalolatnoma(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u): return
+    q = ' '.join(ctx.args).strip() if ctx.args else ''
+    if not q:
+        await u.message.reply_text(
+            "\U0001F4C4 *Solishtirish dalolatnomasi*\n\n`/dalolatnoma Alisher`\n\n"
+            "Mijozning barcha xaridlari va qarz qoldig'i — imzolash uchun.",
+            parse_mode='Markdown')
+        return
+    k = await asyncio.to_thread(mijoz_karta, q)
+    if not k:
+        await u.message.reply_text(f"❌ Mijoz topilmadi: {_md(q)}")
+        return
+    if not k['sotuvlar']:
+        await u.message.reply_text(f"⚠️ {_md(k['nom'])} da xarid yo'q.")
+        return
+    qatorlar = []
+    for s in reversed(k['sotuvlar']):
+        sana = s['sana'][8:10] + '.' + s['sana'][5:7] + '.' + s['sana'][:4]
+        dona = max(1, s['dona'])
+        qatorlar.append((f"{sana} - {s['mahsulot']}", dona, round(s['summa'] / dona, 2)))
+    izoh = f"Xaridlar soni: {k['sotuv_soni']}."
+    if k['bizga_qarzdor']:
+        izoh += f" Qarz qoldigi: {k['bizga_qarzdor']:.2f} USD."
+    else:
+        izoh += " Qarz qoldigi yoq - hisob-kitob yopiq."
+    msg = await u.message.reply_text("⏳ Tayyorlanmoqda...")
+    base = f"/tmp/sd_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    p, raqam, jami, is_pdf = await asyncio.to_thread(
+        build_hujjat, base, 'dalolatnoma', k['nom'], qatorlar, izoh)
+    with open(p, 'rb') as fh:
+        await ctx.bot.send_document(
+            chat_id=OWNER_ID, document=fh,
+            filename=f"{raqam}.{'pdf' if is_pdf else 'html'}",
+            caption=f"\U0001F4C4 {raqam} · {_md(k['nom'])} · {fmt(jami)}")
+    try: os.remove(p)
+    except Exception: pass
+    await asyncio.to_thread(log_qosh, k['id'], 'hujjat', f"Dalolatnoma {raqam}")
+    await msg.delete()
+
+
 async def cmd_brief(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/brief — ertalabki xulosani hozir ko'rish"""
     if not is_owner(u): return
@@ -2803,6 +3676,8 @@ MENU_MAP = {
     "💵 Narxlar": "prices",
     "📊 Analiz": "analiz",
     "👥 Mijozlar": "customers",
+    "🔁 Qayta": "reorder",
+    "📡 Kanallar": "kanallar",
     "💳 Qarzlar": "debts",
     "💸 Xarajatlar": "expenses",
     "🎯 Maqsad": "target",
@@ -2836,7 +3711,9 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'supplier_debt': await cmd_zavod_qarz(u, ctx)
     elif action == 'prices':        await cmd_narxlar(u, ctx)
     elif action == 'analiz':        await cmd_analiz(u, ctx)
-    elif action == 'customers':     await cmd_mijozlar(u, ctx)
+    elif action == 'customers':     await cmd_mijozlar_yangi(u, ctx)
+    elif action == 'reorder':       await cmd_qayta(u, ctx)
+    elif action == 'kanallar':      await cmd_kanallar(u, ctx)
     elif action == 'debts':         await cmd_qarzlar(u, ctx)
     elif action == 'expenses':      await cmd_xarajatlar(u, ctx)
     elif action == 'target':        await cmd_maqsad(u, ctx)
@@ -2867,6 +3744,8 @@ async def cmd_start_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     us = u.effective_user
     nomi = (us.first_name or '') + ((' ' + us.last_name) if us.last_name else '')
     yangi = sub_add(us.id, nomi.strip(), us.username or '', 'start')
+    try: sub_bogla(us.id, nomi.strip())
+    except Exception: pass
     prods = [p for p in get_products() if p['qty'] > 0]
     rate = get_exchange_rate()
     text = ("\U0001F3ED ThermoCrafts \u2014 lazer, CNC va termopress uskunalari\n"
@@ -2927,7 +3806,8 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ["📈 Oylik",      "📅 Yillik"],
         ["🚚 Yo'lda",    "💳 Zavod qarzi"],
         ["💵 Narxlar",    "📊 Analiz"],
-        ["👥 Mijozlar",   "💳 Qarzlar"],
+        ["👥 Mijozlar",   "🔁 Qayta"],
+        ["💳 Qarzlar",    "📡 Kanallar"],
         ["💵 Kassa",      "📉 Nelikvid"],
         ["💸 Xarajatlar", "🎯 Maqsad"],
         ["🔧 Kafolat",    "📈 Trend"],
@@ -3670,7 +4550,7 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == 'supplier_debt': await fake_cmd(cmd_zavod_qarz)
     elif data == 'prices': await fake_cmd(cmd_narxlar)
     elif data == 'analiz': await fake_cmd(cmd_analiz)
-    elif data == 'customers': await fake_cmd(cmd_mijozlar)
+    elif data == 'customers': await fake_cmd(cmd_mijozlar_yangi)
     elif data == 'debts': await fake_cmd(cmd_qarzlar)
     elif data == 'expenses': await fake_cmd(cmd_xarajatlar)
     elif data == 'warranties': await fake_cmd(cmd_kafolat)
@@ -3816,7 +4696,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == 'trend': await cmd_trend(u, ctx)
     elif action == 'rate': await cmd_rate(u, ctx)
     elif action == 'warranties': await cmd_kafolat(u, ctx)
-    elif action == 'customers': await cmd_mijozlar(u, ctx)
+    elif action == 'customers': await cmd_mijozlar_yangi(u, ctx)
     elif action == 'debts': await cmd_qarzlar(u, ctx)
 
     elif action == 'report':
@@ -4763,7 +5643,7 @@ def main():
     app.add_handler(CommandHandler('yolda', cmd_yolda))
     app.add_handler(CommandHandler('zavod_qarz', cmd_zavod_qarz))
     app.add_handler(CommandHandler('analiz', cmd_analiz))
-    app.add_handler(CommandHandler('mijozlar', cmd_mijozlar))
+    app.add_handler(CommandHandler('mijozlar', cmd_mijozlar_yangi))
     app.add_handler(CommandHandler('qarzlar', cmd_qarzlar))
     app.add_handler(CommandHandler('xarajatlar', cmd_xarajatlar))
     app.add_handler(CommandHandler('kafolat', cmd_kafolat))
@@ -4788,6 +5668,16 @@ def main():
     app.add_handler(CommandHandler('och', cmd_och))
     app.add_handler(CommandHandler('hujjat', cmd_hujjat))
     app.add_handler(CommandHandler('deps', cmd_deps))
+    app.add_handler(CommandHandler('mijoz', cmd_mijoz))
+    app.add_handler(CommandHandler('bogla', cmd_bogla))
+    app.add_handler(CommandHandler('birlashtir', cmd_birlashtir))
+    app.add_handler(CommandHandler('kanal', cmd_kanal))
+    app.add_handler(CommandHandler('kanallar', cmd_kanallar))
+    app.add_handler(CommandHandler('qayta', cmd_qayta))
+    app.add_handler(CommandHandler('qayta_ochir', cmd_qayta_ochir))
+    app.add_handler(CommandHandler('rasxodnik', cmd_rasxodnik))
+    app.add_handler(CommandHandler('dalolatnoma', cmd_dalolatnoma))
+    app.add_handler(CommandHandler('ulash', cmd_ulash))
     app.add_handler(CommandHandler('sync_sentyabr', cmd_sync_sentyabr))
     app.add_handler(CommandHandler('backup', cmd_backup))
     app.add_handler(CommandHandler('restore', cmd_restore))
