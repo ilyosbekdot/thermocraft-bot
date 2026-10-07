@@ -6,7 +6,8 @@ ThermoCrafts Biznes Bot v3.0
 import os, json, sqlite3, logging, math, re, requests, base64, asyncio, time
 import threading, hashlib, tempfile, secrets, zipfile, io, difflib, calendar
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+import html as _html
+from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
 # ── Vaqt zonasi: Railway serveri UTC da ishlaydi. Sana/vaqt Toshkent bo'yicha bo'lsin,
@@ -19,15 +20,19 @@ try:
 except Exception:
     pass
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                       InputMediaPhoto, ReplyKeyboardMarkup, KeyboardButton)
+                       InputMediaPhoto, ReplyKeyboardMarkup)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                            CallbackQueryHandler, ConversationHandler,
-                           filters, ContextTypes)
+                           filters, ContextTypes, TypeHandler, ApplicationHandlerStop)
+from telegram.error import BadRequest
 import anthropic
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 log = logging.getLogger(__name__)
+# httpx har so'rovni INFO darajada URL bilan yozadi — URL ichida BOT_TOKEN bor (Railway loglarida token ochiq turardi)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # ── CONFIG ────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv('BOT_TOKEN', '')
@@ -164,7 +169,8 @@ INIT_SPECS = {
 
 # ── DATABASE ──────────────────────────────────────────────────────
 def db():
-    return sqlite3.connect(DB_PATH)
+    # timeout: zaxira (backup) oqimi bazani o'qiyotgan paytda yozuv darhol "database is locked" bilan yiqilmasin
+    return sqlite3.connect(DB_PATH, timeout=15)
 
 def init_db():
     conn = db(); c = conn.cursor()
@@ -515,7 +521,10 @@ def add_product(name, cat, sup, qty, cost, price, factory_price=0, warranty_days
         conn.commit(); conn.close()
         log_op('add_product', {'name':name,'cat':cat,'qty':qty,'cost':cost,'price':price})
         return pid
-    except: conn.close(); return None
+    except sqlite3.IntegrityError:      # shu nomli mahsulot allaqachon bor
+        conn.close(); return None
+    except Exception:
+        log.exception("add_product"); conn.close(); return None
 
 def update_product(pid, **kwargs):
     conn = db(); c = conn.cursor()
@@ -541,7 +550,8 @@ def add_photo(product_id, file_id):
 def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C', cash=True, method='naqd'):
     """Sotuv BITTA tranzaksiyada: astatka kamayadi + sotuv yoziladi + kassaga kirim + kafolat.
     Astatka yetmasa hech narsa yozilmaydi (avval sotuv yozilib, astatka/kassa o'zgarmay qolardi)."""
-    profit = (price - cost) * qty
+    revenue = round(price * qty, 2)              # pul — sentgacha (313.3333*3 = 939.9999 bo'lib qolmasin)
+    profit = round(revenue - (cost or 0) * qty, 2)
     now = datetime.now()
     d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
     conn = db(); c = conn.cursor()
@@ -551,7 +561,7 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
             conn.rollback(); conn.close()
             return False, None
         c.execute('INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                  (d, t, pname, qty, cost, price*qty, profit, discount, customer, ctype))
+                  (d, t, pname, qty, cost, revenue, profit, discount, customer, ctype))
         sale_id = c.lastrowid
         # Kafolat
         c.execute('SELECT COALESCE(warranty_days,0) FROM products WHERE id=?', (pid,))
@@ -563,7 +573,7 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
         # Kassa — shu tranzaksiya ichida (sotuv bor-u kassa yo'q holati bo'lmasin)
         if cash:
             c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
-                      (d, t, 'kirim', price*qty, 'sotuv', f'{pname} x{qty} (#{sale_id})', method or 'naqd'))
+                      (d, t, 'kirim', revenue, 'sotuv', f'{pname} x{qty} (#{sale_id})', method or 'naqd'))
         conn.commit()
     except Exception:
         conn.rollback(); conn.close()
@@ -587,19 +597,39 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
     return ok, sale_id
 
 def reverse_sale(sale_id):
+    """Sotuvni bekor qiladi: sotuv belgisi + astatka + kafolat + kassa qaytimi BITTA tranzaksiyada
+    (avval kassa qaytimi alohida yozilardi — o'rtada xato bo'lsa astatka qaytib, pul qaytmay qolardi)."""
     conn = db(); c = conn.cursor()
-    c.execute('SELECT * FROM sales WHERE id=? AND reversed=0', (sale_id,))
-    row = c.fetchone()
-    if not row: conn.close(); return False
-    product, qty, cost, revenue = row[3], row[4], row[5], row[6]
-    c.execute('UPDATE sales SET reversed=1 WHERE id=?', (sale_id,))
-    c.execute('UPDATE products SET qty=qty+? WHERE name=?', (qty, product))
-    c.execute("UPDATE warranties SET status='cancelled' WHERE sale_id=?", (sale_id,))
-    conn.commit(); conn.close()
-    c2 = db(); cc = c2.cursor()
-    cc.execute("SELECT COUNT(*) FROM cash_box WHERE note LIKE ?", (f'%(#{sale_id})',))
-    had_cash = cc.fetchone()[0] > 0; c2.close()
-    if had_cash: add_cash(revenue, 'chiqim', 'qaytarish', f'{product} bekor (#{sale_id})')
+    cid = 0
+    try:
+        c.execute('SELECT * FROM sales WHERE id=? AND reversed=0', (sale_id,))
+        row = c.fetchone()
+        if not row: conn.close(); return False
+        product, qty, revenue = row[3], row[4], row[6]
+        c.execute('UPDATE sales SET reversed=1 WHERE id=? AND reversed=0', (sale_id,))
+        if c.rowcount == 0:
+            conn.rollback(); conn.close(); return False
+        c.execute('UPDATE products SET qty=qty+? WHERE name=?', (qty, product))
+        c.execute("UPDATE warranties SET status='cancelled' WHERE sale_id=?", (sale_id,))
+        c.execute("SELECT COUNT(*) FROM cash_box WHERE type='kirim' AND note LIKE ?", (f'%(#{sale_id})',))
+        if c.fetchone()[0] > 0:
+            now = datetime.now()
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'), 'chiqim', revenue, 'qaytarish',
+                       f'{product} bekor (#{sale_id})', 'naqd'))
+        try:
+            c.execute('SELECT COALESCE(customer_id,0) FROM sales WHERE id=?', (sale_id,))
+            cid = (c.fetchone() or [0])[0] or 0
+        except sqlite3.OperationalError:     # customer_id ustuni hali yo'q (eski baza)
+            cid = 0
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    if cid:
+        try: yangila_jami(cid)               # mijoz kartasidagi jami xarid ham kamaysin
+        except Exception as e: log.warning(f'yangila_jami: {e}')
     return True
 
 def add_expense(amount, category, expense_type='period', note='', cash=True, date=None):
@@ -632,20 +662,33 @@ def add_transit(supplier, product, qty, unit_cost, deposit=0, bank_fee=0, delive
     return tid
 
 def arrive_transit(tid):
+    """Yo'ldagi tovar keldi: astatkaga qo'shadi, sebestni O'RTACHA tortilgan usulda yangilaydi (IAS 2)."""
     conn = db(); c = conn.cursor()
     c.execute('SELECT * FROM transit WHERE id=? AND status=?', (tid, 'yolda'))
     row = c.fetchone()
     if not row: conn.close(); return None
-    product, qty, real_cost = row[3], row[4], row[10]
+    # transit ustunlari: 0 id,1 date,2 supplier,3 product,4 qty,5 unit_cost,6 total_cost,7 deposit,
+    # 8 remaining,9 bank_fee,10 delivery_fee,11 real_cost (avval row[10] — DOSTAVKA summasi — sebest deb yozilardi)
+    product, qty, real_cost = row[3], row[4] or 0, row[11]
+    if real_cost is None: real_cost = row[5] or 0
+    # Mahsulot: avval aniq nom, keyin yagona moslik, oxirida eski LIKE usuli
+    c.execute('SELECT id, qty, cost FROM products WHERE name=?', (product,))
+    pid_row = c.fetchone()
+    if not pid_row:
+        p, _ = match_product(product, prods=get_products(active_only=False))
+        if p: pid_row = (p['id'], p['qty'], p['cost'])
+    if not pid_row:
+        c.execute('SELECT id, qty, cost FROM products WHERE name LIKE ?', (f'%{product}%',))
+        pid_row = c.fetchone()
     now = datetime.now().strftime('%Y-%m-%d')
     c.execute("UPDATE transit SET status='keldi', arrived_date=? WHERE id=?", (now, tid))
-    c.execute('SELECT id FROM products WHERE name LIKE ?', (f'%{product}%',))
-    pid_row = c.fetchone()
     if pid_row:
-        c.execute('UPDATE products SET qty=qty+?, cost=? WHERE id=?',
-                  (qty, real_cost, pid_row[0]))
+        pid, old_q, old_c = pid_row[0], max(0, pid_row[1] or 0), pid_row[2] or 0
+        jami_q = old_q + qty
+        new_cost = round((old_q * old_c + qty * real_cost) / jami_q, 2) if jami_q > 0 else real_cost
+        c.execute('UPDATE products SET qty=qty+?, cost=? WHERE id=?', (qty, new_cost, pid))
     conn.commit(); conn.close()
-    return {'product': product, 'qty': qty, 'real_cost': real_cost}
+    return {'product': product, 'qty': qty, 'real_cost': real_cost, 'found': bool(pid_row)}
 
 def pay_transit_deposit(tid, amount):
     conn = db(); c = conn.cursor()
@@ -721,26 +764,48 @@ def update_olx(product, calls=0):
                   (product, now, calls))
     conn.commit(); conn.close()
 
+_RATE = {'date': None, 'rate': None, 'retry_at': 0.0}
+
+def _last_known_rate():
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute('SELECT usd_uzs FROM exchange_rates WHERE usd_uzs>0 ORDER BY date DESC LIMIT 1')
+        r = c.fetchone(); conn.close()
+        return float(r[0]) if r and r[0] else None
+    except Exception:
+        return None
+
 def get_exchange_rate():
-    conn = db(); c = conn.cursor()
+    """CBU kursi. Kunlik kesh; cbu.uz ishlamasa 10 daqiqa qayta urinmaydi (har xabarda bot 5 soniya
+    qotib qolmasin) va oxirgi ma'lum kursni qaytaradi (avval darhol 12500 qaytarardi)."""
     today = datetime.now().strftime('%Y-%m-%d')
+    if _RATE['date'] == today and _RATE['rate']:
+        return _RATE['rate']
+    conn = db(); c = conn.cursor()
     c.execute('SELECT usd_uzs FROM exchange_rates WHERE date=?', (today,))
     row = c.fetchone()
     conn.close()
-    if row: return row[0]
-    try:
-        r = requests.get('https://cbu.uz/uz/arkhiv-kursov-valyut/json/', timeout=5)
-        data = r.json()
-        for item in data:
-            if item.get('Ccy') == 'USD':
-                rate = float(item['Rate'])
-                conn2 = db(); c2 = conn2.cursor()
-                c2.execute('INSERT OR REPLACE INTO exchange_rates (date,usd_uzs) VALUES (?,?)',
-                           (today, rate))
-                conn2.commit(); conn2.close()
-                return rate
-    except: pass
-    return 12500.0  # fallback
+    if row and row[0] and row[0] > 0:
+        _RATE.update(date=today, rate=float(row[0]))
+        return _RATE['rate']
+    if time.time() >= _RATE['retry_at']:
+        try:
+            r = requests.get('https://cbu.uz/uz/arkhiv-kursov-valyut/json/', timeout=5)
+            data = r.json()
+            for item in data:
+                if item.get('Ccy') == 'USD':
+                    rate = float(item['Rate'])
+                    if rate <= 0: break
+                    conn2 = db(); c2 = conn2.cursor()
+                    c2.execute('INSERT OR REPLACE INTO exchange_rates (date,usd_uzs) VALUES (?,?)',
+                               (today, rate))
+                    conn2.commit(); conn2.close()
+                    _RATE.update(date=today, rate=rate, retry_at=0.0)
+                    return rate
+        except Exception as e:
+            log.warning("CBU kursini olib bo'lmadi: %s", e)
+        _RATE['retry_at'] = time.time() + 600
+    return _last_known_rate() or 12500.0  # fallback
 
 def get_sales(date_filter):
     conn = db(); c = conn.cursor()
@@ -823,6 +888,18 @@ def get_nelikvid(days=60):
     conn.close()
     return sorted(nelikvid, key=lambda x: -x['days_since'])
 
+def _oylar_orqaga(n):
+    """Joriy oy bilan birga oxirgi n oy, eskidan yangiga: ['2026-03', ..., '2026-10'].
+    (Avval 'bugun - 30*i kun' ishlatilardi: 31-sanada joriy oy ikki marta chiqib, oldingi oy tushib qolardi,
+    1-2 martda esa fevral umuman ko'rinmasdi.)"""
+    now = datetime.now(); y, m = now.year, now.month
+    out = []
+    for _ in range(n):
+        out.append(f"{y}-{m:02d}")
+        m -= 1
+        if m == 0: y, m = y - 1, 12
+    return out[::-1]
+
 def calc_cv(monthly_data):
     n = len(monthly_data)
     if n < 2: return 999.0
@@ -836,7 +913,7 @@ def abc_xyz_analysis():
     conn = db(); c = conn.cursor()
     c.execute('SELECT product,SUM(revenue),SUM(qty),COUNT(*) FROM sales WHERE reversed=0 GROUP BY product')
     sd = {r[0]: {'rev':r[1] or 0,'qty':r[2] or 0,'cnt':r[3]} for r in c.fetchall()}
-    months = [(datetime.now()-timedelta(days=30*i)).strftime('%Y-%m') for i in range(7,-1,-1)]
+    months = _oylar_orqaga(8)
 
     items = []
     for p in prods:
@@ -878,10 +955,9 @@ def is_owner(u): return u.effective_user.id == OWNER_ID
 
 def cash_flow_forecast():
     """30 kunlik cash flow prognozi"""
-    prods = get_products()
     conn = db(); c = conn.cursor()
     # O'rtacha oylik sotuv (oxirgi 3 oy)
-    months = [(datetime.now()-timedelta(days=30*i)).strftime('%Y-%m') for i in range(3)]
+    months = _oylar_orqaga(3)
     monthly_revs = []
     for m in months:
         c.execute('SELECT COALESCE(SUM(revenue),0) FROM sales WHERE date LIKE ? AND reversed=0', (m+'%',))
@@ -911,8 +987,7 @@ def cash_flow_forecast():
 def get_sales_trend():
     """Oxirgi 3 oy trendi"""
     months = []
-    for i in range(2, -1, -1):
-        m = (datetime.now()-timedelta(days=30*i)).strftime('%Y-%m')
+    for m in _oylar_orqaga(3):
         conn = db(); c = conn.cursor()
         c.execute('SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(profit),0) FROM sales WHERE date LIKE ? AND reversed=0', (m+'%',))
         row = c.fetchone(); conn.close()
@@ -1016,8 +1091,9 @@ def _undo_op(op_id: int):
     conn = db(); c = conn.cursor()
     c.execute('SELECT * FROM op_log WHERE id=? AND reversed=0', (op_id,))
     op = c.fetchone()
+    conn.close()          # o'qish ulanishi yopiladi — quyidagi yozuvlar boshqa ulanishda bo'ladi
     if not op:
-        conn.close(); return False, "Topilmadi yoki allaqachon qaytarilgan"
+        return False, "Topilmadi yoki allaqachon qaytarilgan"
     d = json.loads(op[4]); ok = False
     if op[3] == 'sale':
         ok = reverse_sale(d.get('sale_id', 0))
@@ -1027,8 +1103,9 @@ def _undo_op(op_id: int):
         ok = cc.rowcount > 0; c2.commit(); c2.close()
         if ok: add_cash(d.get('amount', 0), 'kirim', 'qaytarish', f"xarajat bekor (#x{d.get('id')})")
     if ok:
-        c.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,)); conn.commit()
-    conn.close()
+        conn = db()
+        conn.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,)); conn.commit()
+        conn.close()
     return ok, ("qaytarildi" if ok else "qaytarib bo'lmadi")
 
 # ── Asboblar ro'yxati ────────────────────────────────────────────
@@ -1776,7 +1853,16 @@ BRIEF_EVENING = os.getenv('BRIEF_EVENING', '21:00')  # kechki xulosa
 _WEB_OK = {'v': AI_WEB}
 
 def _local_now():
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+    # datetime.utcnow() Python 3.12+ da eskirgan (deprecated) — natija o'sha: Toshkent vaqti, tzinfo'siz
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=TZ_OFFSET)
+
+def _hhmm(s):
+    """'9:00' → '09:00' (BRIEF_MORNING/EVENING solishtirish uchun)"""
+    try:
+        h, m = str(s).strip().split(':')[:2]
+        return f"{int(h):02d}:{int(m):02d}"
+    except Exception:
+        return str(s).strip()
 
 # ── Doimiy xotira (SQLite) ───────────────────────────────────────
 def init_sub_table():
@@ -1961,15 +2047,19 @@ def _all_tools():
 async def ai_agent(user_id: int, user_msg, ctx=None, persist=True) -> str:
     """user_msg: matn yoki content-bloklar ro'yxati (rasm uchun)"""
     history = hist_load(user_id)
+    while history and history[0].get("role") != "user":   # tarix assistant xabaridan boshlanmasin (API talabi)
+        history.pop(0)
     messages = history + [{"role": "user", "content": user_msg}]
     save_text = user_msg if isinstance(user_msg, str) else "[rasm] " + next(
         (b.get("text", "") for b in user_msg if isinstance(b, dict) and b.get("type") == "text"), "")
     final_text = ""
     for _ in range(7):
         try:
+            # system prompt kursni (tarmoq) va bazani o'qiydi — event loop'ni to'smasligi uchun oqimda
+            system = await asyncio.to_thread(_mira_system_prompt)
             resp = await asyncio.to_thread(
                 ai.messages.create, model=AI_MODEL, max_tokens=1500,
-                system=_mira_system_prompt(), tools=_all_tools(), messages=messages)
+                system=system, tools=_all_tools(), messages=messages)
         except Exception as e:
             if _WEB_OK['v'] and 'web_search' in str(e).lower():
                 _WEB_OK['v'] = False
@@ -1977,6 +2067,8 @@ async def ai_agent(user_id: int, user_msg, ctx=None, persist=True) -> str:
                 continue
             raise
         messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason == "pause_turn":      # web_search uzoq davom etdi — o'sha javobni davom ettiramiz
+            continue
         if resp.stop_reason != "tool_use":
             final_text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
             break
@@ -1999,7 +2091,7 @@ async def ai_agent(user_id: int, user_msg, ctx=None, persist=True) -> str:
 async def cmd_ai_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
     hist_clear(u.effective_user.id)
-    await u.message.reply_text(f"🧹 Suhbat tozalandi. Doimiy xotira saqlanib qoldi (/xotira).")
+    await u.message.reply_text("🧹 Suhbat tozalandi. Doimiy xotira saqlanib qoldi (/xotira).")
 
 async def cmd_xotira(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
@@ -2094,13 +2186,19 @@ async def _briefing(app, kind):
 async def _scheduler(app):
     log.info("Proaktiv xabarlar yoqildi: %s / %s (UTC%+d)", BRIEF_MORNING, BRIEF_EVENING, TZ_OFFSET)
     sent = set()
+    bm, be = _hhmm(BRIEF_MORNING), _hhmm(BRIEF_EVENING)
     while True:
-        now = _local_now(); key = now.strftime('%Y-%m-%d %H:%M')
-        if key.endswith(BRIEF_MORNING) and ('m' + key[:10]) not in sent:
+        now = _local_now(); key = now.strftime('%Y-%m-%d %H:%M'); hm = now.strftime('%H:%M')
+        if hm == bm and ('m' + key[:10]) not in sent:
             sent.add('m' + key[:10]); await _briefing(app, 'morning')
-        if key.endswith(BRIEF_EVENING) and ('e' + key[:10]) not in sent:
+        if hm == be and ('e' + key[:10]) not in sent:
             sent.add('e' + key[:10]); await _briefing(app, 'evening')
-        if len(sent) > 50: sent.clear()
+        # Eski kunlarni tozalash (avval sent.clear() — xuddi shu daqiqada xulosa ikkinchi marta ketishi mumkin edi)
+        if len(sent) > 50: sent = {k for k in sent if k[1:] == key[:10]}
+        # Kunlik kursni oldindan (alohida oqimda) olib qo'yamiz — handlerlar keshdan oladi, tarmoqni kutmaydi
+        if _RATE.get('date') != datetime.now().strftime('%Y-%m-%d') and time.time() >= _RATE.get('retry_at', 0):
+            try: await asyncio.to_thread(get_exchange_rate)
+            except Exception: log.exception("kurs")
         # Avto-zaxira: FAQAT baza mazmuni o'zgarganda va FAQAT alohida branch'ga (main'ga emas —
         # main'ga yozilsa Railway qayta deploy qiladi va bot o'zini o'chirib-yoqib, yozuvlarni yo'qotadi)
         try:
@@ -2137,6 +2235,8 @@ def init_all_tables():
     init_crm_tables()
     init_excel_tables()
 
+_BG_TASKS = set()
+
 async def _post_init(app):
     init_ai_tables()
     init_sub_table()
@@ -2147,7 +2247,8 @@ async def _post_init(app):
     upd = _check_update_marker()
     if upd:
         _BK['migrate'] = True   # belgi o'chirilgani zaxiraga ham tushsin (keyingi restartda qayta aytmasin)
-    asyncio.create_task(_scheduler(app))
+    _t = asyncio.create_task(_scheduler(app))     # havola saqlanadi — aks holda GC vazifani o'chirib yuborishi mumkin
+    _BG_TASKS.add(_t); _t.add_done_callback(_BG_TASKS.discard)
     if upd:
         d, running = upd
         if d.get('sha') and d.get('sha') == running:
@@ -3306,9 +3407,12 @@ def build_hujjat(path, turi, mijoz, qatorlar, izoh=''):
 
 
 def _hujjat_html(path, raqam, sarlavha, mijoz, qatorlar, jami, rate, izoh):
-    rek = ''.join(f'<div>{v}</div>' for k, v in FIRMA.items() if v and k != 'nom')
+    # Mijoz/mahsulot nomidagi < > & belgilar HTML'ni buzmasin
+    def e(v): return _html.escape(str(v or ''))
+    mijoz, izoh = e(mijoz), e(izoh)
+    rek = ''.join(f'<div>{e(v)}</div>' for k, v in FIRMA.items() if v and k != 'nom')
     rows = ''.join(
-        f'<tr><td>{n}</td><td class=c>{q}</td><td class=r>${p:,.2f}</td>'
+        f'<tr><td>{e(n)}</td><td class=c>{q}</td><td class=r>${p:,.2f}</td>'
         f'<td class=r>${q*p:,.2f}</td></tr>' for n, q, p in qatorlar)
     html = f"""<!DOCTYPE html><html lang=uz><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>{raqam}</title><style>
@@ -3325,7 +3429,7 @@ td{{padding:8px 6px;border-bottom:1px solid #eee}} .c{{text-align:center}} .r{{t
 .imzo{{display:flex;justify-content:space-between;margin-top:46px;color:#555;font-size:13px}}
 @media print{{body{{padding:0}}}}
 </style></head><body>
-<h1>{FIRMA['nom']}</h1><div class=rek>{rek}</div><hr>
+<h1>{e(FIRMA['nom'])}</h1><div class=rek>{rek}</div><hr>
 <h2>{sarlavha} &nbsp;{raqam}</h2>
 <div class=meta>Sana: {datetime.now().strftime('%d.%m.%Y')}{f'<br>Mijoz: {mijoz}' if mijoz else ''}</div>
 <table><thead><tr><th>Mahsulot</th><th class=c>Soni</th><th class=r>Narx</th><th class=r>Summa</th></tr></thead>
@@ -3353,7 +3457,7 @@ async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t += f"Tovar tannarxi      -{fmt(pl['cogs'])}\n"
     if pl['togri_xarajat']:
         t += f"Bank + dostavka     -{fmt(pl['togri_xarajat'])}\n"
-    t += f"────────────────────\n"
+    t += "────────────────────\n"
     t += f"Yalpi foyda          {fmt(pl['yalpi_foyda'])}  ({pl['marja_pct']}%)\n\n"
     if pl['davr_tafsil']:
         t += "Davr xarajatlari:\n"
@@ -3364,13 +3468,13 @@ async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t += f"   {pl['sotuv_soni']} ta sotuv · {pl['dona']} dona\n\n"
 
     t += "── BALANS ──\n"
-    t += f"AKTIV\n"
+    t += "AKTIV\n"
     t += f"  Kassa              {fmt(bl['naqd'])}\n"
     t += f"  Tovar (sebest)     {fmt(bl['tovar'])}\n"
     if bl['debitor']: t += f"  Debitorlik         {fmt(bl['debitor'])}\n"
     if bl['yolda']:   t += f"  Yo'ldagi avans     {fmt(bl['yolda'])}\n"
     t += f"  Jami aktiv         {fmt(bl['aktiv'])}\n\n"
-    t += f"PASSIV\n"
+    t += "PASSIV\n"
     if bl['zavod_qarzi']: t += f"  Zavod qarzi        {fmt(bl['zavod_qarzi'])}\n"
     if bl['kreditor']:    t += f"  Boshqa qarzlar     {fmt(bl['kreditor'])}\n"
     t += f"  Jami passiv        {fmt(bl['passiv'])}\n\n"
@@ -3407,7 +3511,7 @@ async def cmd_qarz_yosh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q['jami_debitor'] == 0 and q['jami_kreditor'] == 0:
         t += "Ochiq qarz yo'q — hammasi toza."
     else:
-        t += f"────────────────\n"
+        t += "────────────────\n"
         t += f"Debitor {fmt(q['jami_debitor'])} · Kreditor {fmt(q['jami_kreditor'])}\n"
         t += f"Sof: {fmt(q['jami_debitor'] - q['jami_kreditor'])}"
     await u.message.reply_text(t)
@@ -3454,7 +3558,9 @@ async def cmd_yop(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         t += ("\n".join(f"• {p} — {c}" for p, c in yop) if yop else "Yopilgan davr yo'q.")
         t += "\n\nYopish: /yop 2026-09\nOchish: /och 2026-09"
         await u.message.reply_text(t); return
-    davr = a[0]
+    davr = a[0].strip()
+    if not re.match(r'^\d{4}-\d{2}$', davr):
+        await u.message.reply_text("Format: /yop 2026-09"); return
     if is_closed(davr + '-01'):
         await u.message.reply_text(f"{davr} allaqachon yopilgan."); return
     pl = pl_hisobot(davr)
@@ -3468,8 +3574,9 @@ async def cmd_yop(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_och(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
     a = ctx.args or []
-    if not a: await u.message.reply_text("Format: /och 2026-09"); return
-    ok = open_period(a[0])
+    if not a or not re.match(r'^\d{4}-\d{2}$', a[0].strip()):
+        await u.message.reply_text("Format: /och 2026-09"); return
+    ok = open_period(a[0].strip())
     await u.message.reply_text(f"\U0001F513 {a[0]} ochildi." if ok else f"{a[0]} yopilmagan edi.")
 
 
@@ -3537,14 +3644,14 @@ async def cmd_deps(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not GITHUB_TOKEN:
         await u.message.reply_text("GITHUB_TOKEN sozlanmagan."); return
     try:
-        from fpdf import FPDF
+        __import__('fpdf')   # faqat o'rnatilganini tekshirish
         await u.message.reply_text("✅ PDF kutubxonasi allaqachon o'rnatilgan."); return
     except ImportError:
         pass
     await u.message.reply_text("⏳ requirements.txt yangilanmoqda...")
     try:
         api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/requirements.txt"
-        r = requests.get(api, headers=_gh_headers(), timeout=20)
+        r = await asyncio.to_thread(requests.get, api, headers=_gh_headers(), timeout=20)
         if r.status_code != 200:
             await u.message.reply_text(f"requirements.txt topilmadi ({r.status_code})"); return
         j = r.json()
@@ -3552,7 +3659,7 @@ async def cmd_deps(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if 'fpdf' in cur.lower():
             await u.message.reply_text("fpdf2 allaqachon ro'yxatda. Railway qayta deploy qiling."); return
         yangi = cur.rstrip() + "\nfpdf2>=2.7.0\n"
-        r2 = requests.put(api, headers=_gh_headers(), timeout=30, json={
+        r2 = await asyncio.to_thread(requests.put, api, headers=_gh_headers(), timeout=30, json={
             "message": "fpdf2 qo'shildi (PDF hujjatlar uchun)",
             "content": base64.b64encode(yangi.encode()).decode(), "sha": j['sha']})
         if r2.status_code in (200, 201):
@@ -4126,7 +4233,7 @@ async def cmd_astatka(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Boshqa yetkazuvchilar
     other = [p for p in prods if p['sup'] not in ('Two Trees', 'Freesub')]
     if other:
-        text += f"⚪ *BOSHQA*\n"
+        text += "⚪ *BOSHQA*\n"
         for p in other:
             e = "🔴" if p['qty']==0 else "🟡" if p['qty']<=1 else "🟢"
             text += f"  {e} {p['name']}: *{p['qty']} ta* · {fmt(p['price'])}\n"
@@ -4154,7 +4261,8 @@ async def cmd_narxlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 text += (f"  {p['name']}\n"
                          f"  🏭${p['factory']:.0f} → 📦${p['cost']:.0f} → 💵${p['price']:.0f} | ✅${margin:.0f} ({pct:.0f}%)\n")
             text += "\n"
-    avg_margin = sum((p['price']-p['cost'])/p['price']*100 for p in prods if p['price']>0) / len(prods)
+    narxli = [p for p in prods if p['price'] > 0]      # mahsulot yo'q / narxsiz bo'lsa ZeroDivisionError bo'lardi
+    avg_margin = sum((p['price']-p['cost'])/p['price']*100 for p in narxli) / len(narxli) if narxli else 0
     text += f"📊 O'rtacha marja: *{avg_margin:.0f}%*"
     await u.message.reply_text(text, parse_mode='Markdown')
 
@@ -4169,7 +4277,6 @@ async def cmd_bugun(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     tR = sum(s[6] for s in sales)
     tCOGS = sum(s[5]*s[4] for s in sales)  # unit_cost * qty
-    tF = sum(s[7] for s in sales)
     tCogsEx = sum(e[2] for e in exps_cogs)
     tPeriod = sum(e[2] for e in exps_period)
     text = f"📊 *Bugungi hisobot — {label}*\n\n"
@@ -4192,7 +4299,11 @@ async def cmd_bugun(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_oy(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
     if not is_owner(u): return
+    # /oy 2026-07 — CommandHandler oyni ctx.args da beradi (avval e'tiborsiz qolib, doim joriy oy chiqardi)
+    if not month and getattr(ctx, 'args', None): month = ctx.args[0].strip()
     if not month: month = this_month()
+    if not re.match(r'^\d{4}-\d{2}$', str(month)):
+        await u.message.reply_text("Format: /oy 2026-07"); return
     sales = get_sales(month)
     exps_cogs = get_expenses(month, 'cogs_bank') + get_expenses(month, 'cogs_delivery')
     exps_period = get_expenses(month, 'period')
@@ -4224,7 +4335,7 @@ async def cmd_oy(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
     if tgt:
         rpct = tR/tgt[0]*100 if tgt[0] else 0
         ppct = sof/tgt[1]*100 if tgt[1] else 0
-        text += f"\n🎯 *Maqsad:*\n"
+        text += "\n🎯 *Maqsad:*\n"
         text += f"Tushum: {rpct:.0f}% ({fmt(tR)}/{fmt(tgt[0])})\n"
         text += f"Foyda: {ppct:.0f}% ({fmt(sof)}/{fmt(tgt[1])})"
     await u.message.reply_text(text, parse_mode='Markdown')
@@ -4232,32 +4343,31 @@ async def cmd_oy(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
 async def cmd_yil(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
     year = datetime.now().strftime('%Y')
-    HIST = [
-        ('Yanvar','2026-01',1987,429),('Fevral','2026-02',2680,540),
-        ('Mart','2026-03',2185,871),('Aprel','2026-04',3190,820),
-        ('May','2026-05',1515,799),('Iyun','2026-06',1500,257),
-        ('Iyul','2026-07',525,97),('Avgust','2026-08',1993,637),
-    ]
-    conn = db(); c = conn.cursor()
+    # Yan–Avg 2026: Excel'dagi yakuniy raqamlar (o'zgarmadi). Qolgan oylar — bazadagi sotuvlardan.
+    # (Avval faqat shu 8 oy + joriy oy chiqardi: oktyabrda sentyabr tushib qolardi, o'rtacha esa doim /9 edi.)
+    HIST = {
+        '2026-01': (1987, 429), '2026-02': (2680, 540), '2026-03': (2185, 871), '2026-04': (3190, 820),
+        '2026-05': (1515, 799), '2026-06': (1500, 257), '2026-07': (525, 97),   '2026-08': (1993, 637),
+    }
     text = f"📅 *YILLIK HISOBOT — {year}*\n\n"
     text += "```\n"
     text += f"{'Oy':<10} {'Tushum':>8} {'Foyda':>8}\n"
     text += "─" * 28 + "\n"
-    total_r, total_f = 0, 0
-    for name, month, rev, profit in HIST:
-        text += f"{name:<10} {fmt(rev):>8} {fmt(profit):>8}\n"
-        total_r += rev; total_f += profit
-    # Joriy oy
-    current_sales = get_sales(this_month())
-    cur_r = sum(s[6] for s in current_sales)
-    cur_f = sum(s[7] for s in current_sales)
-    cur_name = datetime.now().strftime('%B')
-    text += f"{cur_name:<10} {fmt(cur_r):>8} {fmt(cur_f):>8}\n"
-    total_r += cur_r; total_f += cur_f
+    total_r, total_f, n_oy = 0, 0, 0
+    for mo in range(1, datetime.now().month + 1):
+        key = f"{year}-{mo:02d}"
+        if key in HIST and key != this_month():
+            rev, profit = HIST[key]
+        else:
+            ss = get_sales(key)
+            rev = sum(s[6] for s in ss); profit = sum(s[7] for s in ss)
+        text += f"{_OY_NOMI[mo]:<10} {fmt(rev):>8} {fmt(profit):>8}\n"
+        total_r += rev; total_f += profit; n_oy += 1
     text += "─" * 28 + "\n"
     text += f"{'JAMI':<10} {fmt(total_r):>8} {fmt(total_f):>8}\n"
     text += "```\n"
-    text += f"\n📊 O'rtacha oylik: {fmt(total_r//9)} tushum | {fmt(total_f//9)} foyda"
+    n_oy = max(1, n_oy)
+    text += f"\n📊 O'rtacha oylik: {fmt(total_r/n_oy)} tushum | {fmt(total_f/n_oy)} foyda"
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_yolda(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4300,7 +4410,7 @@ async def cmd_zavod_qarz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += f"🏭 *{r[0]}*\n"
         text += f"  Jami zakaz: {fmt(r[1])}\n"
         text += f"  To'langan: {fmt(r[2])}\n"
-        text += f"  ──────────────\n"
+        text += "  ──────────────\n"
         text += f"  💸 Qolgan qarz: *{fmt(r[3])}*\n\n"
         total_remaining += r[3]
     text += f"💸 *JAMI ZAVOD QARZI: {fmt(total_remaining)}*"
@@ -4448,7 +4558,7 @@ async def cmd_kafolat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if r[3]: text += f" ({r[3]})"
         text += f"\n  📅 {r[4]} → {r[5]}"
         if days_left > 0: text += f" ({days_left} kun qoldi)"
-        else: text += f" (tugagan!)"
+        else: text += " (tugagan!)"
         text += "\n\n"
     if expiring:
         text += f"⚠️ {len(expiring)} ta kafolat yaqin tugaydi!"
@@ -4462,7 +4572,7 @@ async def cmd_cashflow(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text += f"💳 Yo'ldagi tovar to'lovi: −{fmt(cf['transit_to_pay'])}\n"
     text += f"💰 Qarz qaytishi: +{fmt(cf['debts_to_receive'])}\n"
     text += f"💸 Qarz to'lash: −{fmt(cf['debts_to_pay'])}\n"
-    text += f"──────────────────────\n"
+    text += "──────────────────────\n"
     net = cf['net_forecast']
     emoji = "✅" if net > 0 else "❌"
     text += f"{emoji} *Prognoz qoldi: {fmt(net)}*\n\n"
@@ -4488,7 +4598,7 @@ async def cmd_rate(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
     rate = get_exchange_rate()
     prods = get_products()
-    text = f"💱 *VALYUTA KURSI*\n\n"
+    text = "💱 *VALYUTA KURSI*\n\n"
     text += f"1 USD = *{rate:,.0f} so'm* (CBU)\n\n"
     text += "*Asosiy tovarlar UZS da:*\n"
     for p in prods[:5]:
@@ -4512,11 +4622,13 @@ async def cmd_maqsad(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if tgt:
         rpct = tR/tgt[3]*100 if tgt[3] else 0
         ppct = sof/tgt[4]*100 if tgt[4] else 0
-        r_bar = "█" * int(rpct/10) + "░" * (10-int(min(rpct,100)/10))
-        p_bar = "█" * int(ppct/10) + "░" * (10-int(min(ppct,100)/10))
+        rb = max(0, min(10, int(rpct/10))); pb = max(0, min(10, int(ppct/10)))
+        r_bar = "█" * rb + "░" * (10 - rb)
+        p_bar = "█" * pb + "░" * (10 - pb)
         text += f"💵 Tushum: {rpct:.0f}%\n`{r_bar}` {fmt(tR)}/{fmt(tgt[3])}\n\n"
         text += f"✅ Foyda: {ppct:.0f}%\n`{p_bar}` {fmt(sof)}/{fmt(tgt[4])}\n\n"
-        days = (datetime(now.year, now.month+1 if now.month<12 else 1, 1) - now).days
+        # dekabrda keyingi oy — KEYINGI yilning yanvari (avval shu yil yanvari olinib, kunlar manfiy chiqardi)
+        days = (datetime(now.year + (now.month == 12), now.month % 12 + 1, 1) - now).days
         need_daily = (tgt[3]-tR)/days if days>0 and tgt[3]>tR else 0
         text += f"⏰ {days} kun qoldi | Kuniga: *{fmt(need_daily)}* kerak"
     else:
@@ -4635,7 +4747,8 @@ async def cmd_katalog(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text += f"*{sname}:* {sval}\n"
         text += "\n"
     text += f"🏭 Zavod: {fmt(prod['factory'])} | 📦 Sebest: {fmt(prod['cost'])}\n"
-    text += f"💵 Narx: *{fmt(prod['price'])}* | ✅ Marja: {fmt(margin)} ({margin/prod['price']*100:.0f}%)\n"
+    pct = margin/prod['price']*100 if prod['price'] else 0
+    text += f"💵 Narx: *{fmt(prod['price'])}* | ✅ Marja: {fmt(margin)} ({pct:.0f}%)\n"
     text += f"📦 Astatka: {prod['qty']} ta"
     kb = [[InlineKeyboardButton("📸 Rasm qo'sh", callback_data=f"add_photo_{prod['id']}"),
            InlineKeyboardButton("✏️ Specs tahrirlash", callback_data=f"edit_specs_{prod['id']}")]]
@@ -4673,8 +4786,10 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── YANGI TOVAR QOSHISH (ConversationHandler) ─────────────────────
 async def conv_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return ConversationHandler.END
+    if u.callback_query:
+        await u.callback_query.answer()
     ctx.user_data.clear()
-    await u.message.reply_text(
+    await u.effective_message.reply_text(
         "➕ *Yangi tovar qo'shish*\n\nMahsulot nomini yozing:",
         parse_mode='Markdown')
     return S_NAME
@@ -4705,20 +4820,20 @@ async def conv_sup_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def conv_cost(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: ctx.user_data['factory'] = float(u.message.text.replace('$','').strip())
-    except: await u.message.reply_text("Raqam kiriting:"); return S_COST
+    except ValueError: await u.message.reply_text("Raqam kiriting:"); return S_COST
     await u.message.reply_text("Sotuv narxi ($):")
     return S_PRICE
 
 async def conv_price(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: ctx.user_data['price'] = float(u.message.text.replace('$','').strip())
-    except: await u.message.reply_text("Raqam kiriting:"); return S_PRICE
+    except ValueError: await u.message.reply_text("Raqam kiriting:"); return S_PRICE
     ctx.user_data['cost'] = ctx.user_data['factory']
     await u.message.reply_text("Boshlang'ich miqdor (dona):")
     return S_QTY
 
 async def conv_qty(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: ctx.user_data['qty'] = int(u.message.text.strip())
-    except: await u.message.reply_text("Raqam kiriting:"); return S_QTY
+    except ValueError: await u.message.reply_text("Raqam kiriting:"); return S_QTY
     await u.message.reply_text(
         "Texnik ma'lumotlar qo'shing:\n"
         "Har qatorga: `Xususiyat: Qiymat`\n"
@@ -4801,7 +4916,10 @@ async def conv_cancel(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── CALLBACK HANDLER ──────────────────────────────────────────────
 async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
-    data = q.data
+    # Faqat egasi: aks holda kanal/forward qilingan xabardagi tugma orqali begona odam
+    # hisobot ko'rishi, sotuvni bekor qilishi yoki tovarni "keldi" qilishi mumkin edi
+    if not is_owner(u): return
+    data = q.data or ''
     msg = q.message
 
     async def fake_cmd(cmd_fn):
@@ -4829,28 +4947,16 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == 'undo_list': await fake_cmd(cmd_undo_list)
     elif data == 'close': await msg.delete()
     elif data.startswith('undo_'):
-        op_id = int(data.split('_')[1])
-        conn = db(); c = conn.cursor()
-        c.execute('SELECT * FROM op_log WHERE id=? AND reversed=0', (op_id,))
-        op = c.fetchone()
-        if not op: await msg.reply_text("❌ Topilmadi yoki allaqachon qaytarilgan"); conn.close(); return
-        op_data = json.loads(op[4])
-        ok = False
-        if op[3] == 'sale':
-            ok = reverse_sale(op_data.get('sale_id', 0))
-        elif op[3] == 'expense':
-            conn2 = db(); c2 = conn2.cursor()
-            c2.execute('UPDATE expenses SET reversed=1 WHERE id=?', (op_data.get('id',0),))
-            ok = c2.rowcount > 0
-            conn2.commit(); conn2.close()
-            if ok: add_cash(op_data.get('amount',0), 'kirim', 'qaytarish', f"xarajat bekor (#x{op_data.get('id')})")
+        # Bitta umumiy funksiya (_undo_op) — AI agent bilan bir xil mantiq, ulanish ochiq qolib bazani qulflamaydi
+        try: op_id = int(data.split('_')[1])
+        except (ValueError, IndexError): return
+        ok, why = await asyncio.to_thread(_undo_op, op_id)
         if ok:
-            c.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,))
-            conn.commit()
             await msg.reply_text(f"✅ Operatsiya #{op_id} qaytarildi!")
+        elif why.startswith('Topilmadi'):
+            await msg.reply_text("❌ Topilmadi yoki allaqachon qaytarilgan")
         else:
             await msg.reply_text("❌ Qaytarib bo'lmadi!")
-        conn.close()
     elif data.startswith('add_photo_'):
         pid = int(data.split('_')[2])
         ctx.user_data['photo_product_id'] = pid
@@ -4861,7 +4967,8 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if result:
             await msg.reply_text(
                 f"✅ *Tovar keldi!*\n{result['product']}: {result['qty']} ta\n"
-                f"Haqiqiy sebest: {fmt(result['real_cost'])}/ta\nAstatka yangilandi!",
+                f"Haqiqiy sebest: {fmt(result['real_cost'])}/ta\n" +
+                ("Astatka yangilandi!" if result.get('found', True) else _ARRIVE_NOT_FOUND),
                 parse_mode='Markdown')
         else:
             await msg.reply_text("❌ Topilmadi yoki allaqachon kelgan!")
@@ -4869,6 +4976,8 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await xl_callback(u, ctx, data)
     elif data.startswith('cat_') or data.startswith('sup_') or data.startswith('photos_'):
         pass  # ConversationHandler handles these
+
+_ARRIVE_NOT_FOUND = "⚠️ Astatkada bu nomli mahsulot topilmadi — astatka o'zgarmadi."
 
 # ── TEXT MESSAGE HANDLER ──────────────────────────────────────────
 async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4910,7 +5019,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(reply)
         return
 
-    parsed = ai_parse(msg, prods)
+    parsed = await asyncio.to_thread(ai_parse, msg, prods)   # sinxron API chaqiruvi butun botni to'xtatmasin
     action = parsed.get('action', 'unknown')
     log.info(f"Action: {action} | {parsed}")
 
@@ -4983,7 +5092,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         etype = parsed.get('type', 'period')
         note = parsed.get('note', '')
         if amount > 0:
-            eid = add_expense(amount, cat, etype, note)
+            add_expense(amount, cat, etype, note)
             type_labels = {'cogs_bank':'🏦 Bank to\'lovi','cogs_delivery':'🚚 Dostavka','period':'📋 Davr xarajati'}
             await u.message.reply_text(
                 f"💸 *Xarajat qayd!*\n{type_labels.get(etype,etype)}\n"
@@ -5025,7 +5134,8 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if result:
                 await u.message.reply_text(
                     f"✅ *Tovar keldi!*\n\n📦 {result['product']}: {result['qty']} ta\n"
-                    f"📊 Sebest: {fmt(result['real_cost'])}/ta\n✅ Astatka yangilandi!",
+                    f"📊 Sebest: {fmt(result['real_cost'])}/ta\n" +
+                    ("✅ Astatka yangilandi!" if result.get('found', True) else _ARRIVE_NOT_FOUND),
                     parse_mode='Markdown')
             else:
                 await u.message.reply_text("❌ Topilmadi!")
@@ -5176,8 +5286,11 @@ async def handle_photo_done(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if pid:
         count = len(get_product_photos(pid))
         await u.message.reply_text(f"✅ Jami {count} ta rasm saqlandi!")
-    else:
+    elif 'name' in ctx.user_data:
         await conv_finish(u, ctx)
+    else:
+        # avval: user_data['name'] yo'qligi sababli KeyError → "Xato yuz berdi"
+        await u.message.reply_text("ℹ️ Hozir tugatiladigan jarayon yo'q.")
 
 
 
@@ -5232,12 +5345,12 @@ async def cmd_kassa(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m_kirim  = sum(r[4] for r in month_hist if r[3]=='kirim')
     m_chiqim = sum(r[4] for r in month_hist if r[3]=='chiqim')
 
-    text = f"💵 *KASSA HOLATI*\n\n"
+    text = "💵 *KASSA HOLATI*\n\n"
     text += f"💰 *Joriy qoldiq: {fmt(balance)}*\n\n"
-    text += f"*Bugun:*\n"
+    text += "*Bugun:*\n"
     text += f"  📥 Kirim: {fmt(t_kirim)}\n"
     text += f"  📤 Chiqim: {fmt(t_chiqim)}\n\n"
-    text += f"*Bu oy:*\n"
+    text += "*Bu oy:*\n"
     text += f"  📥 Kirim: {fmt(m_kirim)}\n"
     text += f"  📤 Chiqim: {fmt(m_chiqim)}\n\n"
 
@@ -5249,7 +5362,7 @@ async def cmd_kassa(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             e = "📥" if r[3]=='kirim' else "📤"
             text += f"{e} {r[5]}: *{fmt(r[4])}* ({r[7]})\n"
 
-    text += f"\n_Yozish: 'Naqd $260 kassa kirim' yoki 'Payme $150 chiqim'_"
+    text += "\n_Yozish: 'Naqd $260 kassa kirim' yoki 'Payme $150 chiqim'_"
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_nelikvid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5268,7 +5381,7 @@ async def cmd_nelikvid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += f"  Oxirgi sotuv: {item['last_sale']}\n\n"
         total_cost += item['qty'] * item['cost']
     text += f"💸 Jami muzlatilgan kapital: *{fmt(total_cost)}*\n"
-    text += f"💡 *Tavsiya:* Chegirma yoki qaytarish ko'ring"
+    text += "💡 *Tavsiya:* Chegirma yoki qaytarish ko'ring"
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_eslatmalar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5285,7 +5398,8 @@ async def cmd_eslatmalar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += "🔧 *Kafolat tugayapti:*\n"
         for w in warr:
             days = (datetime.strptime(w[5],'%Y-%m-%d') - datetime.now()).days
-            text += f"  • {w[2]} ({w[3] or 'noma\'lum'}) — {days} kun\n"
+            kim = w[3] or "noma'lum"   # f-string ichida \' Python 3.11 da SyntaxError
+            text += f"  • {w[2]} ({kim}) — {days} kun\n"
         text += "\n"
         has_alert = True
 
@@ -5926,9 +6040,9 @@ async def _deploy_bot_code(msg, data, source):
     new_sha = _git_blob_sha(data)
     branch = await asyncio.to_thread(_gh_default_branch)
     try:
-        st, cur = await asyncio.to_thread(_gh_file_sha, BOT_FILENAME, branch)
+        cur = (await asyncio.to_thread(_gh_file_sha, BOT_FILENAME, branch))[1]
     except Exception:
-        st, cur = 0, None
+        cur = None
     if cur and cur == new_sha:
         await msg.reply_text(f"ℹ️ Bu fayl GitHub'dagi {BOT_FILENAME} bilan bir xil — yangilash shart emas."); return False
     await msg.reply_text(f"✅ Kod tekshirildi: {len(data) // 1024} KB, xatosiz.\n⏳ Avval baza zaxiralanmoqda...")
@@ -6467,7 +6581,7 @@ def _xl_apply_one(c, pl):
     for s in pl['shaxsiy']:
         _xl_cash(c, d, 'chiqim', s['amount'], 'shaxsiy', f"{s['note'] or 'shaxsiy'} (Excel)")
     if pl['adj']:
-        _xl_cash(c, d, 'kirim', pl['adj'], 'tuzatish', f"Excel'dagi oy oxiri qoldig'iga tenglashtirish")
+        _xl_cash(c, d, 'kirim', pl['adj'], 'tuzatish', "Excel'dagi oy oxiri qoldig'iga tenglashtirish")
     summ = {'sales': len(pl['sales']), 'revenue': pl['sales_sum'], 'noaniq': pl['noaniq_sum'],
             'exps': sum(e['amount'] for e in pl['exps']), 'zavod': sum(z['amount'] for z in pl['zavod']),
             'shaxsiy': sum(s['amount'] for s in pl['shaxsiy']), 'adj': pl['adj']}
@@ -6545,7 +6659,7 @@ def xl_preview_text(plans):
             if dbt['delta'] > 0.004 and dbt['open'] > 0:
                 L.append(f"   {dbt['sup'] if dbt['sup'] != '?' else 'Zavod'} qarzi: {fmt(dbt['open'])} → {fmt(dbt['after'])}")
             elif dbt['delta'] > 0.004:
-                L.append(f"   (ochiq qarz yo'q — oldindan to'lov sifatida kassadan chiqim)")
+                L.append("   (ochiq qarz yo'q — oldindan to'lov sifatida kassadan chiqim)")
             elif dbt['delta'] < -0.004:
                 L.append(f"   ⚠️ {dbt['sup']}: avvalgi importdan {fmt(-dbt['delta'])} kam — zavod qarzini tekshiring")
         if p['shaxsiy']:
@@ -6654,6 +6768,15 @@ async def post_to_channel(ctx: ContextTypes.DEFAULT_TYPE, text: str):
             text=text,
             parse_mode='Markdown')
         return True
+    except BadRequest as e:
+        # Mahsulot nomidagi _ yoki * Markdown'ni buzsa — post yo'qolmasin, oddiy matn bilan yuboramiz
+        log.warning(f"Kanal post Markdown xato, oddiy matn: {e}")
+        try:
+            await ctx.bot.send_message(chat_id=ch, text=text.replace('*', '').replace('`', ''))
+            return True
+        except Exception as e2:
+            log.error(f"Kanal post xato: {e2}")
+            return False
     except Exception as e:
         log.error(f"Kanal post xato: {e}")
         return False
@@ -6674,7 +6797,7 @@ async def cmd_post_kanal(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fs = [p for p in prods if p['sup'] == 'Freesub' and p['qty'] > 0]
 
     text = "🏭 *ThermoCrafts — Mavjud mahsulotlar*\n"
-    text += f"📍 Yunusobod, Toshkent\n\n"
+    text += "📍 Yunusobod, Toshkent\n\n"
 
     if tt:
         text += "🔵 *Lazer va CNC stanoklar:*\n"
@@ -6747,6 +6870,12 @@ async def cmd_post_taklif(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stock_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Astatka ma'lumotlarini Excel dan yangilash"""
     if not is_owner(u): return
+    if not ctx.args or ctx.args[0].lower() != 'ha':
+        await u.message.reply_text(
+            "⚠️ Bu buyruq 21 ta mahsulotning soni/sebest/narxini 01.09.2026 holatiga QAYTA YOZADI "
+            "(sentyabrdan keyingi sotuv va kelgan tovarlar astatkadan yo'qoladi).\n\n"
+            "Rostdan ham kerak bo'lsa: /stock_reset ha")
+        return
     conn = db(); c = conn.cursor()
     # Haqiqiy Sept 2026 ma'lumoti
     updates = [
@@ -6801,12 +6930,22 @@ async def conv_escape_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_error(u: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Xato:", exc_info=ctx.error)
     try:
-        if isinstance(u, Update) and u.effective_message:
+        # Xato matni (ichki tafsilotlar) faqat egasiga ko'rsatiladi — mijozga/kanalga emas.
+        # Markdown'siz: xato matnidagi ` yoki _ yangi xatoga sabab bo'lmasin.
+        if (isinstance(u, Update) and u.effective_message and u.effective_user
+                and u.effective_user.id == OWNER_ID):
             await u.effective_message.reply_text(
-                f"\u26a0\ufe0f Xato yuz berdi:\n`{str(ctx.error)[:250]}`",
-                parse_mode='Markdown')
+                f"\u26a0\ufe0f Xato yuz berdi:\n{str(ctx.error)[:250]}")
     except Exception:
         pass
+
+
+async def _faqat_yangi_xabar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tahrirlangan xabarlar va kanal postlari hech qaysi handlerga bormaydi.
+    Aks holda: tahrirlangan "/restore ha" yoki sotuv qayta bajarilardi, u.message None bo'lib
+    xato chiqardi, kanal postlariga esa bot xato matni bilan javob yozardi."""
+    if u.edited_message or u.channel_post or u.edited_channel_post:
+        raise ApplicationHandlerStop
 
 
 # ── MARKDOWN XATOSIDAN HIMOYA ────────────────────────────────────
@@ -6847,22 +6986,29 @@ def main():
            .post_init(_post_init).post_shutdown(_post_shutdown).build())
 
     OWNER = filters.User(user_id=OWNER_ID)
+    # Tahrirlangan xabar / kanal postlarini eng oldin to'xtatamiz (group=-1)
+    app.add_handler(TypeHandler(Update, _faqat_yangi_xabar), group=-1)
+    # Suhbat ichida menyu tugmasi bosilsa — u nom/narx sifatida yozilmasin, fallback'ga o'tsin
+    MENU_F = filters.Text(list(MENU_MAP.keys()))
+    CONV_TEXT = filters.TEXT & ~filters.COMMAND & ~MENU_F
 
     # Yangi tovar qo'shish (ConversationHandler)
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler('yangi_tovar', conv_start, filters=filters.User(user_id=OWNER_ID)),
             CallbackQueryHandler(conv_start, pattern='^new_product$'),
+            # "➕ Yangi tovar" menyu tugmasi: avval suhbatdan tashqarida ochilib, nom yozilganda AI'ga ketardi
+            MessageHandler(filters.Text(["➕ Yangi tovar"]) & OWNER, conv_start),
         ],
         states={
-            S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_name)],
+            S_NAME: [MessageHandler(CONV_TEXT, conv_name)],
             S_CAT: [CallbackQueryHandler(conv_cat_cb, pattern='^cat_')],
             S_SUP: [CallbackQueryHandler(conv_sup_cb, pattern='^sup_')],
-            S_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_cost)],
-            S_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_price)],
-            S_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_qty)],
+            S_COST: [MessageHandler(CONV_TEXT, conv_cost)],
+            S_PRICE: [MessageHandler(CONV_TEXT, conv_price)],
+            S_QTY: [MessageHandler(CONV_TEXT, conv_qty)],
             S_SPECS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_specs),
+                MessageHandler(CONV_TEXT, conv_specs),
                 CommandHandler('tayyor', conv_specs_done),
             ],
             S_PHOTOS: [
@@ -6874,9 +7020,11 @@ def main():
         fallbacks=[
             CommandHandler('bekor', conv_cancel),
             CommandHandler('start', conv_escape_start),
-            MessageHandler(filters.Text(list(MENU_MAP.keys())), conv_escape_menu),
+            MessageHandler(MENU_F, conv_escape_menu),
         ],
         allow_reentry=True,
+        # 15 daqiqa javob bo'lmasa suhbat yopiladi (JobQueue o'rnatilgan bo'lsa)
+        conversation_timeout=(900 if app.job_queue else None),
     )
 
     app.add_handler(conv_handler)
