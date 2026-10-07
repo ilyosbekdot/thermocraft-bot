@@ -4,8 +4,20 @@ ThermoCrafts Biznes Bot v3.0
 21 Modul | IAS 2 | ABC/XYZ CV | Katalog | Kafolat | Marketing
 """
 import os, json, sqlite3, logging, math, re, requests, base64, asyncio, time
+import threading, hashlib, tempfile, secrets, zipfile, io, difflib, calendar
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
+
+# ── Vaqt zonasi: Railway serveri UTC da ishlaydi. Sana/vaqt Toshkent bo'yicha bo'lsin,
+#    aks holda 00:00–05:00 oralig'idagi sotuv oldingi kunga (va oy boshida — oldingi oyga) yoziladi.
+try:
+    _TZH = int(os.getenv('TZ_OFFSET', '5'))
+    os.environ['TZ'] = f"<{'+' if _TZH >= 0 else '-'}{abs(_TZH):02d}>{-_TZH}"
+    if hasattr(time, 'tzset'):
+        time.tzset()
+except Exception:
+    pass
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                        InputMediaPhoto, ReplyKeyboardMarkup, KeyboardButton)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
@@ -25,7 +37,17 @@ CHANNEL_ID    = os.getenv('CHANNEL_ID', '')   # @ThermoCrafts
 
 def get_channel_id():
     return os.getenv('CHANNEL_ID', '')
-DB_PATH       = os.getenv('DB_PATH', 'thermocraft.db')
+# Baza joyi: Railway'da Volume ulangan bo'lsa (RAILWAY_VOLUME_MOUNT_PATH avtomatik beriladi) —
+# baza o'sha doimiy diskda turadi va qayta deploy/restartda yo'qolmaydi. Aks holda — eski joy.
+VOLUME_PATH   = os.getenv('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
+_DBP_ENV      = os.getenv('DB_PATH', '').strip()
+if VOLUME_PATH and (not _DBP_ENV or not os.path.isabs(_DBP_ENV)):
+    DB_PATH = os.path.join(VOLUME_PATH, os.path.basename(_DBP_ENV) if _DBP_ENV else 'thermocraft.db')
+else:
+    DB_PATH = _DBP_ENV or 'thermocraft.db'
+
+def db_on_volume():
+    return bool(VOLUME_PATH) and os.path.abspath(DB_PATH).startswith(os.path.abspath(VOLUME_PATH) + os.sep)
 ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # Conversation states
@@ -394,16 +416,83 @@ def get_products(active_only=True):
     return [{'id':r[0],'name':r[1],'cat':r[2],'sup':r[3],'qty':r[4],
              'cost':r[5],'price':r[6],'factory':r[7],'warranty':r[8]} for r in rows]
 
-def find_product(q):
-    prods = get_products(); ql = q.lower().strip()
+def _nrm(s):
+    """Nomni solishtirish uchun: kichik harf, '*'/'×' → 'x', faqat harf va raqam"""
+    s = str(s or '').lower().replace('*', 'x').replace('×', 'x')
+    return re.sub(r'[^a-z0-9]', '', s)
+
+def _cand(p):
+    return {"name": p['name'], "qty": p['qty'], "price": p['price']}
+
+def match_product(q, prefer_stock=False, prods=None):
+    """Mahsulotni topadi. Qaytaradi: (mahsulot | None, variantlar).
+    Bir nechta mos kelsa — taxmin qilmaydi, variantlar ro'yxatini qaytaradi.
+    prefer_stock=True (sotuvda): bir nechtasidan faqat bittasida tovar bo'lsa — o'shani oladi."""
+    prods = prods if prods is not None else get_products()
+    ql = str(q or '').lower().strip()
+    if not ql: return None, []
     for p in prods:
-        if p['name'].lower() == ql: return p
+        if p['name'].lower() == ql: return p, []
+    nq = _nrm(q)
+    def pick(lst):
+        if len(lst) == 1: return lst[0], []
+        if prefer_stock:
+            bor = [p for p in lst if p['qty'] > 0]
+            if len(bor) == 1: return bor[0], []
+        return None, [_cand(p) for p in lst[:8]]
+    if nq:
+        ex = [p for p in prods if _nrm(p['name']) == nq]
+        if ex: return pick(ex)
+        sub = [p for p in prods if nq in _nrm(p['name']) or (len(_nrm(p['name'])) >= 3 and _nrm(p['name']) in nq)]
+        if sub: return pick(sub)
+    words = [w for w in re.split(r'[\s\-_/+,()]+', ql) if len(w) > 2]
+    if words:
+        sc = []
+        for p in prods:
+            pl, pn = p['name'].lower(), _nrm(p['name'])
+            k = sum(1 for w in words if w in pl or (_nrm(w) and _nrm(w) in pn))
+            if k: sc.append((k, p))
+        if sc:
+            best = max(k for k, _ in sc)
+            return pick([p for k, p in sc if k == best])
+    return None, []
+
+def find_product(q):
+    p, _ = match_product(q)
+    if p: return p
+    # Eski (yumshoq) qidiruv — hisobot/raqobat kabi o'qish amallari uchun
+    prods = get_products(); ql = (q or '').lower().strip()
+    if not ql: return None
     for p in prods:
         if ql in p['name'].lower() or p['name'].lower() in ql: return p
     words = [w for w in ql.split() if len(w) > 2]
     for p in prods:
         if any(w in p['name'].lower() for w in words): return p
     return None
+
+def _to_usd(usd=None, uzs=None, rate=None):
+    """Summani dollarga: so'm berilsa yoki 'dollar' 5000 dan katta bo'lsa — kurs bo'yicha o'giradi"""
+    try: usd = float(usd or 0)
+    except (TypeError, ValueError): usd = 0.0
+    try: uzs = float(uzs or 0)
+    except (TypeError, ValueError): uzs = 0.0
+    if uzs > 0 or usd >= 5000:
+        rate = rate or get_exchange_rate()
+        return round((uzs or usd) / rate, 2)
+    return usd
+
+def _taqsimla(total, weights):
+    """total ($) ni og'irliklar bo'yicha SENTGACHA aniq taqsimlaydi (yig'indi = total)"""
+    cents = int(round(float(total) * 100))
+    w = [max(0.0, float(x)) for x in weights]
+    if sum(w) <= 0: w = [1.0] * len(w)
+    W = sum(w)
+    raw = [cents * x / W for x in w]
+    base = [int(math.floor(x)) for x in raw]
+    rem = cents - sum(base)
+    for i in sorted(range(len(raw)), key=lambda i: -(raw[i] - base[i]))[:max(0, rem)]:
+        base[i] += 1
+    return [b / 100 for b in base]
 
 def get_product_specs(product_id):
     conn = db(); c = conn.cursor()
@@ -450,25 +539,37 @@ def add_photo(product_id, file_id):
     conn.commit(); conn.close()
 
 def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C', cash=True, method='naqd'):
+    """Sotuv BITTA tranzaksiyada: astatka kamayadi + sotuv yoziladi + kassaga kirim + kafolat.
+    Astatka yetmasa hech narsa yozilmaydi (avval sotuv yozilib, astatka/kassa o'zgarmay qolardi)."""
     profit = (price - cost) * qty
     now = datetime.now()
+    d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
     conn = db(); c = conn.cursor()
-    c.execute('INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) VALUES (?,?,?,?,?,?,?,?,?,?)',
-              (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'),
-               pname, qty, cost, price*qty, profit, discount, customer, ctype))
-    sale_id = c.lastrowid
-    c.execute('UPDATE products SET qty=qty-? WHERE id=? AND qty>=?', (qty, pid, qty))
-    ok = c.rowcount > 0
-    if ok:
+    try:
+        c.execute('UPDATE products SET qty=qty-? WHERE id=? AND qty>=?', (qty, pid, qty))
+        if c.rowcount == 0:
+            conn.rollback(); conn.close()
+            return False, None
+        c.execute('INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                  (d, t, pname, qty, cost, price*qty, profit, discount, customer, ctype))
+        sale_id = c.lastrowid
         # Kafolat
-        p = get_products()
-        prod = next((x for x in p if x['id']==pid), None)
-        if prod and prod['warranty'] > 0:
-            start = now.strftime('%Y-%m-%d')
-            end = (now + timedelta(days=prod['warranty'])).strftime('%Y-%m-%d')
+        c.execute('SELECT COALESCE(warranty_days,0) FROM products WHERE id=?', (pid,))
+        w = c.fetchone(); wdays = (w[0] or 0) if w else 0
+        if wdays > 0:
+            end = (now + timedelta(days=wdays)).strftime('%Y-%m-%d')
             c.execute('INSERT INTO warranties (sale_id,product,customer,start_date,end_date) VALUES (?,?,?,?,?)',
-                      (sale_id, pname, customer, start, end))
-    conn.commit(); conn.close()
+                      (sale_id, pname, customer, d, end))
+        # Kassa — shu tranzaksiya ichida (sotuv bor-u kassa yo'q holati bo'lmasin)
+        if cash:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d, t, 'kirim', price*qty, 'sotuv', f'{pname} x{qty} (#{sale_id})', method or 'naqd'))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    ok = True
     # Mijozga bog'lash (aniq moslik bo'yicha, yo'q bo'lsa yaratadi)
     if ok and customer:
         try:
@@ -483,7 +584,6 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
             log.warning(f'mijozga boglash: {e}')
     if ok:
         log_op('sale', {'sale_id':sale_id,'product':pname,'qty':qty,'price':price,'profit':profit})
-        if cash: add_cash(price*qty, 'kirim', 'sotuv', f'{pname} x{qty} (#{sale_id})', method)
     return ok, sale_id
 
 def reverse_sale(sale_id):
@@ -938,16 +1038,38 @@ AI_TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Ixtiyoriy: nom yoki kategoriya bo'yicha filtr"}}}},
     {"name": "record_sale",
-     "description": "Sotuvni qayd qiladi: astatkani kamaytiradi, kassaga naqd kirim yozadi, foyda hisoblaydi.",
+     "description": "BITTA mahsulot sotuvini qayd qiladi: astatkani kamaytiradi, kassaga kirim yozadi, foyda hisoblaydi. "
+                    "Mijoz ismi va to'lov usuli ixtiyoriy (aytilmasa: naqd, mijozsiz). Bir nechta mahsulot birga sotilsa — record_sale_multi.",
      "input_schema": {"type": "object", "required": ["product", "qty"], "properties": {
          "product": {"type": "string", "description": "Mahsulot nomi (astatkadagi kabi)"},
          "qty": {"type": "integer"},
-         "price_usd": {"type": "number", "description": "Dona narxi dollarda. 0 bo'lsa ro'yxat narxi olinadi"},
+         "price_usd": {"type": "number", "description": "DONA narxi dollarda. 0 bo'lsa ro'yxat narxi olinadi"},
          "price_uzs": {"type": "number", "description": "Agar so'mda aytilgan bo'lsa — dona narxi so'mda"},
+         "total_usd": {"type": "number", "description": "Hamma dona uchun UMUMIY summa dollarda (masalan '2 ta 940$ ga' → qty=2, total_usd=940)"},
+         "total_uzs": {"type": "number", "description": "Umumiy summa so'mda"},
          "discount_pct": {"type": "number", "default": 0},
          "customer": {"type": "string", "default": ""},
          "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "default": "B2C"},
-         "on_credit": {"type": "boolean", "default": False, "description": "Nasiya bo'lsa true — kassaga tushmaydi, debitor yoziladi"},
+         "on_credit": {"type": "boolean", "default": False, "description": "Nasiya bo'lsa true — kassaga tushmaydi, debitor yoziladi (mijoz ismi shart)"},
+         "payment_method": {"type": "string", "enum": ["naqd", "karta", "payme", "click", "otkazma"], "default": "naqd"}}}},
+    {"name": "record_sale_multi",
+     "description": "Bir nechta mahsulot BIRGA sotilganda (komplekt), masalan 'TTS 20 Pro + honeycomb + pump 470$ ga'. "
+                    "Har mahsulot astatkadan kamayadi, kassaga jami summa kirim bo'ladi. Umumiy summa (total_usd) berilsa — "
+                    "narxi alohida aytilmagan mahsulotlarga ro'yxat narxi ulushiga qarab taqsimlanadi. "
+                    "Biror mahsulot aniqlanmasa yoki yetmasa — hech narsa yozilmaydi.",
+     "input_schema": {"type": "object", "required": ["items"], "properties": {
+         "items": {"type": "array", "description": "Sotilgan mahsulotlar",
+                   "items": {"type": "object", "required": ["product"], "properties": {
+                       "product": {"type": "string", "description": "Mahsulot nomi (astatkadagi kabi)"},
+                       "qty": {"type": "integer", "default": 1},
+                       "price_usd": {"type": "number", "description": "Faqat shu mahsulotga alohida narx aytilgan bo'lsa — dona narxi"},
+                       "price_uzs": {"type": "number"}}}},
+         "total_usd": {"type": "number", "description": "Hammasi uchun umumiy summa dollarda"},
+         "total_uzs": {"type": "number", "description": "Umumiy summa so'mda"},
+         "discount_pct": {"type": "number", "default": 0},
+         "customer": {"type": "string", "default": ""},
+         "customer_type": {"type": "string", "enum": ["B2C", "B2B"], "default": "B2C"},
+         "on_credit": {"type": "boolean", "default": False},
          "payment_method": {"type": "string", "enum": ["naqd", "karta", "payme", "click", "otkazma"], "default": "naqd"}}}},
     {"name": "add_stock",
      "description": "Tovar keldi — astatkaga qo'shadi.",
@@ -1132,7 +1254,7 @@ AI_TOOLS = [
 # ── Asboblarni bajarish ──────────────────────────────────────────
 async def execute_tool(name, inp, ctx=None):
     # ── Yopilgan davrga yozishni taqiqlash ──
-    YOZUV = {"record_sale", "record_expense", "record_cash", "add_debt",
+    YOZUV = {"record_sale", "record_sale_multi", "record_expense", "record_cash", "add_debt",
              "pay_factory_debt", "undo_operation", "add_stock"}
     if name in YOZUV:
         _s = inp.get("date") or today()
@@ -1150,42 +1272,123 @@ async def execute_tool(name, inp, ctx=None):
                         "qty": p['qty'], "cost": p['cost'], "price": p['price']} for p in ps])
 
         if name == "record_sale":
-            prod = find_product(inp.get("product", ""))
-            if not prod: return _j({"error": f"Mahsulot topilmadi: {inp.get('product')}"})
-            qty = max(1, int(inp.get("qty", 1)))
+            prod, cands = match_product(inp.get("product", ""), prefer_stock=True)
+            if not prod:
+                if cands:
+                    return _j({"error": f"'{inp.get('product')}' aniq emas — qaysi biri? Egasidan qisqa so'rang.",
+                               "variantlar": cands})
+                return _j({"error": f"Mahsulot topilmadi: {inp.get('product')}. get_stock bilan nomini tekshiring."})
+            qty = max(1, int(inp.get("qty") or 1))
             if prod['qty'] < qty:
-                return _j({"error": f"Yetarli emas: {prod['name']} faqat {prod['qty']} ta"})
-            price = float(inp.get("price_usd") or 0)
-            uzs = float(inp.get("price_uzs") or 0)
+                return _j({"error": f"Astatkada yetarli emas: {prod['name']} — {prod['qty']} ta bor, {qty} ta sotildi deyilyapti. "
+                                    f"Tovar kelgan bo'lsa avval add_stock qiling."})
             rate = get_exchange_rate()
-            if uzs > 0: price = round(uzs / rate, 2)
+            price = _to_usd(inp.get("price_usd"), inp.get("price_uzs"), rate)
+            total_in = _to_usd(inp.get("total_usd"), inp.get("total_uzs"), rate)
+            if price <= 0 and total_in > 0: price = round(total_in / qty, 4)
             if price <= 0: price = prod['price']
-            if price >= 5000: price = round(price / rate, 2)   # so'mni dollar deb yozmasin
             disc = float(inp.get("discount_pct") or 0)
             if disc > 0: price = round(price * (1 - disc / 100), 2)
-            cust = inp.get("customer") or ""
+            cust = (inp.get("customer") or "").strip()
             ctype = inp.get("customer_type") or "B2C"
-            on_credit = bool(inp.get("on_credit")) and bool(cust)
+            on_credit = bool(inp.get("on_credit"))
+            if on_credit and not cust:
+                return _j({"error": "Nasiya uchun mijoz ismi kerak — egasidan so'rang."})
             ok, sale_id = save_sale(prod['id'], prod['name'], qty, price, prod['cost'], disc, cust, ctype,
                                     cash=not on_credit, method=inp.get("payment_method") or "naqd")
-            if not ok: return _j({"error": "Saqlanmadi"})
-            total = price * qty
-            profit = (price - prod['cost']) * qty
+            if not ok: return _j({"error": f"Saqlanmadi — astatka yetmadi ({prod['name']})"})
+            total = round(price * qty, 2)
+            profit = round((price - prod['cost']) * qty, 2)
             if on_credit:
                 add_debt(cust, total, "berildi", f"nasiya: {prod['name']} x{qty}")
                 cash_note = "nasiya — kassaga tushmadi, debitor yozildi"
             else:
                 cash_note = "kassaga kirim yozildi"
+            after = next((p for p in get_products() if p['id'] == prod['id']), None)
             return _j({"ok": True, "sale_id": sale_id, "product": prod['name'], "qty": qty,
-                       "unit_price": price, "total": total, "profit": profit,
-                       "remaining_qty": prod['qty'] - qty, "cash": cash_note,
+                       "unit_price": round(price, 2), "total": total, "profit": profit,
+                       "astatkada_qoldi": after['qty'] if after else prod['qty'] - qty,
+                       "kassa_qoldigi": round(get_cash_balance(), 2), "cash": cash_note,
                        "uzs_total": round(total * rate)})
 
+        if name == "record_sale_multi":
+            items = inp.get("items") or []
+            if not items: return _j({"error": "items bo'sh"})
+            rate = get_exchange_rate()
+            prods_now = get_products()
+            rows, xato = [], []
+            for it in items:
+                p, cands = match_product((it or {}).get("product", ""), prefer_stock=True, prods=prods_now)
+                if not p:
+                    xato.append({"product": (it or {}).get("product"),
+                                 **({"variantlar": cands} if cands else {"error": "topilmadi"})})
+                    continue
+                q = max(1, int((it or {}).get("qty") or 1))
+                rows.append({"p": p, "qty": q,
+                             "unit": _to_usd((it or {}).get("price_usd"), (it or {}).get("price_uzs"), rate)})
+            if xato:
+                return _j({"error": "Ba'zi mahsulotlar aniq emas — HECH NARSA yozilmadi. Egasidan aniqlang.",
+                           "tafsil": xato})
+            kerak = defaultdict(int)
+            for r in rows: kerak[r["p"]["id"]] += r["qty"]
+            yetmaydi = sorted({f"{r['p']['name']}: {r['p']['qty']} ta bor, {kerak[r['p']['id']]} ta kerak"
+                               for r in rows if r["p"]["qty"] < kerak[r["p"]["id"]]})
+            if yetmaydi:
+                return _j({"error": "Astatkada yetarli emas — hech narsa yozilmadi", "tafsil": yetmaydi})
+            total_in = _to_usd(inp.get("total_usd"), inp.get("total_uzs"), rate)
+            fixed = [r for r in rows if r["unit"] > 0]
+            free = [r for r in rows if r["unit"] <= 0]
+            for r in fixed: r["sum"] = round(r["unit"] * r["qty"], 2)
+            if total_in > 0:
+                fixed_sum = sum(r["sum"] for r in fixed)
+                if free:
+                    rest = round(total_in - fixed_sum, 2)
+                    if rest < 0:
+                        return _j({"error": f"Umumiy summa ${total_in:,.2f} alohida aytilgan narxlardan (${fixed_sum:,.2f}) kichik"})
+                    parts = _taqsimla(rest, [r["p"]["price"] * r["qty"] for r in free])
+                    for r, s in zip(free, parts): r["sum"] = s
+                elif abs(fixed_sum - total_in) > 0.01:
+                    parts = _taqsimla(total_in, [r["sum"] for r in fixed])
+                    for r, s in zip(fixed, parts): r["sum"] = s
+            else:
+                for r in free: r["sum"] = round(r["p"]["price"] * r["qty"], 2)
+            disc = float(inp.get("discount_pct") or 0)
+            cust = (inp.get("customer") or "").strip()
+            ctype = inp.get("customer_type") or "B2C"
+            on_credit = bool(inp.get("on_credit"))
+            if on_credit and not cust:
+                return _j({"error": "Nasiya uchun mijoz ismi kerak — egasidan so'rang."})
+            method = inp.get("payment_method") or "naqd"
+            done = []
+            for r in rows:
+                s = r["sum"] * (1 - disc / 100) if disc > 0 else r["sum"]
+                unit = s / r["qty"]
+                ok, sid = save_sale(r["p"]["id"], r["p"]["name"], r["qty"], unit, r["p"]["cost"], disc,
+                                    cust, ctype, cash=not on_credit, method=method)
+                if not ok:
+                    return _j({"error": f"{r['p']['name']} saqlanmadi (astatka yetmadi). Yozilganlari: {done}"})
+                done.append({"sale_id": sid, "product": r["p"]["name"], "qty": r["qty"],
+                             "summa": round(s, 2), "foyda": round(s - r["p"]["cost"] * r["qty"], 2)})
+            jami = round(sum(d["summa"] for d in done), 2)
+            if on_credit:
+                add_debt(cust, jami, "berildi", "nasiya: " + ", ".join(f"{d['product']} x{d['qty']}" for d in done))
+            after = {p['id']: p['qty'] for p in get_products()}
+            for d, r in zip(done, rows): d["astatkada_qoldi"] = after.get(r["p"]["id"])
+            return _j({"ok": True, "sotuvlar": done, "jami": jami,
+                       "jami_foyda": round(sum(d["foyda"] for d in done), 2),
+                       "taqsimlash": "umumiy summa ro'yxat narxi ulushiga qarab bo'lindi" if (total_in > 0 and free) else "",
+                       "kassa_qoldigi": round(get_cash_balance(), 2),
+                       "cash": "nasiya — kassaga tushmadi, debitor yozildi" if on_credit else "kassaga kirim yozildi",
+                       "uzs_total": round(jami * rate)})
+
         if name == "add_stock":
-            prod = find_product(inp.get("product", ""))
-            if not prod: return _j({"error": "Mahsulot topilmadi"})
+            prod, cands = match_product(inp.get("product", ""))
+            if not prod:
+                if cands: return _j({"error": f"'{inp.get('product')}' aniq emas — qaysi biri?", "variantlar": cands})
+                return _j({"error": "Mahsulot topilmadi"})
             add_qty(prod['id'], int(inp.get("qty", 1)))
-            return _j({"ok": True, "product": prod['name'], "new_qty": prod['qty'] + int(inp.get("qty", 1))})
+            after = next((p for p in get_products() if p['id'] == prod['id']), None)
+            return _j({"ok": True, "product": prod['name'], "new_qty": after['qty'] if after else prod['qty'] + int(inp.get("qty", 1))})
 
         if name == "record_expense":
             amt = float(inp.get("amount_usd", 0))
@@ -1319,7 +1522,7 @@ async def execute_tool(name, inp, ctx=None):
 
         if name == "close_period":
             per = (inp.get("period") or "").strip()
-            if not re.match(r"^\\d{4}-\\d{2}$", per):
+            if not re.match(r"^\d{4}-\d{2}$", per):
                 return _j({"error": "Format: YYYY-MM"})
             if inp.get("reopen"):
                 return _j({"ok": open_period(per), "period": per, "holat": "ochildi"})
@@ -1621,6 +1824,9 @@ def init_ai_tables():
     c.execute('''CREATE TABLE IF NOT EXISTS ai_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT,
         category TEXT DEFAULT 'umumiy', created TEXT, active INTEGER DEFAULT 1)''')
+    # Suhbat tarixi cheksiz o'smasin (har zaxirada butun baza yuklanadi); oxirgi 400 ta xabar yetarli
+    c.execute('''DELETE FROM ai_messages WHERE id NOT IN
+                 (SELECT id FROM ai_messages ORDER BY id DESC LIMIT 400)''')
     conn.commit(); conn.close()
 
 def mem_add(fact, category='umumiy'):
@@ -1716,6 +1922,13 @@ XOTIRA QOIDALARI:
 ISH QOIDALARI:
 1. Pul birligi — dollar. So'mda aytilsa (mln, so'm, 5000+ raqam) — price_uzs/amount ga so'mni bering, asbob o'giradi. Javobda ikkala valyutani ko'rsating.
 2. Sotuv/xarajat/qarz YOZUV amallari: ma'lumot yetarli bo'lsa darhol bajaring, keyin 1-2 qatorda tasdiqlang. Faqat mahsulot yoki summa aniq bo'lmasa so'rang.
+   SOTUV ("sotuv", "sotdim", "ketdi", "sotildi" + mahsulot + summa): DARHOL yozing.
+   - Mijoz ismi va to'lov usuli IXTIYORIY — aytilmagan bo'lsa SO'RAMANG: naqd, mijozsiz yozing. Faqat "nasiya/qarzga" desa on_credit=true (shunda mijoz ismi kerak).
+   - Bir nechta mahsulot bitta umumiy summaga ("tts 20 pro + honeycomb + pump 470$ ga") — BITTA record_sale_multi chaqiruvi, total_usd=470. Alohida narx aytilgan mahsulotga price_usd bering.
+   - Bitta mahsulot bir necha dona umumiy summaga ("2 ta 940$") — record_sale, qty=2, total_usd=940.
+   - Asbob "variantlar" qaytarsa (masalan ikki xil honeycomb) — variantlarni ko'rsatib bitta qisqa savol bering, javobdan keyin yozing.
+   - Yozgandan keyin tasdiq: nima sotildi, jami summa ($ va so'm), har biridan astatkada nechta qoldi, kassa qoldig'i.
+   EXCEL: egasi .xlsx faylni shu chatga yuborsa bot uni o'zi o'qiydi (astatka, sotuv, xarajat, kassa) va tasdiqlash tugmasini chiqaradi. Excel haqida so'rasa — faylni shu yerga yuborishni ayting.
 3. Qisqa nomlar (tts20, cnc, 15in1) — get_stock bilan toping, taxmin qilmang.
 4. "sotilmadi", "ketmadi" — bu sotuv EMAS.
 5. Kerak bo'lsa bir nechta asbobni ketma-ket chaqiring va o'zingiz hisoblang.
@@ -1888,23 +2101,62 @@ async def _scheduler(app):
         if key.endswith(BRIEF_EVENING) and ('e' + key[:10]) not in sent:
             sent.add('e' + key[:10]); await _briefing(app, 'evening')
         if len(sent) > 50: sent.clear()
-        # Baza o'zgargan bo'lsa avtomatik zaxira (kamida 10 daqiqada bir)
+        # Avto-zaxira: FAQAT baza mazmuni o'zgarganda va FAQAT alohida branch'ga (main'ga emas —
+        # main'ga yozilsa Railway qayta deploy qiladi va bot o'zini o'chirib-yoqib, yozuvlarni yo'qotadi)
         try:
-            if GITHUB_TOKEN and os.path.exists(DB_PATH):
-                mt = os.path.getmtime(DB_PATH)
-                if mt > _BK['last'] and (time.time() - _BK['last']) > BK_MIN_GAP:
+            if GITHUB_TOKEN and not _BK['blocked'] and time.time() >= _BK['next_try']:
+                migrate = _BK.pop('migrate', False)
+                if migrate or await asyncio.to_thread(_bk_check_dirty):
                     ok, msg = await asyncio.to_thread(db_backup_to_github, 'avto')
                     log.info("Avto-zaxira: %s — %s", "OK" if ok else "XATO", msg)
+                    if not ok:
+                        if migrate: _BK['migrate'] = True
+                        _BK['next_try'] = time.time() + min(900, 30 * (2 ** min(_BK['fail'], 5)))
+                        if _BK['fail'] == 3 and app is not None:     # jim yo'qolmasin — egasiga bir marta aytamiz
+                            if db_on_volume():
+                                holat = ("Baza Railway diskida (Volume) — yozuvlar saqlanadi, "
+                                         "faqat GitHub'dagi nusxa yangilanmayapti.")
+                            else:
+                                holat = ("DIQQAT: Volume ulanmagan — bot qayta ishga tushsa, oxirgi yozuvlar yo'qoladi. "
+                                         "Railway'da botga Volume ulang (mount path: /data).")
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=OWNER_ID,
+                                    text=f"⚠️ Bazani GitHub'ga zaxiralab bo'lmayapti (3 marta): {msg}\n{holat}")
+                            except Exception:
+                                log.exception("zaxira ogohlantirish")
         except Exception:
             log.exception("avto-zaxira")
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
+
+def init_all_tables():
+    init_db()
+    init_ai_tables()
+    init_sub_table()
+    init_erp_tables()
+    init_crm_tables()
+    init_excel_tables()
 
 async def _post_init(app):
     init_ai_tables()
     init_sub_table()
     init_erp_tables()
     init_crm_tables()
+    init_excel_tables()
+    _bk_set_baseline()          # hozirgi holat = zaxiradagi holat (keraksiz zaxira bo'lmasin)
     asyncio.create_task(_scheduler(app))
+    if _BK.get('restore_msg'):
+        try: await app.bot.send_message(chat_id=OWNER_ID, text=_BK['restore_msg'])
+        except Exception: log.exception("restore xabari")
+
+async def _post_shutdown(app):
+    """To'xtashdan oldin (Railway yangi deploy qilganda) oxirgi o'zgarishlarni zaxiralaydi"""
+    try:
+        if GITHUB_TOKEN and not _BK['blocked'] and await asyncio.to_thread(_bk_check_dirty):
+            ok, msg = await asyncio.to_thread(db_backup_to_github, "to'xtash")
+            log.info("Yakuniy zaxira: %s — %s", "OK" if ok else "XATO", msg)
+    except Exception:
+        log.exception("yakuniy zaxira")
 
 
 async def cmd_sync_sentyabr(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4387,7 +4639,10 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/katalog [nom] /yangi_tovar\n\n"
         "*Erkin yozish:*\n\n"
         "💰 *Sotuv:*\n`TTS 20 Pro sotdim 470 ga`\n"
+        "`Sotuv tts 20 pro + honeycomb 400 + pump 470$ ga`\n"
         "`Ahmadga 10% chegirma bilan P8100 ketdi`\n\n"
+        "📥 *Excel:* oylik jadval (.xlsx) faylini shu chatga yuboring — astatka, sotuv, xarajat va kassa "
+        "Excel bo'yicha yangilanadi (tasdiqlashdan oldin ko'rsatadi). Boshqa oy: izohga `2026-08`, hammasi: `hammasi`.\n\n"
         "🚚 *Yo'lda:*\n`Two Trees ga TTS 20 Pro 3 ta zakaz berdim 280 dan, 200 deposit`\n"
         "`Zakaz #1 keldi`\n`Two Trees ga 300 dollar to'ladim`\n\n"
         "💸 *Xarajat:*\n`Bank to'lovi 45 dollar`\n"
@@ -4597,6 +4852,8 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown')
         else:
             await msg.reply_text("❌ Topilmadi yoki allaqachon kelgan!")
+    elif data.startswith('xlimp_'):
+        await xl_callback(u, ctx, data)
     elif data.startswith('cat_') or data.startswith('sup_') or data.startswith('photos_'):
         pass  # ConversationHandler handles these
 
@@ -5179,61 +5436,241 @@ async def handle_video_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SELF-UPDATE (GitHub API) ──────────────────────────────────────
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
-GITHUB_REPO  = 'ilyosbekdot/thermocraft-bot'
+GITHUB_REPO  = os.getenv('GITHUB_REPO', 'ilyosbekdot/thermocraft-bot')
 BOT_FILENAME = os.getenv('BOT_FILENAME', 'bot-20.py')
 
 # ── BAZA ZAXIRASI (GitHub) ────────────────────────────────────────
-DB_BACKUP_PATH = os.getenv('DB_BACKUP_PATH', 'data/thermocraft.db')
-_BK = {'last': 0.0}          # oxirgi zaxira vaqti
-BK_MIN_GAP = 600             # kamida 10 daqiqa oraliq
+# MUHIM: zaxira ALOHIDA branch'ga ("db-backup") yoziladi, main'ga EMAS.
+# Avval zaxira main'ga commit qilinardi → Railway har commitda qayta deploy qilardi →
+# yangi bot ishga tushishi bilan yana zaxira → yana deploy... Bot har ~45 soniyada
+# o'chib-yoqilib, oxirgi zaxiradan keyingi barcha yozuvlar (sotuv, kassa) yo'qolardi.
+DB_BACKUP_PATH   = os.getenv('DB_BACKUP_PATH', 'data/thermocraft.db')
+DB_BACKUP_BRANCH = os.getenv('DB_BACKUP_BRANCH', 'db-backup')
+_BK = {'hash': None, 'cur_hash': None, 'mtime': None, 'last': 0.0, 'fail': 0,
+       'next_try': 0.0, 'blocked': '', 'branch_ok': False, 'restore_msg': '',
+       'default_branch': '', 'source': ''}
+_BK_LOCK = threading.Lock()
 
-def _gh_headers():
+def _gh_headers(raw=False):
     return {"Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
+            "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"}
 
-def db_backup_to_github(reason=''):
-    """Bazani GitHub repoga zaxiralaydi"""
+def _gh_api(path=''):
+    base = f"https://api.github.com/repos/{GITHUB_REPO}"
+    return f"{base}/{path}" if path else base
+
+def _gh_default_branch():
+    if _BK['default_branch']: return _BK['default_branch']
+    try:
+        r = requests.get(_gh_api(), headers=_gh_headers(), timeout=20)
+        if r.status_code == 200:
+            _BK['default_branch'] = r.json().get('default_branch') or 'main'
+    except Exception:
+        pass
+    return _BK['default_branch'] or 'main'
+
+# ── Baza ichidagi belgi: har zaxirada +1 (qaysi nusxa yangiroq ekanini bilish uchun)
+def _meta_get(conn, key, default=None):
+    try:
+        r = conn.execute("SELECT value FROM _meta WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+    except Exception:
+        return default
+
+def _db_seq_of(path):
+    """Fayldagi zaxira raqami; 0 — eski (raqamsiz) nusxa; -1 — yaroqsiz fayl"""
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            return int(_meta_get(conn, 'backup_seq', 0) or 0)
+        finally:
+            conn.close()
+    except Exception:
+        return -1
+
+def _db_content_hash(path=None):
+    """Baza MAZMUNI xeshi (_meta jadvalisiz) — haqiqiy o'zgarish bo'lganini aniqlash uchun"""
+    h = hashlib.sha256()
+    conn = sqlite3.connect(path or DB_PATH)
+    try:
+        for line in conn.iterdump():
+            if line.startswith('INSERT INTO "_meta"') or line.startswith('CREATE TABLE _meta'):
+                continue
+            h.update(line.encode('utf-8', 'replace')); h.update(b'\n')
+    finally:
+        conn.close()
+    return h.hexdigest()
+
+def _db_snapshot():
+    """Izchil nusxa (SQLite backup API — yozish paytida ham buzilmaydi) → (bytes, mazmun_xeshi)"""
+    fd, tmp = tempfile.mkstemp(suffix='.db'); os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH); dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close(); src.close()
+        h = _db_content_hash(tmp)
+        with open(tmp, 'rb') as f: raw = f.read()
+        return raw, h
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+
+def _bk_set_baseline():
+    """Hozirgi holatni 'zaxirada bor' deb belgilaydi (ishga tushganda / tiklagandan keyin)"""
+    try:
+        if os.path.exists(DB_PATH):
+            _BK['mtime'] = os.path.getmtime(DB_PATH)
+            _BK['hash'] = _BK['cur_hash'] = _db_content_hash()
+    except Exception:
+        log.exception("baseline")
+
+def _bk_check_dirty():
+    """True — oxirgi muvaffaqiyatli zaxiradan keyin baza mazmuni o'zgargan"""
+    if not os.path.exists(DB_PATH): return False
+    mt = os.path.getmtime(DB_PATH)
+    if mt != _BK['mtime'] or _BK['cur_hash'] is None:
+        _BK['mtime'] = mt
+        _BK['cur_hash'] = _db_content_hash()
+    return _BK['cur_hash'] != _BK['hash']
+
+def _gh_ensure_branch(branch):
+    """Zaxira branch'i bo'lmasa — asosiy branch'dan yaratadi (bu deploy qilmaydi)"""
+    if _BK['branch_ok']: return True, ''
+    r = requests.get(_gh_api(f"branches/{branch}"), headers=_gh_headers(), timeout=20)
+    if r.status_code == 200:
+        _BK['branch_ok'] = True; return True, ''
+    if r.status_code != 404:
+        return False, f"branch tekshiruvi: GitHub {r.status_code}"
+    base = _gh_default_branch()
+    r = requests.get(_gh_api(f"git/ref/heads/{base}"), headers=_gh_headers(), timeout=20)
+    if r.status_code != 200:
+        return False, f"{base} topilmadi: GitHub {r.status_code}"
+    sha = r.json()['object']['sha']
+    r = requests.post(_gh_api("git/refs"), headers=_gh_headers(), timeout=20,
+                      json={"ref": f"refs/heads/{branch}", "sha": sha})
+    if r.status_code in (201, 422):        # 422 — allaqachon bor
+        _BK['branch_ok'] = True; return True, ''
+    try: err = r.json().get('message', '')[:120]
+    except Exception: err = r.text[:120]
+    return False, f"branch yaratib bo'lmadi: GitHub {r.status_code} {err}"
+
+def _gh_file_sha(path, branch):
+    """(status, sha) — katta (1 MB+) fayllarda ham ishlaydi: papka ro'yxatidan oladi"""
+    folder, _, fname = path.rpartition('/')
+    r = requests.get(_gh_api(f"contents/{folder}" if folder else "contents"),
+                     headers=_gh_headers(), params={"ref": branch}, timeout=20)
+    if r.status_code == 404: return 404, None
+    if r.status_code != 200: return r.status_code, None
+    for it in (r.json() if isinstance(r.json(), list) else []):
+        if it.get('name') == fname: return 200, it.get('sha')
+    return 404, None
+
+def _gh_put_file(path, raw, message, branch):
+    ok, err = _gh_ensure_branch(branch)
+    if not ok: return False, err
+    api = _gh_api(f"contents/{path}")
+    for attempt in range(3):
+        st, sha = _gh_file_sha(path, branch)
+        if st not in (200, 404):
+            return False, f"GitHub {st}"
+        payload = {"message": message, "content": base64.b64encode(raw).decode(), "branch": branch}
+        if sha: payload["sha"] = sha
+        r = requests.put(api, json=payload, headers=_gh_headers(), timeout=120)
+        if r.status_code in (200, 201): return True, ''
+        if r.status_code in (409, 422) and attempt < 2:      # sha eskirgan — qayta urinish
+            time.sleep(2); continue
+        try: err = r.json().get('message', '')[:120]
+        except Exception: err = r.text[:120]
+        return False, f"GitHub {r.status_code}: {err}"
+    return False, "GitHub: urinishlar tugadi"
+
+def db_backup_to_github(reason='', force=False):
+    """Bazani GitHub'dagi ALOHIDA branch'ga zaxiralaydi (main'ga emas — deploy bo'lmaydi)"""
     if not GITHUB_TOKEN: return False, "GITHUB_TOKEN sozlanmagan"
+    if _BK['blocked'] and not force:
+        return False, f"Avto-zaxira to'xtatilgan: {_BK['blocked']}"
+    if not _BK_LOCK.acquire(timeout=180):
+        return False, "Boshqa zaxira jarayoni tugamadi"
     try:
         if not os.path.exists(DB_PATH): return False, "Baza fayli yo'q"
-        with open(DB_PATH, 'rb') as f: raw = f.read()
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
+            seq = int(_meta_get(conn, 'backup_seq', 0) or 0) + 1
+            conn.execute("INSERT OR REPLACE INTO _meta (key,value) VALUES ('backup_seq',?)", (str(seq),))
+            conn.execute("INSERT OR REPLACE INTO _meta (key,value) VALUES ('backup_at',?)", (now_t(),))
+            conn.commit()
+        finally:
+            conn.close()
+        raw, h = _db_snapshot()
         if len(raw) < 100: return False, "Baza bo'sh"
-        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_BACKUP_PATH}"
-        sha = None
-        r = requests.get(api, headers=_gh_headers(), timeout=20)
-        if r.status_code == 200: sha = r.json().get('sha')
-        payload = {"message": f"DB backup {datetime.now().strftime('%Y-%m-%d %H:%M')} {reason}".strip(),
-                   "content": base64.b64encode(raw).decode()}
-        if sha: payload["sha"] = sha
-        r2 = requests.put(api, json=payload, headers=_gh_headers(), timeout=90)
-        if r2.status_code in (200, 201):
-            _BK['last'] = time.time()
-            return True, f"{max(1, len(raw)//1024)} KB zaxiralandi"
-        try: err = r2.json().get('message', '')[:120]
-        except Exception: err = r2.text[:120]
-        return False, f"GitHub {r2.status_code}: {err}"
+        msg = f"DB backup #{seq} {datetime.now().strftime('%Y-%m-%d %H:%M')} {reason}".strip()
+        ok, err = _gh_put_file(DB_BACKUP_PATH, raw, msg, DB_BACKUP_BRANCH)
+        if ok:
+            _BK['hash'] = h; _BK['last'] = time.time(); _BK['fail'] = 0; _BK['next_try'] = 0.0
+            return True, f"{max(1, len(raw)//1024)} KB zaxiralandi (#{seq})"
+        _BK['fail'] += 1
+        return False, err
     except Exception as e:
+        _BK['fail'] += 1
         log.exception("db backup"); return False, str(e)[:150]
+    finally:
+        _BK_LOCK.release()
 
-def db_restore_from_github():
-    """GitHub dagi zaxiradan bazani tiklaydi"""
-    if not GITHUB_TOKEN: return False, "GITHUB_TOKEN sozlanmagan"
+def _gh_download(path, ref):
+    r = requests.get(_gh_api(f"contents/{path}"), headers=_gh_headers(raw=True),
+                     params={"ref": ref}, timeout=90)
+    if r.status_code != 200:
+        return r.status_code, None
+    data = r.content or b''
+    if data[:15] != b'SQLite format 3':
+        # GitHub JSON qaytargan bo'lsa (base64 yoki katta fayl uchun download_url)
+        try:
+            j = r.json()
+            if isinstance(j, dict) and j.get('content') and j.get('encoding') == 'base64':
+                data = base64.b64decode(j['content'])
+            elif isinstance(j, dict) and j.get('download_url'):
+                data = requests.get(j['download_url'], headers={"Authorization": f"Bearer {GITHUB_TOKEN}"},
+                                    timeout=90).content
+        except Exception:
+            pass
+    if len(data) >= 100 and data[:15] == b'SQLite format 3':
+        return 200, data
+    return 422, None            # fayl bor, lekin SQLite emas
+
+def db_fetch_remote():
+    """GitHub'dagi eng so'nggi zaxira: avval db-backup branch, u yo'q bo'lsa — eski joy (main).
+    Qaytaradi: ('ok', bytes, manba) | ('none', None, '') | ('error', None, sabab)"""
+    if not GITHUB_TOKEN: return 'error', None, "GITHUB_TOKEN sozlanmagan"
     try:
-        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_BACKUP_PATH}"
-        r = requests.get(api, headers=_gh_headers(), timeout=60)
-        if r.status_code != 200: return False, f"Zaxira topilmadi ({r.status_code})"
-        j = r.json()
-        raw = base64.b64decode(j.get('content', '')) if j.get('content') else b''
-        if len(raw) < 100 and j.get('download_url'):
-            raw = requests.get(j['download_url'], timeout=60).content
-        if len(raw) < 100: return False, "Zaxira bo'sh"
-        d = os.path.dirname(DB_PATH)
-        if d: os.makedirs(d, exist_ok=True)
-        with open(DB_PATH, 'wb') as f: f.write(raw)
-        return True, f"{max(1, len(raw)//1024)} KB tiklandi"
+        st, raw = _gh_download(DB_BACKUP_PATH, DB_BACKUP_BRANCH)
     except Exception as e:
-        log.exception("db restore"); return False, str(e)[:150]
+        return 'error', None, f"{DB_BACKUP_BRANCH}: {str(e)[:100]}"
+    if st == 200: return 'ok', raw, DB_BACKUP_BRANCH
+    if st != 404:            # branch bor-u o'qib bo'lmadi — eski nusxaga o'tib ketmaymiz
+        return 'error', None, f"{DB_BACKUP_BRANCH}: GitHub {st}"
+    base = _gh_default_branch()
+    try:
+        st, raw = _gh_download(DB_BACKUP_PATH, base)
+    except Exception as e:
+        return 'error', None, f"{base}: {str(e)[:100]}"
+    if st == 200: return 'ok', raw, base
+    if st == 404: return 'none', None, ''
+    return 'error', None, f"{base}: GitHub {st}"
+
+def _write_db_file(raw):
+    d = os.path.dirname(DB_PATH)
+    if d: os.makedirs(d, exist_ok=True)
+    tmp = DB_PATH + '.tmp'
+    with open(tmp, 'wb') as f: f.write(raw)
+    for ext in ('-journal', '-wal', '-shm'):
+        try: os.remove(DB_PATH + ext)
+        except Exception: pass
+    os.replace(tmp, DB_PATH)
 
 def db_is_empty():
     """Baza yo'q yoki ma'lumotsizmi"""
@@ -5252,16 +5689,67 @@ def db_is_empty():
         return True
 
 def db_autorestore():
-    """Ishga tushganda baza bo'sh bo'lsa GitHub dan tiklaydi"""
-    if not db_is_empty():
-        log.info("Baza joyida, tiklash shart emas"); return
-    ok, msg = db_restore_from_github()
-    log.info("Avtomatik tiklash: %s — %s", "OK" if ok else "XATO", msg)
+    """Ishga tushganda: GitHub'dagi zaxira mahalliy bazadan yangiroq bo'lsa — tiklaydi.
+    Zaxirani o'qib bo'lmasa — avto-zaxirani to'xtatadi: aks holda bo'sh/eski baza
+    GitHub'dagi yaxshi zaxirani bosib ketadi (25-sentyabrda shunday bo'lgan)."""
+    if not GITHUB_TOKEN:
+        log.warning("GITHUB_TOKEN yo'q — zaxira va tiklash o'chirilgan"); return
+    local_empty = db_is_empty()
+    local_seq = -1 if local_empty else _db_seq_of(DB_PATH)
+    status, raw, info = 'error', None, ''
+    for i in range(5):
+        status, raw, info = db_fetch_remote()
+        if status != 'error': break
+        log.warning("Zaxirani olish %d/5: %s", i + 1, info)
+        time.sleep(3 * (i + 1))
+    if status == 'none':
+        log.info("GitHub'da zaxira yo'q — yangi baza bilan ishlanadi")
+        return
+    if status == 'error':
+        _BK['blocked'] = f"ishga tushishda zaxirani o'qib bo'lmadi ({info})"
+        if local_empty:
+            _BK['restore_msg'] = ("⚠️ Bot ishga tushdi, lekin GitHub'dagi zaxirani o'qib bo'lmadi:\n" + info +
+                                  "\n\nBaza bo'sh holatda boshlandi. Avto-zaxira to'xtatildi — bo'sh baza "
+                                  "GitHub'dagi yaxshi zaxirani bosib ketmasligi uchun.\n"
+                                  "GitHub ishlaganda: /restore ha (zaxiradan tiklash).")
+        else:
+            _BK['restore_msg'] = ("⚠️ GitHub'dagi zaxirani tekshirib bo'lmadi (" + info + ").\n"
+                                  "Diskdagi baza bilan ishlayapman — ma'lumotlar joyida. Avto-zaxira vaqtincha to'xtatildi.\n"
+                                  "GitHub ishlaganda: /backup ha (/restore ni BOSMANG — u eski nusxani qo'yadi).")
+        log.error("Tiklash xatosi: %s", info)
+        return
+    fd, tmp = tempfile.mkstemp(suffix='.db'); os.close(fd)
+    try:
+        with open(tmp, 'wb') as f: f.write(raw)
+        remote_seq = _db_seq_of(tmp)
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+    if remote_seq < 0:
+        _BK['blocked'] = "GitHub'dagi zaxira fayli yaroqsiz"
+        _BK['restore_msg'] = "⚠️ GitHub'dagi zaxira fayli yaroqsiz. Avto-zaxira to'xtatildi. /restore ha yoki /backup ha"
+        return
+    if local_empty or remote_seq > local_seq or (remote_seq == 0 and local_seq <= 0):
+        _write_db_file(raw)
+        _BK['source'] = info
+        log.info("Baza GitHub'dan tiklandi: %s (#%s), %d KB", info, remote_seq, len(raw) // 1024)
+    else:
+        log.info("Mahalliy baza yangiroq yoki teng (#%s ≥ #%s) — tiklanmadi", local_seq, remote_seq)
+    if info != DB_BACKUP_BRANCH:
+        _BK['migrate'] = True        # birinchi zaxira db-backup branch'ini yaratadi
 
 async def cmd_backup(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
+    force = bool(ctx.args) and ctx.args[0].lower() in ('ha', 'yes')
+    if _BK['blocked'] and not force:
+        await u.message.reply_text(
+            f"⚠️ Avto-zaxira to'xtatilgan: {_BK['blocked']}\n\n"
+            "Hozirgi bazani baribir GitHub'ga yozish (eski zaxira ustidan): /backup ha\n"
+            "Yoki avval zaxiradan tiklash: /restore ha")
+        return
     await u.message.reply_text("⏳ Zaxiralanmoqda...")
-    ok, msg = db_backup_to_github('qo\'lda')
+    ok, msg = await asyncio.to_thread(db_backup_to_github, "qo'lda", force)
+    if ok and force: _BK['blocked'] = ''
     await u.message.reply_text(("✅ " if ok else "❌ ") + msg)
 
 async def cmd_restore(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5272,13 +5760,20 @@ async def cmd_restore(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "⚠️ Bu hozirgi bazani GitHub dagi zaxira bilan ALMASHTIRADI.\n"
             "Hozirgi ma'lumotlar yo'qoladi.\n\nTasdiqlash: /restore ha")
         return
-    ok, msg = db_restore_from_github()
-    if ok:
-        init_db(); init_ai_tables()
-        await u.message.reply_text(f"✅ {msg}\nBaza tiklandi.")
-    else:
-        await u.message.reply_text(f"❌ {msg}")
-
+    status, raw, info = await asyncio.to_thread(db_fetch_remote)
+    if status != 'ok':
+        await u.message.reply_text("❌ " + ("GitHub'da zaxira yo'q" if status == 'none' else info))
+        return
+    def _apply():
+        with _BK_LOCK:
+            _write_db_file(raw)
+            init_all_tables()
+            _BK['blocked'] = ''; _BK['restore_msg'] = ''
+            _bk_set_baseline()
+    await asyncio.to_thread(_apply)
+    if info != DB_BACKUP_BRANCH: _BK['migrate'] = True
+    await u.message.reply_text(f"✅ {max(1, len(raw)//1024)} KB tiklandi ({info}).\n"
+                               f"💵 Kassa: {fmt(get_cash_balance())}")
 
 
 async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5344,11 +5839,18 @@ async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── FAYL ORQALI AUTO-UPDATE ───────────────────────────────────────
 async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Bot ga .py fayl yuboring — bot o'zini yangilaydi"""
+    """.xlsx — Excel import (astatka/sotuv/kassa); .py — bot o'zini yangilaydi"""
     if not is_owner(u): return
     doc = u.message.document
-    if not doc or not doc.file_name.endswith('.py'):
-        await u.message.reply_text("❌ Faqat .py fayl yuboring!")
+    fname = ((doc.file_name if doc else '') or '').lower()
+    if fname.endswith(('.xlsx', '.xlsm')):
+        return await handle_excel(u, ctx)
+    if fname.endswith(('.xls', '.csv', '.ods', '.numbers')):
+        await u.message.reply_text("📥 Excel faylni .xlsx formatida saqlab yuboring (Fayl → Saqlash → Excel .xlsx).")
+        return
+    if not doc or not fname.endswith('.py'):
+        await u.message.reply_text("Qabul qilinadigan fayllar:\n• .xlsx — Excel jadval (astatka, sotuv, xarajat, kassa import)\n"
+                                   "• .py — bot kodini yangilash")
         return
     if not GITHUB_TOKEN:
         await u.message.reply_text("❌ GITHUB_TOKEN sozlanmagan!")
@@ -5400,6 +5902,656 @@ async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await u.message.reply_text(f"❌ Xato: {str(e)[:300]}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# EXCEL IMPORT — oylik jadval: astatka, sotuv, xarajat, kassa, zavod qarzi
+# Fayl shu chatga yuboriladi → bot ko'rib chiqadi → "✅ Import" tugmasi bilan yoziladi.
+# Kutubxona kerak emas (.xlsx = zip + xml).
+# ══════════════════════════════════════════════════════════════════
+class XLError(Exception):
+    pass
+
+_XL_M = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+_XL_R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+
+def init_excel_tables():
+    conn = db(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS excel_imports (
+        period TEXT PRIMARY KEY, imported_at TEXT, sheet TEXT,
+        opening_cash REAL, summary TEXT)""")
+    conn.commit(); conn.close()
+
+def _xl_ref(ref):
+    """'AB12' → (12, 28)"""
+    m = re.match(r'^([A-Z]+)(\d+)$', ref or '')
+    if not m: return None
+    col = 0
+    for ch in m.group(1): col = col * 26 + (ord(ch) - 64)
+    return int(m.group(2)), col
+
+def xlsx_oqi(raw):
+    """.xlsx → [(varaq_nomi, {(qator, ustun): qiymat})] (qator/ustun 1 dan)"""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        names = set(z.namelist())
+        if 'xl/workbook.xml' not in names: raise zipfile.BadZipFile('workbook yo\'q')
+    except zipfile.BadZipFile:
+        raise XLError("Bu fayl .xlsx emas yoki buzilgan. Excel'da \"Saqlash → .xlsx\" qilib qayta yuboring.")
+    shared = []
+    if 'xl/sharedStrings.xml' in names:
+        for si in ET.fromstring(z.read('xl/sharedStrings.xml')).findall(_XL_M + 'si'):
+            parts = [t.text or '' for t in si.findall(_XL_M + 't')]
+            for r in si.findall(_XL_M + 'r'):
+                parts += [t.text or '' for t in r.findall(_XL_M + 't')]
+            shared.append(''.join(parts))
+    rmap = {}
+    if 'xl/_rels/workbook.xml.rels' in names:
+        for r in ET.fromstring(z.read('xl/_rels/workbook.xml.rels')):
+            rmap[r.get('Id')] = r.get('Target', '')
+    wb = ET.fromstring(z.read('xl/workbook.xml'))
+    sheets = wb.find(_XL_M + 'sheets')
+    out = []
+    for sh in (list(sheets) if sheets is not None else []):
+        target = rmap.get(sh.get(_XL_R + 'id'), '')
+        if not target: continue
+        path = target.lstrip('/') if target.startswith('/') else 'xl/' + target
+        path = os.path.normpath(path).replace('\\', '/')
+        if path not in names: continue
+        cells = {}
+        sd = ET.fromstring(z.read(path)).find(_XL_M + 'sheetData')
+        rown = 0
+        for row in (list(sd) if sd is not None else []):
+            if row.tag != _XL_M + 'row': continue
+            rown = int(row.get('r') or (rown + 1))
+            coln = 0
+            for c in row:
+                if c.tag != _XL_M + 'c': continue
+                rc = _xl_ref(c.get('r'))
+                coln = rc[1] if rc else coln + 1
+                t = c.get('t', 'n'); v = c.find(_XL_M + 'v')
+                if t == 'inlineStr':
+                    isel = c.find(_XL_M + 'is')
+                    val = ''.join(x.text or '' for x in isel.iter(_XL_M + 't')) if isel is not None else ''
+                elif v is None or v.text is None:
+                    continue
+                elif t == 's':
+                    i = int(v.text); val = shared[i] if 0 <= i < len(shared) else ''
+                elif t in ('str', 'e'):
+                    val = v.text
+                elif t == 'b':
+                    val = 1.0 if v.text == '1' else 0.0
+                else:
+                    try: val = float(v.text)
+                    except ValueError: val = v.text
+                if val is None or (isinstance(val, str) and not val.strip()): continue
+                cells[(rown, coln)] = val
+        out.append((sh.get('name') or '', cells))
+    return out
+
+_XL_HDR = {'boshqoldi': 'bosh', 'sebestda': 'bosh_sebest', 'bittasebest': 'unit',
+           'sotildisht': 'sold_qty', 'sotildisebest': 'sold_cost', 'sotildinarx': 'sold_rev',
+           'qoldisht': 'end_qty', 'qoldisebest': 'end_cost'}
+_OY_UZ = {'yanvar': 1, 'fevral': 2, 'mart': 3, 'aprel': 4, 'may': 5, 'iyun': 6, 'iyul': 7,
+          'avgust': 8, 'sentyabr': 9, 'sentabr': 9, 'oktyabr': 10, 'oktabr': 10,
+          'noyabr': 11, 'dekabr': 12}
+_OY_NOMI = ['', 'Yanvar', 'Fevral', 'Mart', 'Aprel', 'May', 'Iyun', 'Iyul', 'Avgust',
+            'Sentyabr', 'Oktyabr', 'Noyabr', 'Dekabr']
+
+def _hn(s):
+    return re.sub(r'[^a-z]', '', str(s).lower())
+
+def _xnum(v):
+    if v is None or v == '': return None
+    if isinstance(v, (int, float)): return float(v)
+    s = str(v).strip().replace(' ', '').replace(' ', '').replace('$', '').replace(',', '.')
+    try: return float(s)
+    except ValueError: return None
+
+def _xl_period(text):
+    """'01,09,2026' → '2026-09'; '2026-08' / '08.2026' / 'sentyabr' → oy"""
+    s = str(text or '')
+    m = re.search(r'(\d{1,2})\D+(\d{1,2})\D+(\d{4})', s)
+    if m and 1 <= int(m.group(2)) <= 12 and 2000 <= int(m.group(3)) <= 2100:
+        return f"{int(m.group(3))}-{int(m.group(2)):02d}"
+    m = re.search(r'(\d{4})\D+(\d{1,2})(?!\d)', s)
+    if m and 1 <= int(m.group(2)) <= 12 and 2000 <= int(m.group(1)) <= 2100:
+        return f"{int(m.group(1))}-{int(m.group(2)):02d}"
+    m = re.search(r'(?<!\d)(\d{1,2})\D+(\d{4})', s)
+    if m and 1 <= int(m.group(1)) <= 12 and 2000 <= int(m.group(2)) <= 2100:
+        return f"{int(m.group(2))}-{int(m.group(1)):02d}"
+    low = s.lower()
+    for k, mo in _OY_UZ.items():
+        if re.search(r'\b' + k, low):
+            y = re.search(r'(20\d\d)', low)
+            return f"{y.group(1) if y else datetime.now().year}-{mo:02d}"
+    return None
+
+def _oy_label(p):
+    y, m = p.split('-'); return f"{_OY_NOMI[int(m)]} {y}"
+
+def xl_parse_sheet(name, cells):
+    res = {'sheet': name, 'period': _xl_period(name), 'ok': False, 'why': '', 'rows': [],
+           'opening': None, 'sales_cash': None, 'qoldiq': None, 'xarajat': [], 'tavar': None}
+    if not cells:
+        res['why'] = "bo'sh varaq"; return res
+    by_row = defaultdict(dict)
+    for (r, c), v in cells.items(): by_row[r][c] = v
+    hdr, cols = None, {}
+    for r in sorted(by_row):
+        found = {}
+        for c, v in sorted(by_row[r].items()):
+            if isinstance(v, str):
+                k = _XL_HDR.get(_hn(v))
+                if k and k not in found: found[k] = c
+        if {'bosh', 'sold_qty', 'end_qty'} <= set(found):
+            hdr, cols = r, found; break
+    if hdr is None:
+        res['why'] = "sarlavha topilmadi (bosh Qoldi | Sotildi sht | Qoldi sht)"; return res
+    name_col, price_col = cols['bosh'] - 1, cols['bosh'] - 2
+    span = range(min(cols.values()), max(cols.values()) + 1)
+    for r in sorted(x for x in by_row if x > hdr):
+        rv = by_row[r]
+        nm = rv.get(name_col)
+        nm = re.sub(r'\s+', ' ', nm).strip() if isinstance(nm, str) else ''
+        if _hn(nm).startswith(('order', 'zakaz', 'jami', 'itogo', 'total')): break
+        if not nm:
+            if any((_xnum(rv.get(c)) or 0) != 0 for c in span): break     # itog qatori — jadval tugadi
+            continue
+        g = lambda k: _xnum(rv.get(cols[k])) if k in cols else None
+        res['rows'].append({'name': nm, 'price': _xnum(rv.get(price_col)),
+                            'bosh': g('bosh'), 'bosh_sebest': g('bosh_sebest'), 'unit': g('unit'),
+                            'sold_qty': g('sold_qty'), 'sold_cost': g('sold_cost'), 'sold_rev': g('sold_rev'),
+                            'end_qty': g('end_qty'), 'end_cost': g('end_cost')})
+    # O'ng tomondagi kassa bloki: naqd (oy boshi), naqd (sotuv), Xarajatlar, Qoldiq
+    labels = sorted((r, c, _hn(v)) for (r, c), v in cells.items() if isinstance(v, str))
+    right = lambda r, c, k=1: cells.get((r, c + k))
+    naqd = [x for x in (_xnum(right(r, c)) for r, c, h in labels if h == 'naqd') if x is not None]
+    if naqd: res['opening'] = naqd[0]
+    if len(naqd) > 1: res['sales_cash'] = naqd[1]
+    for r, c, h in labels:
+        if h == 'qoldiq' and _xnum(right(r, c)) is not None:
+            res['qoldiq'] = _xnum(right(r, c)); break
+    for r, c, h in labels:
+        if h == 'tavar' and _xnum(right(r, c)) is not None:
+            res['tavar'] = _xnum(right(r, c)); break
+    for r, c, h in labels:
+        if h in ('xarajatlar', 'xarajat'):
+            amt = _xnum(right(r, c))
+            if not amt: continue
+            note = ' — '.join(re.sub(r'\s+', ' ', x).strip() for x in (right(r, c, 2), right(r, c, 3))
+                              if isinstance(x, str) and x.strip())
+            res['xarajat'].append({'amount': round(amt, 2), 'note': note})
+    if not res['rows']:
+        res['why'] = "mahsulot qatorlari topilmadi"; return res
+    if not res['period']:
+        res['why'] = f"varaq nomidan oy aniqlanmadi ('{name}')"; return res
+    res['ok'] = True
+    return res
+
+def xl_parse_workbook(raw):
+    sheets = xlsx_oqi(raw)
+    if not sheets: raise XLError("Excel faylda varaq topilmadi")
+    return [xl_parse_sheet(n, c) for n, c in sheets]
+
+def xl_choose(parsed, caption=''):
+    """Qaysi oy(lar) import qilinadi → (oylar, eng_oxirgi_oy). Astatka faqat eng oxirgi oydan olinadi."""
+    good = [p for p in parsed if p['ok']]
+    if not good:
+        why = '\n'.join(f"• {p['sheet']}: {p['why']}" for p in parsed[:8])
+        raise XLError("Import qilsa bo'ladigan oylik varaq topilmadi.\n" + why +
+                      "\n\nKerakli ustunlar: bosh Qoldi | sebestda | bitta sebest | Sotildi sht | "
+                      "sotildi sebest | sotildi narx | Qoldi sht | Qoldi sebest")
+    by_p = {}
+    for p in good: by_p[p['period']] = p
+    periods = sorted(by_p)
+    latest = periods[-1]
+    cap = (caption or '').lower()
+    if re.search(r'\b(hammasi|barchasi|hamma|all)\b', cap):
+        return [by_p[x] for x in periods], latest
+    want = _xl_period(caption) if cap.strip() else None
+    if want and want not in by_p:
+        raise XLError(f"{_oy_label(want)} uchun varaq yo'q. Bor oylar: " + ', '.join(_oy_label(x) for x in periods))
+    return [by_p[want or latest]], latest
+
+# Excel'dagi nom (normallashgan) → botdagi nom
+_XL_ALIAS = {
+    'airassitpump': 'Air Assist Pump', 'airassistpump': 'Air Assist Pump',
+    'cnc3018': 'CNC3018 Pro', 'f1130': 'F1130 (2 in 1)',
+    '15in1': '15 in 1 (SB400)', 'sb40015a': '15 in 1 (SB400)',
+    'p8100': 'P8100 (11 in 1)', 'p8100b220v11': 'P8100 (11 in 1)',
+    'hc12e': "Hc12E qorong'i", 'hc12gb': 'Hc12g-B och', 'st210b110va': 'ST210 kepka',
+    '4thaxiscncrotarymodulekit': '4th Axis Rotary', '500wspindleforttc450pro25': '500W Spindle',
+    'extensionkit600x600mmforttsprottsseries': 'Extension Kit 600x600',
+    'honeycomb500x500mm': 'Honeycomb 500x500', 'honeycomb400x400': 'Honeycomb 400x400',
+    'ttc450pro25': 'TTC450 PRO', 'laserhead10w': 'Laser head 10W',
+}
+
+def xl_match(xname, prods):
+    """Excel nomi → (botdagi mahsulot | None, usul)"""
+    nx = _nrm(xname)
+    if not nx: return None, ''
+    byname = {p['name']: p for p in prods}
+    a = _XL_ALIAS.get(nx)
+    if a and a in byname: return byname[a], 'alias'
+    ex = [p for p in prods if _nrm(p['name']) == nx]
+    if ex: return ex[0], 'aniq'
+    pre = [p for p in prods if len(_nrm(p['name'])) >= 4 and len(nx) >= 4 and
+           (_nrm(p['name']).startswith(nx) or nx.startswith(_nrm(p['name'])))]
+    if len(pre) == 1: return pre[0], 'boshi'
+    if len(pre) > 1:
+        return max(pre, key=lambda p: len(os.path.commonprefix([_nrm(p['name']), nx]))), 'taxminiy'
+    xt = set(re.findall(r'[a-z0-9]+', str(xname).lower().replace('*', 'x')))
+    sub = []
+    for p in prods:
+        pt = set(re.findall(r'[a-z0-9]+', p['name'].lower().replace('*', 'x')))
+        if len(pt) >= 2 and pt <= xt: sub.append((len(pt), p))
+    if sub:
+        return sorted(sub, key=lambda x: -x[0])[0][1], "so'zlar"
+    best, br = None, 0.0
+    for p in prods:
+        r = difflib.SequenceMatcher(None, nx, _nrm(p['name'])).ratio()
+        if r > br: best, br = p, r
+    if best and br >= 0.85: return best, 'taxminiy'
+    return None, ''
+
+def _xl_guess_cat(name):
+    n = name.lower()
+    if re.search(r'tts|laser|lazer|head', n): return 'Lazer', 'Two Trees'
+    if re.search(r'cnc|ttc|spindle|honeycomb|rotary|pump|cutter|freza|extension|axis|vacuum', n):
+        return 'CNC', 'Two Trees'
+    if re.search(r'hc12|qog', n): return "Qog'oz", 'Freesub'
+    return 'Press', 'Freesub'
+
+_XL_SUP = [(r"two\s*t?re|twotre|\btrees?\b", 'Two Trees'), (r'free\s*su[bn]', 'Freesub'),
+           (r'algo\s*laser', 'AlgoLaser'), (r'\bzavod', '')]
+_XL_SHAXSIY = (r"\bo'?zim|shaxsiy|\buy\b|\buyga\b|\buyda\b|ro'?z?g'?or|kvartira|\bonam|\botam|ehson|"
+               r"sadaqa|praduxt|produkt|oziq|ovqat|pitaniya|\bdacha|\boila|kiyim|\bbola")
+
+def _xl_sup_of(note):
+    n = str(note or '').lower()
+    for rx, sup in _XL_SUP:
+        if re.search(rx, n): return sup or '?'
+    return '?'
+
+def _xl_classify(note):
+    n = str(note or '').lower()
+    for ch in ('ʻ', '’', '‘', '`', 'ʼ'): n = n.replace(ch, "'")
+    for rx, sup in _XL_SUP:
+        if re.search(rx, n): return {'kind': 'zavod', 'sup': sup or '?'}
+    if re.search(_XL_SHAXSIY, n): return {'kind': 'shaxsiy'}
+    if re.search(r'\bbank|alibaba|komissiya|\bfee\b', n): return {'kind': 'xarajat', 'cat': 'bank', 'type': 'cogs_bank'}
+    if re.search(r'olx|olex|reklama|instagram|target', n): return {'kind': 'xarajat', 'cat': 'reklama', 'type': 'period'}
+    if re.search(r'\bai\b|\bai[ _-]|claude|chatgpt|\bgpt', n): return {'kind': 'xarajat', 'cat': 'ai_xizmat', 'type': 'period'}
+    if re.search(r'abusa|kargo|cargo', n): return {'kind': 'xarajat', 'cat': 'kargo', 'type': 'period'}
+    if re.search(r"dostavka|yo'?lkira|transport|taksi|taxi|pochta|\bbts\b|yetkaz", n):
+        return {'kind': 'xarajat', 'cat': 'transport', 'type': 'period'}
+    return {'kind': 'xarajat', 'cat': 'boshqa', 'type': 'period'}
+
+def xl_plan(m, update_stock, prods=None):
+    """Bitta oy uchun reja (bazaga hali yozmaydi)"""
+    prods = prods if prods is not None else get_products(active_only=False)
+    P = m['period']; y, mo = map(int, P.split('-'))
+    d0 = P + '-01'
+    d_end = f"{P}-{calendar.monthrange(y, mo)[1]:02d}"
+    td = today()
+    d_ops = td if d0 <= td < d_end else d_end
+    if is_closed(d0): raise XLError(f"{_oy_label(P)} yopilgan — avval /och {P}")
+    pl = {'period': P, 'sheet': m['sheet'], 'update_stock': update_stock, 'date': d_ops, 'd_end': d_end,
+          'stock': [], 'sales': [], 'noaniq': [], 'exps': [], 'zavod': [], 'shaxsiy': [],
+          'warn': [], 'opening': m['opening'], 'qoldiq': m['qoldiq'], 'not_in_excel': []}
+    seen = {}
+    for r in m['rows']:
+        p, how = xl_match(r['name'], prods)
+        tgt = p['name'] if p else r['name']
+        if how == 'taxminiy': pl['warn'].append(f"'{r['name']}' → {tgt} (taxminiy moslik)")
+        sq = r['sold_qty'] or 0; sr = r['sold_rev'] or 0; sc = r['sold_cost'] or 0
+        unit = r['unit'] or 0
+        if unit <= 0:
+            if (r['end_qty'] or 0) > 0 and (r['end_cost'] or 0) > 0: unit = r['end_cost'] / r['end_qty']
+            elif (r['bosh'] or 0) > 0 and (r['bosh_sebest'] or 0) > 0: unit = r['bosh_sebest'] / r['bosh']
+        if sq > 0:
+            cu = (sc / sq) if sc > 0 else unit
+            pl['sales'].append({'product': tgt, 'qty': int(round(sq)), 'unit_cost': round(cu, 4),
+                                'revenue': round(sr, 2)})
+            if sr <= 0: pl['warn'].append(f"{tgt}: {int(round(sq))} ta sotilgan, lekin summasi yo'q — $0 deb yozildi")
+        elif sr > 0:
+            pl['noaniq'].append({'product': tgt, 'amount': round(sr, 2)})
+        if not update_stock: continue
+        eq = r['end_qty']
+        if eq is None and r['bosh'] is not None: eq = max(0.0, r['bosh'] - sq)
+        eq = int(round(eq or 0))
+        if p is None and eq <= 0: continue
+        if tgt in seen:
+            seen[tgt]['qty'] += eq
+            pl['warn'].append(f"'{r['name']}' qatori {tgt} bilan qo'shildi")
+            continue
+        st = {'name': tgt, 'excel_name': r['name'], 'new': p is None, 'pid': p['id'] if p else None,
+              'old_qty': p['qty'] if p else 0, 'qty': eq,
+              'old_cost': p['cost'] if p else 0,
+              'cost': round(unit, 2) if unit > 0 else (p['cost'] if p else 0),
+              'old_price': p['price'] if p else 0,
+              'price': r['price'] if (r['price'] or 0) > 0 else (p['price'] if p else 0)}
+        if p is None: st['cat'], st['sup'] = _xl_guess_cat(tgt)
+        seen[tgt] = st; pl['stock'].append(st)
+    if update_stock:
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT product, COALESCE(SUM(qty),0) FROM sales WHERE date>? AND reversed=0 GROUP BY product", (d_end,))
+        later = {a: int(b) for a, b in c.fetchall()}
+        conn.close()
+        for st in pl['stock']:
+            k = later.get(st['name'], 0)
+            if k:
+                st['later'] = k; st['qty'] = max(0, st['qty'] - k)
+        if later:
+            pl['warn'].append("Oydan keyingi sotuvlar astatkadan ayirildi: " +
+                              ', '.join(f"{a} {b} ta" for a, b in list(later.items())[:6]))
+        names = {st['name'] for st in pl['stock']}
+        pl['not_in_excel'] = [p['name'] for p in prods if p['qty'] > 0 and p['name'] not in names]
+    for x in m['xarajat']:
+        cl = _xl_classify(x['note']); amt = x['amount']
+        if amt < 0:
+            pl['warn'].append(f"Manfiy xarajat ({x['note']} {fmt(amt)}) — kassaga kirim deb yozildi")
+        if cl['kind'] == 'zavod': pl['zavod'].append({'amount': amt, 'sup': cl['sup'], 'note': x['note']})
+        elif cl['kind'] == 'shaxsiy': pl['shaxsiy'].append({'amount': amt, 'note': x['note']})
+        else: pl['exps'].append({'amount': amt, 'cat': cl['cat'], 'type': cl['type'], 'note': x['note']})
+    s_sum = sum(s['revenue'] for s in pl['sales']); n_sum = sum(n['amount'] for n in pl['noaniq'])
+    out = sum(e['amount'] for e in pl['exps']) + sum(z['amount'] for z in pl['zavod']) + sum(s['amount'] for s in pl['shaxsiy'])
+    pl['sales_sum'], pl['noaniq_sum'], pl['out_sum'] = s_sum, n_sum, out
+    pl['adj'] = 0.0
+    if pl['opening'] is not None:
+        computed = pl['opening'] + s_sum + n_sum - out
+        pl['computed_end'] = round(computed, 2)
+        if pl['qoldiq'] is not None and abs(pl['qoldiq'] - computed) >= 0.5:
+            pl['adj'] = round(pl['qoldiq'] - computed, 2)
+    if m['sales_cash'] is not None and abs(m['sales_cash'] - (s_sum + n_sum)) >= 0.5:
+        pl['warn'].append(f"Excel'dagi 2-'naqd' ({fmt(m['sales_cash'])}) sotuvlar yig'indisiga ({fmt(s_sum + n_sum)}) teng emas")
+    # Zavod qarzi: oldin shu oy uchun yozilgan to'lovlar bilan farqi (qayta importda ikki marta yopilmasin)
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT note, amount FROM cash_box WHERE date LIKE ? AND type='chiqim' AND category='zavod_qarz'", (P + '%',))
+    old = defaultdict(float)
+    for note, amt in c.fetchall(): old[_xl_sup_of(note)] += amt or 0
+    new = defaultdict(float)
+    for z in pl['zavod']: new[z['sup']] += z['amount']
+    pl['debt'] = []
+    for sup in sorted(set(old) | set(new)):
+        # faqat shu oy oxirigacha paydo bo'lgan qarzlar (iyun to'lovi sentyabr qarzini yopmasin)
+        if sup == '?':
+            c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0 AND date<=?", (d_end,))
+        else:
+            c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0 AND supplier LIKE ? AND date<=?",
+                      (f'%{sup}%', d_end))
+        open_debt = c.fetchone()[0] or 0
+        delta = round(new.get(sup, 0) - old.get(sup, 0), 2)
+        pl['debt'].append({'sup': sup, 'delta': delta, 'open': round(open_debt, 2),
+                           'after': round(max(0.0, open_debt - max(0.0, delta)), 2)})
+    c.execute("SELECT COUNT(*) FROM sales WHERE date LIKE ?", (P + '%',)); pl['had_sales'] = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM expenses WHERE date LIKE ?", (P + '%',)); pl['had_exps'] = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM cash_box WHERE date LIKE ?", (P + '%',)); pl['had_cash'] = c.fetchone()[0]
+    conn.close()
+    return pl
+
+def _xl_cash(c, d, typ, amt, cat, note):
+    if abs(amt) < 0.005: return
+    if amt < 0: typ = 'kirim' if typ == 'chiqim' else 'chiqim'
+    c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+              (d, '12:00', typ, round(abs(amt), 2), cat, note, 'naqd'))
+
+def _xl_pay_debt(c, sup, amount, d_end):
+    if sup and sup != '?':
+        c.execute("SELECT id, remaining FROM transit WHERE remaining>0 AND supplier LIKE ? AND date<=? ORDER BY date, id",
+                  (f'%{sup}%', d_end))
+    else:
+        c.execute("SELECT id, remaining FROM transit WHERE remaining>0 AND date<=? ORDER BY date, id", (d_end,))
+    left = amount
+    for tid, rem in c.fetchall():
+        if left <= 0.004: break
+        part = min(left, rem)
+        c.execute("UPDATE transit SET deposit=deposit+?, remaining=MAX(0,remaining-?) WHERE id=?", (part, part, tid))
+        c.execute("UPDATE transit SET status='tolangan' WHERE id=? AND remaining<=0.004 AND status='qarz'", (tid,))
+        left -= part
+    return round(amount - left, 2)
+
+def _xl_reanchor(c):
+    """Import qilingan har oy boshida kassa qoldig'i Excel'dagi 'naqd' ga teng bo'lishi uchun"""
+    for period, opening in c.execute(
+            "SELECT period, opening_cash FROM excel_imports WHERE opening_cash IS NOT NULL ORDER BY period").fetchall():
+        d0 = period + '-01'
+        c.execute("DELETE FROM cash_box WHERE date=? AND category='boshlangich'", (d0,))
+        c.execute("SELECT COALESCE(SUM(CASE WHEN type='kirim' THEN amount ELSE -amount END),0) FROM cash_box WHERE date<?", (d0,))
+        diff = round(opening - (c.fetchone()[0] or 0), 2)
+        if abs(diff) >= 0.01:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d0, '00:00', 'kirim' if diff > 0 else 'chiqim', abs(diff), 'boshlangich',
+                       f"{_oy_label(period)} boshi qoldig'i {fmt(opening)} (Excel)", 'naqd'))
+
+def _xl_apply_one(c, pl):
+    P = pl['period']; like = P + '%'; d = pl['date']
+    c.execute("SELECT DISTINCT customer_id FROM sales WHERE date LIKE ? AND COALESCE(customer_id,0)>0", (like,))
+    cids = [r[0] for r in c.fetchall()]
+    # 1) shu oy yozuvlari Excel bilan almashtiriladi
+    c.execute("DELETE FROM warranties WHERE sale_id IN (SELECT id FROM sales WHERE date LIKE ?)", (like,))
+    c.execute("DELETE FROM sales WHERE date LIKE ?", (like,))
+    c.execute("DELETE FROM expenses WHERE date LIKE ?", (like,))
+    c.execute("DELETE FROM cash_box WHERE date LIKE ?", (like,))
+    c.execute("UPDATE op_log SET reversed=1 WHERE date LIKE ? AND op_type IN ('sale','expense')", (like,))
+    # 2) astatka (faqat eng oxirgi oy)
+    for st in pl['stock']:
+        if st['new']:
+            c.execute("SELECT id FROM products WHERE name=?", (st['name'],))
+            if c.fetchone():
+                c.execute("UPDATE products SET qty=?, cost=?, price=?, active=1 WHERE name=?",
+                          (st['qty'], st['cost'], st['price'], st['name']))
+            else:
+                c.execute("INSERT INTO products (name,cat,supplier,qty,cost,price,factory_price,warranty_days,active) "
+                          "VALUES (?,?,?,?,?,?,0,90,1)",
+                          (st['name'], st['cat'], st['sup'], st['qty'], st['cost'], st['price']))
+        else:
+            c.execute("UPDATE products SET qty=?, cost=?, price=? WHERE id=?",
+                      (st['qty'], st['cost'], st['price'], st['pid']))
+    # 3) sotuvlar + kassa
+    for s in pl['sales']:
+        c.execute("INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) "
+                  "VALUES (?,?,?,?,?,?,?,0,'','B2C')",
+                  (d, '12:00', s['product'], s['qty'], s['unit_cost'], s['revenue'],
+                   round(s['revenue'] - s['unit_cost'] * s['qty'], 2)))
+        sid = c.lastrowid
+        _xl_cash(c, d, 'kirim', s['revenue'], 'sotuv', f"{s['product']} x{s['qty']} (#{sid}) Excel")
+    for n in pl['noaniq']:
+        _xl_cash(c, d, 'kirim', n['amount'], 'sotuv', f"{n['product']} — soni ko'rsatilmagan tushum (Excel)")
+    # 4) xarajatlar (+kassa), zavod to'lovlari, shaxsiy
+    for e in pl['exps']:
+        if e['amount'] > 0:
+            c.execute("INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)",
+                      (d, e['amount'], e['cat'], e['type'], (e['note'] or e['cat']) + ' (Excel)'))
+            eid = c.lastrowid
+            _xl_cash(c, d, 'chiqim', e['amount'], e['cat'], f"{e['note'] or e['cat']} (#x{eid})")
+        else:
+            _xl_cash(c, d, 'chiqim', e['amount'], 'boshqa', f"{e['note']} (Excel)")
+    for z in pl['zavod']:
+        _xl_cash(c, d, 'chiqim', z['amount'], 'zavod_qarz',
+                 f"{z['sup'] if z['sup'] != '?' else 'Zavod'} — {z['note'] or 'to`lov'} (Excel)")
+    debt_res = []
+    for dbt in pl['debt']:
+        if dbt['delta'] > 0.004:
+            paid = _xl_pay_debt(c, dbt['sup'], dbt['delta'], pl['d_end'])
+            debt_res.append({'sup': dbt['sup'], 'paid': paid})
+    for s in pl['shaxsiy']:
+        _xl_cash(c, d, 'chiqim', s['amount'], 'shaxsiy', f"{s['note'] or 'shaxsiy'} (Excel)")
+    if pl['adj']:
+        _xl_cash(c, d, 'kirim', pl['adj'], 'tuzatish', f"Excel'dagi oy oxiri qoldig'iga tenglashtirish")
+    summ = {'sales': len(pl['sales']), 'revenue': pl['sales_sum'], 'noaniq': pl['noaniq_sum'],
+            'exps': sum(e['amount'] for e in pl['exps']), 'zavod': sum(z['amount'] for z in pl['zavod']),
+            'shaxsiy': sum(s['amount'] for s in pl['shaxsiy']), 'adj': pl['adj']}
+    c.execute("INSERT OR REPLACE INTO excel_imports (period,imported_at,sheet,opening_cash,summary) VALUES (?,?,?,?,?)",
+              (P, now_t(), pl['sheet'], pl['opening'], json.dumps(summ, ensure_ascii=False)))
+    return {'period': P, 'cids': cids, 'debt': debt_res}
+
+def xl_apply(months, latest):
+    """Tanlangan oylarni BITTA tranzaksiyada yozadi (xato bo'lsa hech narsa o'zgarmaydi)"""
+    prods = get_products(active_only=False)
+    plans = [xl_plan(m, m['period'] == latest, prods) for m in sorted(months, key=lambda x: x['period'])]
+    conn = db(); c = conn.cursor()
+    try:
+        res = [_xl_apply_one(c, pl) for pl in plans]
+        _xl_reanchor(c)
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    for r in res:
+        for cid in r['cids']:
+            try: yangila_jami(cid)
+            except Exception: pass
+    return plans, res
+
+def _cut(lines, n):
+    return lines[:n] + ([f"  … yana {len(lines) - n} ta"] if len(lines) > n else [])
+
+def xl_preview_text(plans):
+    L = []
+    multi = len(plans) > 1
+    if multi:
+        L.append(f"📥 EXCEL IMPORT — {len(plans)} oy: " + ', '.join(_oy_label(p['period']) for p in plans))
+        L.append("")
+        for p in plans:
+            L.append(f"• {_oy_label(p['period'])}: sotuv {len(p['sales'])} ta {fmt(p['sales_sum'] + p['noaniq_sum'])}, "
+                     f"xarajat {fmt(sum(e['amount'] for e in p['exps']))}, zavodga {fmt(sum(z['amount'] for z in p['zavod']))}, "
+                     f"shaxsiy {fmt(sum(s['amount'] for s in p['shaxsiy']))}"
+                     + (f", kassa oxiri {fmt(p['qoldiq'])}" if p['qoldiq'] is not None else ""))
+        L.append("")
+    for p in plans:
+        if multi and not p['update_stock']: continue
+        if not multi:
+            L.append(f"📥 EXCEL IMPORT — {_oy_label(p['period'])} (varaq \"{p['sheet']}\")")
+            L.append("")
+        if p['update_stock']:
+            tq = sum(s['qty'] for s in p['stock']); tc = sum(s['qty'] * s['cost'] for s in p['stock'])
+            L.append(f"📦 Astatka ({_oy_label(p['period'])} oxiri): {tq} dona, sebest {fmt(tc)}")
+            ch = [f"  • {s['name']}: {s['old_qty']} → {s['qty']}" + (f" (keyin {s['later']} ta sotilgan)" if s.get('later') else "")
+                  for s in p['stock'] if not s['new'] and s['old_qty'] != s['qty']]
+            pc = [s for s in p['stock'] if not s['new'] and s['old_qty'] == s['qty'] and
+                  (abs((s['old_cost'] or 0) - s['cost']) >= 1 or abs((s['old_price'] or 0) - s['price']) >= 1)]
+            L += _cut(ch, 14) if ch else ["  • soni o'zgarmaydi"]
+            if pc: L.append(f"  (yana {len(pc)} ta mahsulotda faqat sebest/narx yangilanadi)")
+            nw = [f"{s['name']} ({s['qty']} ta)" for s in p['stock'] if s['new']]
+            if nw: L.append("  🆕 Yangi mahsulot: " + ', '.join(nw))
+            if p['not_in_excel']:
+                L.append("  ℹ️ Excel'da yo'q (o'zgarmaydi): " + ', '.join(p['not_in_excel'][:8]))
+            L.append("")
+        if multi: continue
+        prof = sum(s['revenue'] - s['unit_cost'] * s['qty'] for s in p['sales'])
+        L.append(f"🛒 Sotuvlar: {len(p['sales'])} ta — {fmt(p['sales_sum'])}, foyda {fmt(prof)}")
+        L += _cut([f"  • {s['product']} ×{s['qty']} — {fmt(s['revenue'])}" for s in p['sales']], 12)
+        for n in p['noaniq']:
+            L.append(f"⚠️ {n['product']}: {fmt(n['amount'])} sotuv summasi yozilgan, lekin SONI yo'q → "
+                     f"kassaga kirim qilinadi, astatka o'zgarmaydi. Agar sotilgan bo'lsa — Excel'da \"Sotildi sht\" ni to'ldirib qayta yuboring.")
+        L.append("")
+        if p['exps']:
+            L.append(f"💸 Xarajat: {fmt(sum(e['amount'] for e in p['exps']))}")
+            L += _cut([f"  • {e['note'] or '—'}: {fmt(e['amount'])} ({e['cat']})" for e in p['exps']], 10)
+        for z in p['zavod']:
+            L.append(f"🏭 Zavodga to'lov: {z['sup'] if z['sup'] != '?' else 'zavod'} {fmt(z['amount'])} ({z['note']})")
+        for dbt in p['debt']:
+            if dbt['delta'] > 0.004 and dbt['open'] > 0:
+                L.append(f"   {dbt['sup'] if dbt['sup'] != '?' else 'Zavod'} qarzi: {fmt(dbt['open'])} → {fmt(dbt['after'])}")
+            elif dbt['delta'] > 0.004:
+                L.append(f"   (ochiq qarz yo'q — oldindan to'lov sifatida kassadan chiqim)")
+            elif dbt['delta'] < -0.004:
+                L.append(f"   ⚠️ {dbt['sup']}: avvalgi importdan {fmt(-dbt['delta'])} kam — zavod qarzini tekshiring")
+        if p['shaxsiy']:
+            L.append(f"👤 Shaxsiy (xarajat emas): {fmt(sum(s['amount'] for s in p['shaxsiy']))} — " +
+                     ', '.join(f"{s['note']} {fmt(s['amount'])}" for s in p['shaxsiy'][:5]))
+        L.append("")
+        if p['opening'] is not None:
+            end = p.get('computed_end', 0) + p['adj']
+            line = f"💵 Kassa: oy boshi {fmt(p['opening'])} → oy oxiri {fmt(end)}"
+            if p['qoldiq'] is not None:
+                line += " (Excel bilan teng ✅)" if not p['adj'] else f" (Excel: {fmt(p['qoldiq'])})"
+            L.append(line)
+            if p['adj']:
+                L.append(f"⚖️ Excel'dagi Qoldiq bilan farq {fmt(p['adj'])} — 'tuzatish' yozuvi bilan tenglashtiriladi")
+        else:
+            L.append("💵 Kassa: oy boshi qoldig'i ('naqd') topilmadi — faqat oy harakatlari yoziladi")
+        for w in p['warn'][:8]: L.append("⚠️ " + w)
+        if p['had_sales'] or p['had_exps'] or p['had_cash']:
+            L.append(f"❗ Botdagi {_oy_label(p['period'])} yozuvlari ({p['had_sales']} sotuv, {p['had_exps']} xarajat, "
+                     f"{p['had_cash']} kassa) Excel bilan ALMASHTIRILADI.")
+    if multi:
+        for p in plans:
+            for n in p['noaniq']:
+                L.append(f"⚠️ {_oy_label(p['period'])}: {n['product']} {fmt(n['amount'])} — soni yozilmagan → kassaga kirim, astatka o'zgarmaydi")
+            for w in p['warn'][:3]: L.append(f"⚠️ {_oy_label(p['period'])}: {w}")
+        L.append("❗ Shu oylarning botdagi yozuvlari Excel bilan ALMASHTIRILADI. Astatka — eng oxirgi oydan.")
+    L.append("")
+    L.append("Tasdiqlaysizmi?")
+    txt = '\n'.join(L)
+    return txt if len(txt) < 3900 else txt[:3850] + "\n…\nTasdiqlaysizmi?"
+
+async def handle_excel(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = u.message.document
+    if doc.file_size and doc.file_size > 15 * 1024 * 1024:
+        await u.message.reply_text("❌ Fayl juda katta (15 MB dan oshmasin)."); return
+    await ctx.bot.send_chat_action(chat_id=u.effective_chat.id, action='typing')
+    try:
+        f = await ctx.bot.get_file(doc.file_id)
+        raw = bytes(await f.download_as_bytearray())
+        parsed = await asyncio.to_thread(xl_parse_workbook, raw)
+        months, latest = xl_choose(parsed, u.message.caption or '')
+        prods = await asyncio.to_thread(get_products, False)
+        plans = await asyncio.to_thread(lambda: [xl_plan(m, m['period'] == latest, prods) for m in months])
+    except XLError as e:
+        await u.message.reply_text(f"⚠️ {e}"); return
+    except Exception as e:
+        log.exception("excel o'qish")
+        await u.message.reply_text(f"⚠️ Excel'ni o'qib bo'lmadi: {str(e)[:200]}"); return
+    token = secrets.token_hex(4)
+    ctx.user_data['xl_import'] = {'token': token, 'months': months, 'latest': latest,
+                                  'file': doc.file_name, 'ts': time.time()}
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Import qilish", callback_data=f"xlimp_ok_{token}"),
+                                InlineKeyboardButton("❌ Bekor", callback_data=f"xlimp_no_{token}")]])
+    await u.message.reply_text(xl_preview_text(plans), reply_markup=kb)
+
+async def xl_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str):
+    q = u.callback_query
+    if not is_owner(u): return
+    try: _, action, token = data.split('_', 2)
+    except ValueError: return
+    st = ctx.user_data.get('xl_import')
+    if not st or st.get('token') != token:
+        await q.message.reply_text("⌛ Bu import eskirgan. Excel faylni qaytadan yuboring."); return
+    ctx.user_data.pop('xl_import', None)
+    try: await q.edit_message_reply_markup(reply_markup=None)
+    except Exception: pass
+    if action != 'ok':
+        await q.message.reply_text("❌ Import bekor qilindi — hech narsa o'zgarmadi."); return
+    await q.message.reply_text("⏳ Import qilinmoqda...")
+    try:
+        plans, res = await asyncio.to_thread(xl_apply, st['months'], st['latest'])
+    except XLError as e:
+        await q.message.reply_text(f"⚠️ {e}\nHech narsa o'zgarmadi."); return
+    except Exception as e:
+        log.exception("excel import")
+        await q.message.reply_text(f"⚠️ Import xatosi — hech narsa o'zgarmadi: {str(e)[:200]}"); return
+    prods = get_products()
+    L = ["✅ Excel import tugadi — " + ', '.join(_oy_label(p['period']) for p in plans), ""]
+    for p in plans:
+        L.append(f"• {_oy_label(p['period'])}: {len(p['sales'])} sotuv {fmt(p['sales_sum'] + p['noaniq_sum'])}, "
+                 f"xarajat {fmt(sum(e['amount'] for e in p['exps']))}")
+    for r in res:
+        for dbt in r['debt']:
+            if dbt['paid'] > 0: L.append(f"🏭 {dbt['sup']} qarzidan {fmt(dbt['paid'])} yopildi")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
+    zq = c.fetchone()[0] or 0; conn.close()
+    L += ["", f"📦 Astatka: {sum(p['qty'] for p in prods)} dona, sebest {fmt(sum(p['qty'] * p['cost'] for p in prods))}",
+          f"💵 Kassa hozir: {fmt(get_cash_balance())}",
+          f"🏭 Zavod qarzi: {fmt(zq)}", "",
+          "Tekshiring: 📦 Astatka, 💵 Kassa, /oy_tafsil " + plans[-1]['period']]
+    await q.message.reply_text('\n'.join(L))
+    ok, msg = await asyncio.to_thread(db_backup_to_github, 'excel import')
+    await q.message.reply_text(("💾 Zaxira: " if ok else "⚠️ Zaxira: ") + msg)
 
 
 # ── TELEGRAM KANAL POSTLAR ────────────────────────────────────────
@@ -5591,10 +6743,20 @@ def main():
     if not ANTHROPIC_KEY: raise ValueError("ANTHROPIC_KEY yo'q!")
     if OWNER_ID == 0: raise ValueError("OWNER_ID yo'q!")
 
-    db_autorestore()
+    _d = os.path.dirname(DB_PATH)
+    if _d: os.makedirs(_d, exist_ok=True)
+    log.info("Baza: %s (%s)", DB_PATH, "Volume — doimiy disk" if db_on_volume() else "vaqtinchalik disk, GitHub zaxira")
+    try:
+        db_autorestore()
+    except Exception as e:
+        log.exception("db_autorestore")
+        _BK['blocked'] = f"tiklashda kutilmagan xato: {str(e)[:120]}"
+        _BK['restore_msg'] = ("⚠️ Ishga tushishda zaxirani tiklashda xato: " + str(e)[:200] +
+                              "\nAvto-zaxira to'xtatildi. /restore ha ni sinab ko'ring.")
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    app = (Application.builder().token(BOT_TOKEN)
+           .post_init(_post_init).post_shutdown(_post_shutdown).build())
 
     OWNER = filters.User(user_id=OWNER_ID)
 
@@ -5704,7 +6866,8 @@ def main():
     app.add_error_handler(on_error)
     log.info("ThermoCrafts Bot v3.0 ishga tushdi! ✅")
     log.info(f"21 modul | {len(get_products())} mahsulot")
-    app.run_polling(drop_pending_updates=True)
+    # drop_pending_updates=False: qayta ishga tushish paytida yozilgan xabarlar (sotuv) yo'qolmasin
+    app.run_polling(drop_pending_updates=False)
 
 if __name__ == '__main__':
     main()
