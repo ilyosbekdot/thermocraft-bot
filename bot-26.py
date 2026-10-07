@@ -742,7 +742,9 @@ def add_expense(amount, category, expense_type='period', note='', cash=True, dat
         add_cash(amount, 'chiqim', category, f'{note} (#x{eid})')
     return eid
 
-def add_transit(supplier, product, qty, unit_cost, deposit=0, bank_fee=0, delivery_fee=0, note=''):
+def add_transit(supplier, product, qty, unit_cost, deposit=0, bank_fee=0, delivery_fee=0, note='', cash_method=None):
+    """cash_method berilsa — avans ('zavod_qarz') va bank/yetkazish ('zavod_xarajat') kassadan chiqim bo'lib
+    shu tranzaksiyada yoziladi (🏭 Zavod buyurtmasi bilan bir xil). Berilmasa — avvalgidek kassaga tegmaydi."""
     total = qty * unit_cost
     real_cost = unit_cost + (bank_fee + delivery_fee) / qty if qty else unit_cost
     remaining = total - deposit
@@ -755,6 +757,17 @@ def add_transit(supplier, product, qty, unit_cost, deposit=0, bank_fee=0, delive
         (now.strftime('%Y-%m-%d'), supplier, product, qty, unit_cost,
          total, deposit, remaining, bank_fee, delivery_fee, real_cost, note))
     tid = c.lastrowid
+    try: c.execute("UPDATE transit SET bs_usul='toliq' WHERE id=?", (tid,))
+    except sqlite3.OperationalError: pass          # ustun hali yo'q (init dan oldin) — keyingi init belgilaydi
+    if cash_method:
+        d_, t_ = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+        if deposit > 0:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d_, t_, 'chiqim', round(deposit, 2), 'zavod_qarz', f"{supplier} zakaz #{tid} avans", cash_method))
+        if (bank_fee or 0) + (delivery_fee or 0) > 0:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d_, t_, 'chiqim', round((bank_fee or 0) + (delivery_fee or 0), 2), 'zavod_xarajat',
+                       f"{supplier} zakaz #{tid} bank/yetkazish", cash_method))
     conn.commit(); conn.close()
     log_op('transit', {'id':tid,'supplier':supplier,'product':product,'qty':qty,'total':total,'deposit':deposit})
     return tid
@@ -3341,10 +3354,9 @@ def balans(sanagacha=None):
     kreditor = c.fetchone()[0] or 0
     c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
     zavod = c.fetchone()[0] or 0
-    # Eski qatorlar: to'langan avans. Zavod buyurtmasi qatorlari (po_id>0): kelmagan donalar landed tannarxda
-    # (majburiyat transit.remaining passivda — buyurtma berish/qabul/to'lov kapitalni o'zgartirmaydi)
-    c.execute("SELECT COALESCE(SUM(CASE WHEN COALESCE(po_id,0)>0 "
-              "THEN MAX(0, qty-COALESCE(received_qty,0))*COALESCE(real_cost,unit_cost,0) ELSE deposit END),0) "
+    # Yo'ldagi tovar: kelmagan donalar landed tannarxda (barcha qatorlar — eski ham, transit_balans_otkaz).
+    # To'lanmagan qismi transit.remaining — passivda. Buyurtma berish / to'lov / qabul kapitalni o'zgartirmaydi.
+    c.execute("SELECT COALESCE(SUM(MAX(0, COALESCE(qty,0)-COALESCE(received_qty,0))*COALESCE(real_cost,unit_cost,0)),0) "
               "FROM transit WHERE status='yolda'")
     yolda = c.fetchone()[0] or 0
     conn.close()
@@ -4232,7 +4244,7 @@ async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t += f"  Kassa              {fmt(bl['naqd'])}\n"
     t += f"  Tovar (sebest)     {fmt(bl['tovar'])}\n"
     if bl['debitor']: t += f"  Debitorlik         {fmt(bl['debitor'])}  (mijozlar bizga qarz)\n"
-    if bl['yolda']:   t += f"  Yo'ldagi avans     {fmt(bl['yolda'])}\n"
+    if bl['yolda']:   t += f"  Yo'ldagi tovar     {fmt(bl['yolda'])}  (tannarxda)\n"
     t += f"  Jami aktiv         {fmt(bl['aktiv'])}\n\n"
     t += "PASSIV\n"
     if bl['zavod_qarzi']: t += f"  Kreditorlik—zavod  {fmt(bl['zavod_qarzi'])}  (biz zavodga qarzmiz)\n"
@@ -7803,6 +7815,7 @@ def hisobot(d1, d2, od1=None, od2=None, nomi=''):
     h['od1'], h['od2'] = od1, od2
     conn.close()
     h['ombor'] = ombor_qiymati()['jami']
+    h['yolda'] = round(balans()['yolda'], 2)
     return h
 
 def _foiz(yangi, eski):
@@ -7826,7 +7839,7 @@ def his_matn(h):
     L.append(f"{'✅' if h['sof'] >= 0 else '🔴'} Sof foyda: {_usd2(h['sof'])} ({h['sof_pct']}%){f('sof')}")
     k = h['kassa']
     L += ["", f"💰 Kassa: +{_usd2(k['jami_kirim'])} / −{_usd2(k['jami_chiqim'])} → qoldiq {_usd2(k['oxiri'])}",
-          f"🏬 Ombor (tannarxda, hozir): {_usd2(h['ombor'])}",
+          f"🏬 Ombor (tannarxda, hozir): {_usd2(h['ombor'])}" + (f" · 🚢 yo'lda {_usd2(h['yolda'])}" if h.get('yolda') else ""),
           f"📥 Bizga qarz (debitorlik): {_usd2(h['debitor'])}",
           f"📤 Bizning qarz (kreditorlik, zavod bilan): {_usd2(h['kreditor'])}"]
     if o: L.append(f"\n↔️ Solishtirish: {h['od1']} … {h['od2']} bilan")
@@ -7922,7 +7935,8 @@ def his_excel(h, path_base):
            ["Bank/yetkazish (to'g'ridan)", h['togri']], ["Yalpi foyda", h['yalpi']], ["Marja %", h['marja']],
            ["Chegirma", h['chegirma']], ["Xarajatlar", h['xarajat']], ["Sof foyda", h['sof']],
            ["Kassa kirim", h['kassa']['jami_kirim']], ["Kassa chiqim", h['kassa']['jami_chiqim']], ["Kassa qoldiq", h['kassa']['oxiri']],
-           ["Ombor qiymati (hozir)", h['ombor']], ["Debitorlik", h['debitor']], ["Kreditorlik", h['kreditor']]]
+           ["Ombor qiymati (hozir)", h['ombor']], ["Yo'ldagi tovar (hozir)", h.get('yolda', 0)],
+           ["Debitorlik", h['debitor']], ["Kreditorlik", h['kreditor']]]
     return _jadval_fayl({
         "Xulosa": xul,
         "Mahsulotlar": [["Mahsulot", "Dona", "Tushum", "Foyda"]] + [[m['nom'], m['dona'], m['tushum'], m['foyda']] for m in sorted(h['mahsulotlar'], key=lambda x: -x['tushum'])],
@@ -8070,7 +8084,30 @@ def init_po_tables():
     c.execute("UPDATE transit SET received_qty=qty WHERE status='keldi' AND COALESCE(received_qty,0)=0 AND COALESCE(po_id,0)=0")
     c.execute('CREATE INDEX IF NOT EXISTS idx_transit_po ON transit(po_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_po_log ON po_status_log(po_id)')
+    transit_balans_otkaz(c)
     conn.commit(); conn.close()
+
+def transit_balans_otkaz(c):
+    """Eski transit qatorlarini yangi balans usuliga belgilaydi (idempotent, ma'lumot o'zgarmaydi).
+    Eski usul: aktivda faqat to'langan avans (deposit) edi — to'lov kapitalni sun'iy oshirardi, buyurtma kamaytirardi.
+    Yangi usul: kelmagan donalar × landed tannarx aktivda, transit.remaining passivda (balans() ga qarang).
+    Asl qiymatlar bs_asl ga yoziladi (qaytarish/tekshirish uchun). Qaytaradi: o'tkazilgan qatorlar soni."""
+    for ddl in ("ALTER TABLE transit ADD COLUMN bs_usul TEXT DEFAULT ''",
+                "ALTER TABLE transit ADD COLUMN bs_asl TEXT DEFAULT ''"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass
+    c.execute("SELECT id, status, qty, COALESCE(received_qty,0), unit_cost, total_cost, deposit, remaining, real_cost, "
+              "bank_fee, delivery_fee FROM transit WHERE COALESCE(bs_usul,'')=''")
+    rows = c.fetchall(); sana = today()
+    for r in rows:
+        asl = {'v': 1, 'sana': sana, 'status': r[1], 'qty': r[2], 'received_qty': r[3], 'unit_cost': r[4], 'total_cost': r[5],
+               'deposit': r[6], 'remaining': r[7], 'real_cost': r[8], 'bank_fee': r[9], 'delivery_fee': r[10],
+               'eski_aktiv': (r[6] or 0) if r[1] == 'yolda' else 0}
+        c.execute("UPDATE transit SET bs_usul='toliq', bs_asl=? WHERE id=? AND COALESCE(bs_usul,'')=''",
+                  (json.dumps(asl, ensure_ascii=False), r[0]))
+    if rows:
+        log.info(f"Transit: {len(rows)} ta qator yangi balans usuliga o'tkazildi (asl qiymatlar bs_asl da)")
+    return len(rows)
 
 def _po_kim(user):
     return (user[1] if isinstance(user, (tuple, list)) and len(user) > 1 else str(user or '')) or ''
@@ -8149,8 +8186,8 @@ def zavod_yarat(supplier, lines, deposit=0, bank_fee=0, delivery_fee=0, expected
         if holat != 'buyurtma': _po_log(c, po, holat, f"avans {_usd2(deposit)}", user)
         for (pid, q, cst), v, dep in zip(toza, qiymat, _taqsimla(deposit, qiymat), strict=True):
             c.execute('''INSERT INTO transit (date, supplier, product, qty, unit_cost, total_cost, deposit, remaining,
-                         bank_fee, delivery_fee, real_cost, status, note, po_id, received_qty, expected_date, product_id)
-                         VALUES (?,?,?,?,?,?,?,?,0,0,?,'yolda',?,?,0,?,?)''',
+                         bank_fee, delivery_fee, real_cost, status, note, po_id, received_qty, expected_date, product_id, bs_usul)
+                         VALUES (?,?,?,?,?,?,?,?,0,0,?,'yolda',?,?,0,?,?,'toliq')''',
                       (d, supplier, nomlar[pid], q, cst, v, dep, round(v - dep, 2), cst, f"zakaz #Z{po}", po, expected or '', pid))
         if bank_fee: _po_xarajat_tx(c, po, bank_fee, 'bank')
         if delivery_fee: _po_xarajat_tx(c, po, delivery_fee, 'yetkazish')
@@ -8943,7 +8980,9 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         delivery_fee = float(parsed.get('delivery_fee', 0))
         if not product or unit_cost <= 0:
             await u.message.reply_text("❌ Mahsulot va narx kiriting"); return
-        tid = add_transit(supplier, product, qty, unit_cost, deposit, bank_fee, delivery_fee)
+        if is_closed(today()):
+            await u.message.reply_text(f"❌ {today()[:7]} davri yopilgan (/och)"); return
+        tid = add_transit(supplier, product, qty, unit_cost, deposit, bank_fee, delivery_fee, cash_method='naqd')
         total = qty * unit_cost
         real = unit_cost + (bank_fee+delivery_fee)/qty if qty else unit_cost
         kb = [[InlineKeyboardButton(f"✅ #{tid} Keldi", callback_data=f"arrive_{tid}")]]
@@ -8979,10 +9018,13 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tid = int(parsed.get('id', 0))
         amount = float(parsed.get('amount', 0))
         if tid and amount > 0:
-            pay_transit_deposit(tid, amount)
-            await u.message.reply_text(
-                f"✅ *To'lov qayd!*\nZakaz #{tid}: +{fmt(amount)} to'landi",
-                parse_mode='Markdown')
+            r = await asyncio.to_thread(pay_debt, 'kreditorlik', '', amount, 'naqd', f"zakaz #{tid}", [tid])
+            if r.get('ok'):
+                await u.message.reply_text(
+                    f"✅ *To'lov qayd!*\nZakaz #{tid}: +{fmt(r['paid'])} to'landi (kassadan)\nQolgan qarz: {fmt(r['qoldiq'])}",
+                    parse_mode='Markdown')
+            else:
+                await u.message.reply_text("❌ " + r.get('error', 'Xato'))
         else:
             await u.message.reply_text("❌ Zakaz ID va summa kiriting")
 
