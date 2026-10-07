@@ -410,6 +410,8 @@ def init_db():
             ('2026-09-01','Two Trees','Oldingi partiya qoldighi',1,805,805,0,805,'qarz','boshlangich_qarz'))
 
     conn.commit(); conn.close()
+    init_stock_tables()          # ombor jurnali + boshlang'ich qoldiq (idempotent)
+    init_po_tables()             # zavod buyurtmalari (8-bosqich, idempotent)
     log.info("DB tayyor!")
 
 
@@ -520,6 +522,7 @@ def add_product(name, cat, sup, qty, cost, price, factory_price=0, warranty_days
         c.execute('INSERT INTO products (name,cat,supplier,qty,cost,price,factory_price,warranty_days) VALUES (?,?,?,?,?,?,?,?)',
                   (name, cat, sup, qty, cost, price, factory_price, warranty_days))
         pid = c.lastrowid
+        if qty: _sm_yoz(c, pid, name, int(qty), int(qty), 'yangi_tovar', cost)
         conn.commit(); conn.close()
         log_op('add_product', {'name':name,'cat':cat,'qty':qty,'cost':cost,'price':price})
         return pid
@@ -531,7 +534,9 @@ def add_product(name, cat, sup, qty, cost, price, factory_price=0, warranty_days
 def update_product(pid, **kwargs):
     conn = db(); c = conn.cursor()
     for k, v in kwargs.items():
-        if k in ('name','cat','supplier','qty','cost','price','factory_price','warranty_days','active'):
+        if k == 'qty':
+            stock_set(c, pid, int(v), 'tuzatish', 'update_product')
+        elif k in ('name','cat','supplier','cost','price','factory_price','warranty_days','active'):
             c.execute(f'UPDATE products SET {k}=? WHERE id=?', (v, pid))
     conn.commit(); conn.close()
 
@@ -556,12 +561,11 @@ def _sotuv_tx(c, now, pid, pname, qty, price, cost, discount=0, customer='', cty
     revenue = round(price * qty, 2)              # pul — sentgacha (313.3333*3 = 939.9999 bo'lib qolmasin)
     profit = round(revenue - (cost or 0) * qty, 2)
     d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
-    c.execute('UPDATE products SET qty=qty-? WHERE id=? AND qty>=?', (qty, pid, qty))
-    if c.rowcount == 0:
-        return None
     c.execute('INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) VALUES (?,?,?,?,?,?,?,?,?,?)',
               (d, t, pname, qty, cost, revenue, profit, discount, customer, ctype))
     sale_id = c.lastrowid
+    if stock_move(c, pid, -qty, 'sotuv', ref=f's{sale_id}', user=(seller_id, seller_name), unit_cost=cost, now=now) is None:
+        return None                              # astatka yetmadi — chaqiruvchi rollback qiladi (sotuv ham yozilmaydi)
     if seller_id or seller_name:
         c.execute('UPDATE sales SET seller_id=?, seller_name=? WHERE id=?', (int(seller_id or 0), seller_name or '', sale_id))
     # Kafolat
@@ -695,7 +699,12 @@ def reverse_sale(sale_id):
         c.execute('UPDATE sales SET reversed=1 WHERE id=? AND reversed=0', (sale_id,))
         if c.rowcount == 0:
             conn.rollback(); conn.close(); return False
-        c.execute('UPDATE products SET qty=qty+? WHERE name=?', (qty, product))
+        c.execute("SELECT product_id FROM stock_moves WHERE kind='sotuv' AND ref=? ORDER BY id DESC LIMIT 1", (f's{sale_id}',))
+        pr = c.fetchone()
+        if not pr:
+            c.execute('SELECT id FROM products WHERE name=?', (product,)); pr = c.fetchone()
+        if pr:
+            stock_move(c, pr[0], qty, 'qaytish', reason='sotuv bekor', ref=f's{sale_id}', unit_cost=row[5], allow_negative=True)
         c.execute("UPDATE warranties SET status='cancelled' WHERE sale_id=?", (sale_id,))
         c.execute("SELECT COUNT(*) FROM cash_box WHERE type='kirim' AND note LIKE ?", (f'%(#{sale_id})',))
         if c.fetchone()[0] > 0:
@@ -760,6 +769,9 @@ def arrive_transit(tid):
     # 8 remaining,9 bank_fee,10 delivery_fee,11 real_cost (avval row[10] — DOSTAVKA summasi — sebest deb yozilardi)
     product, qty, real_cost = row[3], row[4] or 0, row[11]
     if real_cost is None: real_cost = row[5] or 0
+    c.execute('SELECT COALESCE(received_qty,0), COALESCE(po_id,0) FROM transit WHERE id=?', (tid,))
+    _rq, _po = c.fetchone()
+    qty = max(0, qty - _rq)                  # 8-bosqich: qisman kelgan bo'lsa — faqat qolgani
     # Mahsulot: avval aniq nom, keyin yagona moslik, oxirida eski LIKE usuli
     c.execute('SELECT id, qty, cost FROM products WHERE name=?', (product,))
     pid_row = c.fetchone()
@@ -770,12 +782,15 @@ def arrive_transit(tid):
         c.execute('SELECT id, qty, cost FROM products WHERE name LIKE ?', (f'%{product}%',))
         pid_row = c.fetchone()
     now = datetime.now().strftime('%Y-%m-%d')
-    c.execute("UPDATE transit SET status='keldi', arrived_date=? WHERE id=?", (now, tid))
-    if pid_row:
+    c.execute("UPDATE transit SET status='keldi', arrived_date=?, received_qty=qty WHERE id=?", (now, tid))
+    if pid_row and qty > 0:
         pid, old_q, old_c = pid_row[0], max(0, pid_row[1] or 0), pid_row[2] or 0
         jami_q = old_q + qty
         new_cost = round((old_q * old_c + qty * real_cost) / jami_q, 2) if jami_q > 0 else real_cost
-        c.execute('UPDATE products SET qty=qty+?, cost=? WHERE id=?', (qty, new_cost, pid))
+        stock_move(c, pid, qty, 'zavod_kirim', reason=f"zakaz #{tid}", ref=f't{tid}', unit_cost=real_cost,
+                   new_cost=new_cost, supplier=row[2] or '', allow_negative=True)
+    if _po:
+        _po_holat_avto(c, _po)
     conn.commit(); conn.close()
     return {'product': product, 'qty': qty, 'real_cost': real_cost, 'found': bool(pid_row)}
 
@@ -994,7 +1009,7 @@ def ochiq_qarzlar(turi):
     conn.close()
     return {k: round(v, 2) for k, v in out.items()}
 
-def pay_debt(kind, person, amount, method='naqd', note=''):
+def pay_debt(kind, person, amount, method='naqd', note='', transit_ids=None):
     """Qarz to'lovi BITTA tranzaksiyada.
     debitorlik — mijoz bizga to'ladi: kassaga KIRIM, mijozning ochiq debitorligi eng eskisidan (FIFO) kamayadi.
     kreditorlik — biz to'ladik: kassadan CHIQIM, zavod qoldig'i (transit.remaining) va boshqa kreditorlik FIFO kamayadi.
@@ -1023,6 +1038,16 @@ def pay_debt(kind, person, amount, method='naqd', note=''):
             c.execute("SELECT id, date, supplier, remaining FROM transit WHERE remaining>0")
             tr = c.fetchall()
         nomlar = [d[2] for d in debts] + [t[2] for t in tr]
+        if transit_ids is not None:
+            # Faqat ko'rsatilgan zavod buyurtmasi qatorlari (🏭 Zavod → To'lov); boshqa qarzlarga tegmaydi
+            ids_ = {int(i) for i in transit_ids}
+            tr = [t for t in tr if t[0] in ids_] if turi == KREDITOR else []
+            debts = []
+            if not tr:
+                conn.close()
+                return {'ok': False, 'error': "Bu buyurtma bo'yicha ochiq qarz topilmadi"}
+            person = tr[0][2] or person
+            nomlar = [t[2] for t in tr]
         tanlangan, nomzod = _nom_tanla(person, nomlar)
         if not tanlangan:
             conn.close()
@@ -1220,10 +1245,304 @@ def get_last_ops(n=10):
     c.execute('SELECT * FROM op_log WHERE reversed=0 ORDER BY id DESC LIMIT ?', (n,))
     rows = c.fetchall(); conn.close(); return rows
 
-def add_qty(pid, delta):
+def add_qty(pid, delta, kind=None, reason='', user=None):
+    """Astatkaga qo'shadi/ayiradi (avvalgidek 0 dan pastga tushmaydi) — ombor jurnali orqali."""
     conn = db(); c = conn.cursor()
-    c.execute('UPDATE products SET qty=MAX(0,qty+?) WHERE id=?', (delta, pid))
+    try:
+        c.execute('SELECT COALESCE(qty,0) FROM products WHERE id=?', (pid,))
+        r = c.fetchone()
+        if r:
+            d = max(int(delta), -max(0, r[0]))
+            stock_move(c, pid, d, kind or ('kirim' if d >= 0 else 'tuzatish'), reason, user=user, allow_negative=True)
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+
+# ── OMBOR JURNALI (stock ledger) ──────────────────────────────────
+# Har bir astatka o'zgarishi stock_moves ga yoziladi — o'sha tranzaksiyada (stock_move orqali).
+# Qoida: SUM(stock_moves.qty) == products.qty (har mahsulot uchun). Ishga tushishda ombor_moslash() tekshiradi.
+OMBOR_TURLARI = {
+    'boshlangich': "Boshlang'ich qoldiq", 'sotuv': 'Sotuv', 'qaytish': 'Sotuv bekor / qaytish',
+    'kirim': 'Kirim', 'zavod_kirim': 'Zavoddan keldi', 'chiqim': 'Chiqim (spisanie)',
+    'inventar': 'Inventarizatsiya', 'tuzatish': 'Tuzatish', 'yangi_tovar': 'Yangi tovar',
+}
+CHIQIM_SABABLARI = (('brak', 'Brak'), ('yoqoldi', "Yo'qoldi"), ('namuna', 'Namuna'), ('ichki', 'Ichki ishlatish'))
+CHIQIM_SABAB_NOMI = dict(CHIQIM_SABABLARI)
+
+def init_stock_tables():
+    """Additiv: stock_moves jadvali, products.min_qty; har mahsulot uchun boshlang'ich qoldiq (idempotent)."""
+    conn = db(); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS stock_moves (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, time TEXT,
+        product_id INTEGER, product TEXT, kind TEXT, qty INTEGER, balance INTEGER,
+        unit_cost REAL DEFAULT 0, reason TEXT DEFAULT '', ref TEXT DEFAULT '',
+        user_id INTEGER DEFAULT 0, user_name TEXT DEFAULT '', supplier TEXT DEFAULT ''
+    )''')
+    try: c.execute("CREATE INDEX IF NOT EXISTS ix_sm_pid ON stock_moves(product_id, id)")
+    except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE products ADD COLUMN min_qty INTEGER DEFAULT 0")
+    except sqlite3.OperationalError: pass
+    ombor_moslash(c)
     conn.commit(); conn.close()
+
+def ombor_moslash(c):
+    """Jurnal yig'indisi products.qty ga teng bo'lmasa — farqni bitta yozuv bilan tenglashtiradi.
+    Jurnali yo'q mahsulot: 'boshlangich'; aks holda (jurnalsiz o'zgarish bo'lgan) 'tuzatish'. Qaytaradi: yozuvlar soni."""
+    c.execute("SELECT p.id, p.name, COALESCE(p.qty,0), COALESCE(p.cost,0), "
+              "(SELECT COALESCE(SUM(m.qty),0) FROM stock_moves m WHERE m.product_id=p.id), "
+              "(SELECT COUNT(*) FROM stock_moves m WHERE m.product_id=p.id) FROM products p")
+    n = 0
+    for pid, name, q, cost, s, cnt in c.fetchall():
+        if q != s:
+            _sm_yoz(c, pid, name, q - s, q, 'boshlangich' if cnt == 0 else 'tuzatish', cost,
+                    reason='' if cnt == 0 else "avtomatik tenglash (jurnalsiz o'zgarish)")
+            n += 1
+    return n
+
+def _sm_yoz(c, pid, name, delta, balance, kind, unit_cost=0, reason='', ref='', user=None, supplier='', now=None):
+    now = now or datetime.now()
+    uid, uname = (user or (0, ''))[:2]
+    c.execute("INSERT INTO stock_moves (date,time,product_id,product,kind,qty,balance,unit_cost,reason,ref,user_id,user_name,supplier) "
+              "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'), pid, name, kind, int(delta), int(balance),
+               round(float(unit_cost or 0), 4), reason or '', ref or '', int(uid or 0), uname or '', supplier or ''))
+    return c.lastrowid
+
+def stock_move(c, pid, delta, kind, reason='', ref='', user=None, unit_cost=None, new_cost=None,
+               supplier='', allow_negative=False, now=None):
+    """YAGONA astatka o'zgartirish nuqtasi (chaqiruvchining tranzaksiyasi ichida).
+    delta<0 va astatka yetmasa (allow_negative=False) — hech narsa qilmaydi, None qaytaradi.
+    Qaytaradi: (move_id, yangi_qoldiq)."""
+    c.execute('SELECT name, COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+    r = c.fetchone()
+    if not r: return None
+    name, q, cost = r
+    delta = int(delta)
+    if delta < 0 and not allow_negative:
+        c.execute('UPDATE products SET qty=qty+? WHERE id=? AND qty>=?', (delta, pid, -delta))
+        if c.rowcount == 0: return None
+    elif delta != 0:
+        c.execute('UPDATE products SET qty=qty+? WHERE id=?', (delta, pid))
+    if new_cost is not None:
+        c.execute('UPDATE products SET cost=? WHERE id=?', (round(float(new_cost), 2), pid))
+    bal = q + delta
+    if delta == 0: return (0, bal)
+    mid = _sm_yoz(c, pid, name, delta, bal, kind, cost if unit_cost is None else unit_cost,
+                  reason, ref, user, supplier, now)
+    return (mid, bal)
+
+def stock_set(c, pid, new_qty, kind='tuzatish', reason='', ref='', user=None, new_cost=None):
+    """Astatkani aniq songa o'rnatadi (farq jurnalga yoziladi)."""
+    c.execute('SELECT COALESCE(qty,0) FROM products WHERE id=?', (pid,))
+    r = c.fetchone()
+    if not r: return None
+    return stock_move(c, pid, int(new_qty) - r[0], kind, reason, ref, user, new_cost=new_cost, allow_negative=True)
+
+def ombor_tarix(pid, limit=8, offset=0):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, date, time, kind, qty, balance, unit_cost, reason, ref, user_name, supplier "
+              "FROM stock_moves WHERE product_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (pid, limit, offset))
+    rows = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM stock_moves WHERE product_id=?", (pid,))
+    n = c.fetchone()[0]; conn.close()
+    return rows, n
+
+def ombor_tekshir():
+    """[(pid, nom, qty, jurnal_yigindisi)] — mos kelmaganlar (bo'sh bo'lishi kerak)."""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT p.id, p.name, COALESCE(p.qty,0), (SELECT COALESCE(SUM(m.qty),0) FROM stock_moves m WHERE m.product_id=p.id) "
+              "FROM products p")
+    rows = [r for r in c.fetchall() if r[2] != r[3]]; conn.close()
+    return rows
+
+def _ombor_davr_tekshir():
+    if is_closed(today()):
+        return f"{today()[:7]} davri yopilgan — yozib bo'lmaydi (/och {today()[:7]})"
+    return None
+
+def ombor_kirim(pid, qty, unit_cost, supplier='', pay='none', user=None, note=''):
+    """Qo'lda kirim: astatka +qty, tannarx o'rtacha tortilgan (IAS 2).
+    pay: 'cash' — kassadan chiqim; 'debt' — yetkazuvchiga kreditorlik; 'none' — pulsiz (faqat astatka)."""
+    xato = _ombor_davr_tekshir()
+    if xato: return {'ok': False, 'error': xato}
+    try: qty = int(qty); unit_cost = round(float(unit_cost), 2)
+    except (TypeError, ValueError): return {'ok': False, 'error': "Son yoki narx noto'g'ri"}
+    if qty <= 0 or unit_cost < 0: return {'ok': False, 'error': "Son musbat, narx manfiy bo'lmasin"}
+    if pay == 'debt' and not (supplier or '').strip():
+        return {'ok': False, 'error': "Qarzga kirim uchun yetkazuvchi kerak"}
+    now = datetime.now(); d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute('SELECT name, COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+        r = c.fetchone()
+        if not r: conn.close(); return {'ok': False, 'error': 'Mahsulot topilmadi'}
+        name, q, cost = r
+        baza = max(0, q)
+        new_cost = round((baza * cost + qty * unit_cost) / (baza + qty), 2) if baza + qty > 0 else unit_cost
+        c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)', (d, t, 'stock', '{}'))
+        op_id = c.lastrowid
+        mid, bal = stock_move(c, pid, qty, 'kirim', note, f'op{op_id}', user, unit_cost, new_cost, supplier)
+        summa = round(qty * unit_cost, 2); cash_id = debt_id = None
+        if pay == 'cash' and summa > 0:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d, t, 'chiqim', summa, 'tovar_xarid', f"{name} x{qty} kirim (#m{op_id})", 'naqd'))
+            cash_id = c.lastrowid
+        elif pay == 'debt' and summa > 0:
+            c.execute('INSERT INTO debts (date,person,amount,type,note) VALUES (?,?,?,?,?)',
+                      (d, supplier.strip(), summa, KREDITOR, f"tovar kirim: {name} x{qty} (#m{op_id})"))
+            debt_id = c.lastrowid
+        data = {'kind': 'kirim', 'pid': pid, 'product': name, 'qty': qty, 'unit_cost': unit_cost,
+                'old_cost': cost, 'move_ids': [mid], 'cash_id': cash_id, 'debt_id': debt_id, 'supplier': supplier,
+                'summa': summa, 'pay': pay}
+        c.execute('UPDATE op_log SET data_json=? WHERE id=?', (json.dumps(data, ensure_ascii=False), op_id))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'op_id': op_id, 'product': name, 'balance': bal, 'new_cost': new_cost, 'summa': summa}
+
+def ombor_chiqim(pid, qty, sabab, user=None, note=''):
+    """Chiqim / spisanie: astatka −qty, tannarx bo'yicha XARAJAT yoziladi (kassaga tegmaydi)."""
+    xato = _ombor_davr_tekshir()
+    if xato: return {'ok': False, 'error': xato}
+    if sabab not in CHIQIM_SABAB_NOMI: return {'ok': False, 'error': "Sabab noma'lum"}
+    try: qty = int(qty)
+    except (TypeError, ValueError): qty = 0
+    if qty <= 0: return {'ok': False, 'error': "Son musbat bo'lsin"}
+    now = datetime.now(); d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute('SELECT name, COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+        r = c.fetchone()
+        if not r: conn.close(); return {'ok': False, 'error': 'Mahsulot topilmadi'}
+        name, cost = r
+        c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)', (d, t, 'stock', '{}'))
+        op_id = c.lastrowid
+        res = stock_move(c, pid, -qty, 'chiqim', CHIQIM_SABAB_NOMI[sabab] + (f": {note}" if note else ''),
+                         f'op{op_id}', user, cost)
+        if res is None:
+            conn.rollback(); conn.close(); return {'ok': False, 'error': "Astatka yetmaydi"}
+        summa = round(qty * cost, 2); eid = None
+        if summa > 0:
+            c.execute('INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)',
+                      (d, summa, 'spisanie', 'period', f"{CHIQIM_SABAB_NOMI[sabab]}: {name} x{qty} (#m{op_id})"))
+            eid = c.lastrowid
+        data = {'kind': 'chiqim', 'pid': pid, 'product': name, 'qty': qty, 'sabab': sabab,
+                'move_ids': [res[0]], 'expense_id': eid, 'summa': summa}
+        c.execute('UPDATE op_log SET data_json=? WHERE id=?', (json.dumps(data, ensure_ascii=False), op_id))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'op_id': op_id, 'product': name, 'balance': res[1], 'summa': summa}
+
+def ombor_inventar(sanoq, user=None):
+    """sanoq: {pid: (tizimdagi_son_sanash_paytida, sanalgan_son)}. Farq = sanalgan − tizimdagi
+    (sanash paytidan keyingi sotuvlar saqlanadi). Kamomad tannarx bo'yicha xarajat ('inventar_kamomad').
+    Ortiqcha — faqat astatka (foyda sifatida yozilmaydi)."""
+    xato = _ombor_davr_tekshir()
+    if xato: return {'ok': False, 'error': xato}
+    now = datetime.now(); d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)', (d, t, 'stock', '{}'))
+        op_id = c.lastrowid
+        moves = []; kamomad = 0.0; qatorlar = []
+        for pid, (tizim, sanalgan) in sanoq.items():
+            farq = int(sanalgan) - int(tizim)
+            if farq == 0: continue
+            c.execute('SELECT name, COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+            r = c.fetchone()
+            if not r: continue
+            farq = max(farq, -r[1])                 # astatka manfiy bo'lmasin
+            if farq == 0: continue
+            mid, bal = stock_move(c, pid, farq, 'inventar', f"sanoq: tizim {tizim} → {sanalgan}", f'op{op_id}', user,
+                                  r[2], allow_negative=True)
+            moves.append(mid)
+            if farq < 0: kamomad += -farq * r[2]
+            qatorlar.append({'pid': pid, 'product': r[0], 'farq': farq, 'qoldiq': bal, 'summa': round(farq * r[2], 2)})
+        eid = None
+        kamomad = round(kamomad, 2)
+        if kamomad > 0:
+            c.execute('INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)',
+                      (d, kamomad, 'inventar_kamomad', 'period', f"inventarizatsiya kamomadi (#m{op_id})"))
+            eid = c.lastrowid
+        if not moves:
+            conn.rollback(); conn.close()
+            return {'ok': True, 'op_id': None, 'qatorlar': [], 'kamomad': 0.0}
+        c.execute('UPDATE op_log SET data_json=? WHERE id=?',
+                  (json.dumps({'kind': 'inventar', 'move_ids': moves, 'expense_id': eid, 'qatorlar': qatorlar,
+                               'kamomad': kamomad}, ensure_ascii=False), op_id))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'op_id': op_id, 'qatorlar': qatorlar, 'kamomad': kamomad}
+
+def ombor_undo(op_id):
+    """Ombor operatsiyasini bekor qiladi (teskari harakatlar + xarajat/kassa/qarz) — bitta tranzaksiyada."""
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("SELECT date, data_json FROM op_log WHERE id=? AND op_type='stock' AND reversed=0", (op_id,))
+        r = c.fetchone()
+        if not r: conn.close(); return False, "Topilmadi yoki allaqachon qaytarilgan"
+        for s in (r[0], today()):
+            if is_closed(s):
+                conn.close(); return False, f"{s[:7]} davri yopilgan (/och {s[:7]})"
+        d = json.loads(r[1] or '{}')
+        for mid in d.get('move_ids', []):
+            c.execute("SELECT product_id, qty FROM stock_moves WHERE id=?", (mid,))
+            m = c.fetchone()
+            if not m: continue
+            res = stock_move(c, m[0], -m[1], 'tuzatish', f"bekor: op #{op_id}", f'op{op_id}u')
+            if res is None:
+                conn.rollback(); conn.close()
+                return False, "Astatka yetmaydi — kirim qilingan tovar allaqachon sotilgan"
+        if d.get('kind') == 'kirim' and d.get('old_cost') is not None:
+            c.execute('UPDATE products SET cost=? WHERE id=?', (d['old_cost'], d['pid']))
+        if d.get('expense_id'):
+            c.execute('UPDATE expenses SET reversed=1 WHERE id=?', (d['expense_id'],))
+        if d.get('cash_id'):
+            now = datetime.now()
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'), 'kirim', d.get('summa', 0), 'qaytarish',
+                       f"kirim bekor (#m{op_id})", 'naqd'))
+        if d.get('debt_id'):
+            c.execute('UPDATE debts SET paid=1, note=note || ? WHERE id=?', (f" | bekor (#m{op_id})", d['debt_id']))
+        c.execute('UPDATE op_log SET reversed=1 WHERE id=?', (op_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return True, "qaytarildi"
+
+def kam_qolganlar():
+    """min_qty belgilangan va qoldig'i shundan oshmagan faol mahsulotlar."""
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("SELECT id, name, cat, COALESCE(qty,0), COALESCE(min_qty,0), price FROM products "
+                  "WHERE active=1 AND COALESCE(min_qty,0)>0 AND COALESCE(qty,0)<=min_qty ORDER BY qty, name")
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return [{'id': r[0], 'name': r[1], 'cat': r[2], 'qty': r[3], 'min': r[4], 'price': r[5]} for r in rows]
+
+def set_min_qty(pid, n):
+    conn = db(); c = conn.cursor()
+    c.execute('UPDATE products SET min_qty=? WHERE id=?', (max(0, int(n)), pid))
+    ok = c.rowcount > 0; conn.commit(); conn.close()
+    return ok
+
+def ombor_qiymati():
+    """Tannarx bo'yicha ombor qiymati: {'jami','dona','kat':{cat:(dona, qiymat)}}"""
+    kat = defaultdict(lambda: [0, 0.0]); jami = 0.0; dona = 0
+    for p in get_products():
+        q = max(0, p['qty'] or 0); v = q * (p['cost'] or 0)
+        kat[p['cat'] or 'Boshqa'][0] += q; kat[p['cat'] or 'Boshqa'][1] += v
+        jami += v; dona += q
+    return {'jami': round(jami, 2), 'dona': dona, 'kat': {k: (v[0], round(v[1], 2)) for k, v in kat.items()}}
 
 
 # ── ABC/XYZ TAHLIL (IAS 2 + CV formula) ──────────────────────────
@@ -1584,7 +1903,9 @@ def _undo_op(op_id: int):
     if not op:
         return False, "Topilmadi yoki allaqachon qaytarilgan"
     if op[3] == 'debt_payment':
-        return reverse_debt_payment(op_id)       # o'zi atomik: qarz + kassa + op_log bitta tranzaksiyada
+        return reverse_debt_payment(op_id)
+    if op[3] == 'stock':
+        return ombor_undo(op_id)                 # kirim / chiqim / inventarizatsiya — atomik       # o'zi atomik: qarz + kassa + op_log bitta tranzaksiyada
     d = json.loads(op[4]); ok = False
     if op[3] == 'sale':
         ok = reverse_sale(d.get('sale_id', 0))
@@ -2711,6 +3032,8 @@ async def _scheduler(app):
         now = _local_now(); key = now.strftime('%Y-%m-%d %H:%M'); hm = now.strftime('%H:%M')
         if hm == bm and ('m' + key[:10]) not in sent:
             sent.add('m' + key[:10]); await _briefing(app, 'morning')
+            try: await _ertalab_ogohlantirish(app)
+            except Exception: log.exception("ertalab ogohlantirish")
         if hm == be and ('e' + key[:10]) not in sent:
             sent.add('e' + key[:10]); await _briefing(app, 'evening')
         # Eski kunlarni tozalash (avval sent.clear() — xuddi shu daqiqada xulosa ikkinchi marta ketishi mumkin edi)
@@ -3018,7 +3341,11 @@ def balans(sanagacha=None):
     kreditor = c.fetchone()[0] or 0
     c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
     zavod = c.fetchone()[0] or 0
-    c.execute("SELECT COALESCE(SUM(deposit),0) FROM transit WHERE status='yolda'")
+    # Eski qatorlar: to'langan avans. Zavod buyurtmasi qatorlari (po_id>0): kelmagan donalar landed tannarxda
+    # (majburiyat transit.remaining passivda — buyurtma berish/qabul/to'lov kapitalni o'zgartirmaydi)
+    c.execute("SELECT COALESCE(SUM(CASE WHEN COALESCE(po_id,0)>0 "
+              "THEN MAX(0, qty-COALESCE(received_qty,0))*COALESCE(real_cost,unit_cost,0) ELSE deposit END),0) "
+              "FROM transit WHERE status='yolda'")
     yolda = c.fetchone()[0] or 0
     conn.close()
     tovar = sum(p['qty'] * p['cost'] for p in get_products())
@@ -4506,7 +4833,36 @@ MENU_MAP = {
     "🔄 Aylanish": "aylanish",
     "📋 Qarz yoshi": "qarz_yosh",
     "🔍 Raqobat": "raqobat",
+    # 5–8-bosqich: yangi asosiy menyu
+    "📦 Ombor": "ombor",
+    "📊 Hisobotlar": "hisobotlar",
+    "🏭 Zavod": "zavod_ui",
+    "⚙️ Boshqa": "boshqa",
+    "⬅️ Asosiy menyu": "asosiy",
 }
+
+# Egasi/admin asosiy menyusi (5–8-bosqich). Eski to'liq menyu — "⚙️ Boshqa" ichida, barcha eski tugmalar ishlaydi.
+ASOSIY_KB = [["🛒 Sotuv", "📦 Ombor"], ["👥 Mijozlar", "📊 Hisobotlar"], ["🏭 Zavod", "👷 Sotuvchilar"], ["⚙️ Boshqa"]]
+# Olib tashlangan (yangi ekran to'liq qoplaydi): 📦 Astatka → 📦 Ombor; 💰 Bugun / 📈 Oylik / 📅 Yillik → 📊 Hisobotlar;
+# 💳 Zavod qarzi → 🏭 Zavod → Zavodlar balansi; 💳 Qarzlar → 👥 Mijozlar → Qarzdorlar/Kreditorlar;
+# 💵 Cash Flow → 📊 Hisobotlar → 💰 Kassa; 👥 Mijozlar (takror). Buyruqlari (/astatka, /bugun, /oy ...) qoladi.
+OLIB_TASHLANGAN_TUGMALAR = {"📦 Astatka", "💰 Bugun", "📈 Oylik", "📅 Yillik", "💳 Zavod qarzi", "💳 Qarzlar", "💵 Cash Flow"}
+ESKI_KB = [
+    ["🚚 Yo'lda",     "💵 Kassa"],
+    ["💵 Narxlar",    "💸 Xarajatlar"],
+    ["📊 Analiz",     "📈 Moliya"],
+    ["🔁 Qayta",      "📉 Nelikvid"],
+    ["🔄 Aylanish",   "📈 Trend"],
+    ["📊 Dashboard",  "🎯 Maqsad"],
+    ["🔧 Kafolat",    "🔔 Eslatmalar"],
+    ["📡 Kanallar",   "📣 Reklama"],
+    ["🔍 Raqobat",    "📢 OLX"],
+    ["➕ Yangi tovar", "↩️ Qayt etish"],
+    ["⬅️ Asosiy menyu"],
+]
+
+def _asosiy_kb():
+    return ReplyKeyboardMarkup(ASOSIY_KB, resize_keyboard=True, is_persistent=True)
 
 async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     """Menyu tugmasini tegishli bo'limga yo'naltiradi"""
@@ -4521,7 +4877,7 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'supplier_debt': await cmd_zavod_qarz(u, ctx)
     elif action == 'prices':        await cmd_narxlar(u, ctx)
     elif action == 'analiz':        await cmd_analiz(u, ctx)
-    elif action == 'customers':     await cmd_mijozlar_yangi(u, ctx)
+    elif action == 'customers':     await cmd_mijozlar_ui(u, ctx)          # tugmali (eski ro'yxat: /mijozlar)
     elif action == 'reorder':       await cmd_qayta(u, ctx)
     elif action == 'kanallar':      await cmd_kanallar(u, ctx)
     elif action == 'debts':         await cmd_qarzlar(u, ctx)
@@ -4546,6 +4902,16 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'qoldiq':        await cmd_qoldiq(u, ctx)
     elif action == 'mening':        await cmd_mening(u, ctx)
     elif action == 'yordam':        await cmd_yordam(u, ctx)
+    elif action == 'ombor':         await cmd_ombor(u, ctx)
+    elif action == 'hisobotlar':    await cmd_hisobotlar(u, ctx)
+    elif action == 'zavod_ui':      await cmd_zavod_ui(u, ctx)
+    elif action == 'boshqa':
+        if can(u, 'boshqaruv'):
+            await u.message.reply_text("⚙️ Boshqa bo'limlar. Qaytish: ⬅️ Asosiy menyu",
+                                       reply_markup=ReplyKeyboardMarkup(ESKI_KB, resize_keyboard=True, is_persistent=True))
+    elif action == 'asosiy':
+        if can(u, 'boshqaruv'):
+            await u.message.reply_text("🏠 Asosiy menyu", reply_markup=_asosiy_kb())
     elif action == 'reklama_menu':
         await u.message.reply_text(
             "\U0001F4E3 *Reklama yuborish*\n\nFormat: `/reklama Xabar matni`\n\n"
@@ -4618,25 +4984,12 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await cmd_start_sotuvchi(u, ctx)
     if not can(u, 'boshqaruv'): return
     rate = get_exchange_rate()
-    kb = ReplyKeyboardMarkup([
-        ["🛒 Sotuv",      "👷 Sotuvchilar"],
-        ["📦 Astatka",    "💰 Bugun"],
-        ["📈 Oylik",      "📅 Yillik"],
-        ["🚚 Yo'lda",    "💳 Zavod qarzi"],
-        ["💵 Narxlar",    "📊 Analiz"],
-        ["👥 Mijozlar",   "🔁 Qayta"],
-        ["💳 Qarzlar",    "📡 Kanallar"],
-        ["💵 Kassa",      "📉 Nelikvid"],
-        ["💸 Xarajatlar", "🎯 Maqsad"],
-        ["🔧 Kafolat",    "📈 Trend"],
-        ["📣 Reklama",    "🔔 Eslatmalar"],
-        ["📊 Dashboard",  "🔍 Raqobat"],
-        ["📈 Moliya",     "🔄 Aylanish"],
-        ["💵 Cash Flow",  "📢 OLX"],
-        ["➕ Yangi tovar","↩️ Qayt etish"],
-    ], resize_keyboard=True, is_persistent=True)
+    kb = _asosiy_kb()
     await u.message.reply_text(
-        f"🏭 ThermoCrafts v5.0 — {AI_NAME} bilan\n💱 1 USD = {rate:,.0f} so'm\n\nErkin yozing: \"tts20 ni Alisherga 450 ga nasiya berdim\" yoki \"bu oy eng ko'p nima ketdi?\"",
+        f"🏭 ThermoCrafts v5.0 — {AI_NAME} bilan\n💱 1 USD = {rate:,.0f} so'm\n\n"
+        "🛒 Sotuv · 📦 Ombor · 👥 Mijozlar · 📊 Hisobotlar · 🏭 Zavod · 👷 Sotuvchilar\n"
+        "⚙️ Boshqa — qolgan bo'limlar (kassa, narxlar, moliya, kafolat, qaytarish…)\n\n"
+        "Erkin yozing: \"tts20 ni Alisherga 450 ga nasiya berdim\" yoki \"bu oy eng ko'p nima ketdi?\"",
         reply_markup=kb)
 
 
@@ -5231,6 +5584,8 @@ async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif op[3] == 'expense': label += f"{data.get('note','')} {fmt(data.get('amount',0))}"
         elif op[3] == 'transit': label += f"{data.get('product','')} {fmt(data.get('total',0))}"
         elif op[3] == 'debt_payment': label += f"{data.get('kind','')} {data.get('person','')} {fmt(data.get('amount',0))}"
+        elif op[3] == 'stock': label += (f"ombor {data.get('kind','')} {data.get('product','')} {data.get('qty','')}"
+                                         if data.get('kind') != 'inventar' else f"inventarizatsiya {len(data.get('qatorlar', []))} ta")
         else: label += str(data)[:30]
         text += f"{label}\n"
         kb.append([InlineKeyboardButton(f"↩️ #{op[0]} qayt", callback_data=f"undo_{op[0]}")])
@@ -5280,6 +5635,10 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/trend /rate /maqsad /olx /undo\n"
         "/katalog [nom] /yangi_tovar\n\n"
         "🛒 *Tugmali sotuv:* /sotuv yoki 🛒 Sotuv tugmasi\n"
+        "📦 *Ombor:* /ombor · kam qolganlar: /kam\n"
+        "👥 *Mijozlar:* 👥 Mijozlar tugmasi · qarzdorlar: /qarzdorlar\n"
+        "📊 *Hisobotlar:* /hisobotlar · 🏭 *Zavod buyurtmalari:* /zavod\n"
+        "⚙️ Boshqa — eski to'liq menyu\n"
         "👷 *Xodimlar:* /xodim\\_qosh /xodimlar /xodim\\_ochir\n"
         "📊 Sotuvchilar hisoboti: /sotuvchilar · ID bilish: /id\n\n"
         "*Erkin yozish:*\n\n"
@@ -5446,7 +5805,7 @@ POS_CHEGIRMALAR = (3, 5, 10, 15, 20)
 POS_USULLAR = (('naqd', '💵 Naqd'), ('karta', '💳 Karta'), ('payme', '📱 Payme'),
                ('click', '📱 Click'), ('otkazma', "🏦 O'tkazma"), ('nasiya', '📝 Nasiya'))
 POS_USUL_NOMI = dict(POS_USULLAR)
-SOTUVCHI_KB = [["🛒 Sotuv", "📦 Qoldiq"], ["📋 Bugungi sotuvlarim", "❓ Yordam"]]
+SOTUVCHI_KB = [["🛒 Sotuv", "📦 Qoldiq"], ["📦 Ombor", "👥 Mijozlar"], ["📋 Bugungi sotuvlarim", "❓ Yordam"]]
 
 def _btn(t, d): return InlineKeyboardButton(t, callback_data=d)
 def _pos_bekor(): return [_btn("❌ Bekor qilish", "pos:x")]
@@ -6054,6 +6413,7 @@ async def cmd_start_sotuvchi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         f"👋 Salom, {x['name']}! Siz sotuvchisiz.\n\n"
         "🛒 Sotuv — tugmalar orqali sotish\n📦 Qoldiq — tovarlar va narxlar\n"
+        "📦 Ombor — tovar kartasi (faqat ko'rish)\n👥 Mijozlar — mijoz qidirish/qo'shish\n"
         "📋 Bugungi sotuvlarim — bugun nima sotdingiz\n❓ Yordam",
         reply_markup=_sotuvchi_kb())
 
@@ -6070,7 +6430,8 @@ async def cmd_yordam_sotuvchi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "7) 💳 To'lov — usulni tanlang (📝 Nasiya faqat mijoz bilan)\n"
         "8) ✅ Tasdiqlash — chek chiqadi\n\n"
         "Har qadamda ❌ Bekor qilish bor. 30 daqiqa tegmasangiz savat o'chadi.\n"
-        "Buyruqlar: /sotuv /qoldiq /mening /id",
+        "📦 Ombor — qoldiqni ko'rish · 👥 Mijozlar — yangi mijoz qo'shish\n"
+        "Buyruqlar: /sotuv /qoldiq /ombor /mening /id",
         reply_markup=_sotuvchi_kb() if x['role'] == 'sotuvchi' else None)
 
 async def cmd_qoldiq(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6114,7 +6475,8 @@ async def cmd_mening(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def sotuvchi_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     """Sotuvchi yozgan matn: faqat o'z menyusi. AI agentga yuborilmaydi."""
     fn = {"🛒 Sotuv": pos_start, "📦 Qoldiq": cmd_qoldiq, "📦 Astatka": cmd_qoldiq,
-          "📋 Bugungi sotuvlarim": cmd_mening, "❓ Yordam": cmd_yordam_sotuvchi}.get(msg)
+          "📋 Bugungi sotuvlarim": cmd_mening, "❓ Yordam": cmd_yordam_sotuvchi,
+          "📦 Ombor": cmd_ombor, "👥 Mijozlar": cmd_mijozlar_ui}.get(msg)
     if fn:
         await fn(u, ctx); return
     await u.message.reply_text("Sotish uchun 🛒 Sotuv tugmasini bosing.\n📦 Qoldiq · 📋 Bugungi sotuvlarim · ❓ Yordam",
@@ -6249,6 +6611,2129 @@ async def cmd_sotuvchilar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await u.message.reply_text("\n".join(out)[:4000])
 
+# ── 📦 OMBOR (tugmali) ────────────────────────────────────────────
+# Holat: ctx.user_data['omb']. Ko'rish — 'stock_view' (sotuvchi ham); yozish/inventar/qiymat — 'ombor' (egasi/admin).
+UI_TTL = 1800
+
+def _ui_ol(ctx, key):
+    st = ctx.user_data.get(key)
+    if not st: return None
+    if time.time() - st.get('ts', 0) > UI_TTL:
+        ctx.user_data.pop(key, None); return None
+    st['ts'] = time.time()
+    return st
+
+def _ui_yangi(ctx, key, **kv):
+    st = {'id': secrets.token_hex(4), 'ts': time.time(), 'wait': None}
+    st.update(kv); ctx.user_data[key] = st
+    return st
+
+def _ui_done(ctx, token):
+    """Ikki marta bosishdan himoya: token birinchi marta — True."""
+    done = ctx.user_data.setdefault('ui_done', [])
+    if token in done: return False
+    done.append(token); del done[:-50]
+    return True
+
+def _x_btn(prefix): return [_btn("❌ Yopish", f"{prefix}:x")]
+def _ui_user(u):
+    x = xodim(u) or {}
+    return (x.get('id', 0), x.get('name', ''))
+
+def _omb_cats(prods):
+    return sorted({(p['cat'] or 'Boshqa') for p in prods})
+
+def _omb_menu(u):
+    kam = len(kam_qolganlar())
+    rows = [[_btn("📋 Tovarlar", "omb:cats"), _btn("🔍 Qidirish", "omb:s")],
+            [_btn(f"⚠️ Kam qolgan ({kam})", "omb:kam")]]
+    if can(u, 'ombor'):
+        rows.append([_btn("📥 Kirim", "omb:kirim"), _btn("📤 Chiqim", "omb:chiqim")])
+        rows.append([_btn("🧮 Inventarizatsiya", "omb:inv"), _btn("💰 Ombor qiymati", "omb:val")])
+        rows.append([_btn("📜 Oxirgi harakatlar", "omb:log:0")])
+    rows.append(_x_btn('omb'))
+    return "📦 Ombor — bo'limni tanlang", rows
+
+_OMB_REJIM = {'card': "📦 Tovar kartasi", 'kirim': "📥 Kirim — tovarni tanlang", 'chiqim': "📤 Chiqim — tovarni tanlang",
+              'zav': "🏭 Buyurtmaga tovar tanlang"}
+
+def _omb_kat_ekran(st, prefix='omb'):
+    prods = get_products()
+    cats = _omb_cats(prods); st['cats'] = cats
+    rows, row = [], []
+    for i, cn in enumerate(cats):
+        row.append(_btn(f"{cn[:24]} ({sum(1 for p in prods if (p['cat'] or 'Boshqa') == cn)})", f"{prefix}:k:{i}:0"))
+        if len(row) == 2: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([_btn("🔍 Qidirish", f"{prefix}:s"), _btn("📋 Hammasi", f"{prefix}:k:-1:0")])
+    rows.append([_btn("⬅️ Orqaga", f"{prefix}:menu")] + _x_btn(prefix))
+    return _OMB_REJIM.get(st.get('mode'), "Tovarni tanlang") + "\nKategoriya:", rows
+
+def _omb_royxat(st, prods, sarlavha, page, nav, prefix='omb'):
+    pages = max(1, math.ceil(len(prods) / POS_SAHIFA)); page = min(max(0, page), pages - 1)
+    rows = []
+    for p in prods[page * POS_SAHIFA:(page + 1) * POS_SAHIFA]:
+        q = p['qty'] or 0
+        belgi = "🔴" if q <= 0 else ("🟡" if q <= max(2, p.get('min') or 0) else "🟢")
+        rows.append([_btn(f"{belgi} {p['name'][:30]} · {q} ta · {_usd2(p['price'] or 0)}", f"{prefix}:p:{p['id']}")])
+    if pages > 1:
+        nv = []
+        if page > 0: nv.append(_btn("⬅️", f"{nav}:{page - 1}"))
+        nv.append(_btn(f"{page + 1}/{pages}", "pos:noop"))
+        if page < pages - 1: nv.append(_btn("➡️", f"{nav}:{page + 1}"))
+        rows.append(nv)
+    rows.append([_btn("🔍 Qidirish", f"{prefix}:s"), _btn("⬅️ Kategoriyalar", f"{prefix}:cats")])
+    rows.append(_x_btn(prefix))
+    return (f"{_OMB_REJIM.get(st.get('mode'), '')}\n{sarlavha}" if prods else f"{sarlavha}: topilmadi"), rows
+
+def _omb_kat_mahsulot(st, ci, page, prefix='omb'):
+    prods = get_products()
+    cats = st.get('cats') or _omb_cats(prods)
+    sel, nom = ((prods, "Hammasi") if not (0 <= ci < len(cats))
+                else ([p for p in prods if (p['cat'] or 'Boshqa') == cats[ci]], cats[ci]))
+    return _omb_royxat(st, sorted(sel, key=lambda p: p['name']), nom, page, f"{prefix}:k:{ci}", prefix)
+
+def _omb_qidiruv_ekran(st, page=0, prefix='omb'):
+    ids = st.get('found') or []
+    by = {p['id']: p for p in get_products()}
+    return _omb_royxat(st, [by[i] for i in ids if i in by], "Qidiruv natijasi", page, f"{prefix}:f", prefix)
+
+def _omb_mahsulot(pid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, name, cat, supplier, COALESCE(qty,0), COALESCE(cost,0), COALESCE(price,0), COALESCE(min_qty,0), active, "
+              "COALESCE(factory_price,0) FROM products WHERE id=?", (pid,))
+    r = c.fetchone(); conn.close()
+    if not r: return None
+    return {'id': r[0], 'name': r[1], 'cat': r[2], 'sup': r[3], 'qty': r[4], 'cost': r[5], 'price': r[6], 'min': r[7],
+            'active': r[8], 'factory': r[9]}
+
+def _sm_qator(m, narx=True):
+    _id, d, t, kind, qty, bal, uc, reason, ref, uname, sup = m
+    s = f"{d[8:10]}.{d[5:7]} {t} {OMBOR_TURLARI.get(kind, kind)} {qty:+d} → {bal}"
+    if narx and kind in ('kirim', 'zavod_kirim') and uc: s += f" @{_usd2(uc)}"
+    if reason: s += f" · {reason[:40]}"
+    if uname: s += f" ({uname})"
+    return s
+
+def _omb_karta(u, pid, page=0):
+    p = _omb_mahsulot(pid)
+    if not p: return "Mahsulot topilmadi", [[_btn("⬅️ Orqaga", "omb:menu")]]
+    bosh = can(u, 'boshqaruv')
+    out = [f"📦 {p['name']}", f"Kategoriya: {p['cat'] or '-'} · Yetkazuvchi: {p['sup'] or '-'}",
+           f"Qoldiq: {p['qty']} ta" + (f" (min: {p['min']})" if p['min'] else ""), f"Narx: {_usd2(p['price'])}"]
+    if bosh:
+        out.append(f"Tannarx: {_usd2(p['cost'])} · Ombordagi qiymati: {_usd2(max(0, p['qty']) * p['cost'])}")
+    rows = []
+    if can(u, 'ombor'):
+        rows.append([_btn("📥 Kirim", f"omb:pk:{pid}"), _btn("📤 Chiqim", f"omb:pc:{pid}")])
+        rows.append([_btn(f"⚠️ Min qoldiq: {p['min']}", f"omb:min:{pid}")])
+    if bosh:
+        tarix, n = ombor_tarix(pid, 8, page * 8)
+        pages = max(1, math.ceil(n / 8))
+        out.append(f"\n📜 Harakatlar ({n} ta, sahifa {page + 1}/{pages}):")
+        out += [_sm_qator(m) for m in tarix] or ["(yo'q)"]
+        nv = []
+        if page > 0: nv.append(_btn("⬅️ Yangiroq", f"omb:h:{pid}:{page - 1}"))
+        if page < pages - 1: nv.append(_btn("Eskiroq ➡️", f"omb:h:{pid}:{page + 1}"))
+        if nv: rows.append(nv)
+    rows.append([_btn("⬅️ Ro'yxat", "omb:cats")] + _x_btn('omb'))
+    return "\n".join(out), rows
+
+def _omb_kirim_ekran(st):
+    p = _omb_mahsulot(st['pid'])
+    out = [f"📥 Kirim: {p['name']}", f"Hozir: {p['qty']} ta · tannarx {_usd2(p['cost'])}"]
+    if st.get('qty'): out.append(f"Soni: {st['qty']} ta")
+    if st.get('cost') is not None: out.append(f"Dona narxi (tannarx): {_usd2(st['cost'])}")
+    if st.get('sup') is not None: out.append(f"Yetkazuvchi: {st['sup'] or '-'}")
+    rows = []
+    if not st.get('qty'):
+        out.append("\nNechta keldi?")
+        rows.append([_btn(str(n), f"omb:kq:{n}") for n in (1, 2, 3, 5, 10, 20)])
+        rows.append([_btn("✍️ Boshqa son", "omb:kqc")])
+    elif st.get('cost') is None:
+        out.append("\nDona tannarxi qancha?")
+        rows.append([_btn(f"Joriy: {_usd2(p['cost'])}", "omb:kc:cur")] +
+                    ([_btn(f"Zavod: {_usd2(p['factory'])}", "omb:kc:fac")] if p.get('factory') else []))
+        rows.append([_btn("✍️ Narx yozish", "omb:kcc")])
+    elif st.get('sup') is None:
+        out.append("\nYetkazuvchi kim?")
+        sups = _yetkazuvchilar(p['sup']); st['sups'] = sups
+        rows += [[_btn(s_[:30], f"omb:ks:{i}")] for i, s_ in enumerate(sups[:6])]
+        rows.append([_btn("✍️ Boshqa", "omb:ksc"), _btn("— Ko'rsatmaslik", "omb:ks0")])
+    elif not st.get('pay'):
+        yangi = (max(0, p['qty']) * p['cost'] + st['qty'] * st['cost']) / (max(0, p['qty']) + st['qty'])
+        out.append(f"Summa: {_usd2(st['qty'] * st['cost'])} · yangi o'rtacha tannarx ≈ {_usd2(yangi)}")
+        out.append("\nPuli qanday?")
+        rows.append([_btn("💵 Kassadan to'landi", "omb:kp:cash")])
+        if st.get('sup'): rows.append([_btn("📝 Qarzga (kreditorlik)", "omb:kp:debt")])
+        rows.append([_btn("➖ Pulsiz (faqat astatka)", "omb:kp:none")])
+    else:
+        nomi = {'cash': "kassadan", 'debt': "qarzga (kreditorlik)", 'none': "pulsiz"}[st['pay']]
+        out.append(f"To'lov: {nomi}\n\nTasdiqlaysizmi?")
+        rows.append([_btn("✅ Tasdiqlash", f"omb:kok:{st['id']}")])
+    rows.append([_btn("⬅️ Ombor", "omb:menu")] + _x_btn('omb'))
+    return "\n".join(out), rows
+
+def _yetkazuvchilar(birinchi=''):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT supplier FROM products WHERE COALESCE(supplier,'')<>'' UNION SELECT supplier FROM transit WHERE COALESCE(supplier,'')<>''")
+    s = sorted({r[0] for r in c.fetchall()}); conn.close()
+    if birinchi and birinchi in s: s.remove(birinchi); s.insert(0, birinchi)
+    return s
+
+def _omb_chiqim_ekran(st):
+    p = _omb_mahsulot(st['pid'])
+    out = [f"📤 Chiqim (spisanie): {p['name']}", f"Qoldiq: {p['qty']} ta"]
+    rows = []
+    if not st.get('qty'):
+        out.append("\nNechta?")
+        rows.append([_btn(str(n), f"omb:cq:{n}") for n in (1, 2, 3, 5, 10) if n <= p['qty']])
+        rows.append([_btn("✍️ Boshqa son", "omb:cqc")])
+    elif not st.get('sabab'):
+        out.append(f"Soni: {st['qty']} ta\n\nSababi?")
+        rows += [[_btn(nom, f"omb:cs:{k}")] for k, nom in CHIQIM_SABABLARI]
+    else:
+        out.append(f"Soni: {st['qty']} ta · Sabab: {CHIQIM_SABAB_NOMI[st['sabab']]}")
+        out.append(f"Xarajat sifatida yoziladi (tannarx bo'yicha): {_usd2(st['qty'] * p['cost'])}\nKassaga tegmaydi.\n\nTasdiqlaysizmi?")
+        rows.append([_btn("✅ Tasdiqlash", f"omb:cok:{st['id']}")])
+    rows.append([_btn("⬅️ Ombor", "omb:menu")] + _x_btn('omb'))
+    return "\n".join(out), rows
+
+def _omb_min_ekran(pid):
+    p = _omb_mahsulot(pid)
+    rows = [[_btn(str(n), f"omb:mv:{pid}:{n}") for n in (0, 1, 2, 3, 5, 10)], [_btn("✍️ Boshqa son", f"omb:mvc:{pid}")],
+            [_btn("⬅️ Karta", f"omb:p:{pid}")] + _x_btn('omb')]
+    return (f"⚠️ {p['name']} — minimal qoldiq (hozir {p['min']}).\nQoldiq shundan oshmasa ertalab ogohlantiraman. "
+            "0 — kuzatilmaydi."), rows
+
+def _omb_kam_ekran():
+    ks = kam_qolganlar()
+    out = ["⚠️ Kam qolgan tovarlar:"] + [f"{'🔴' if k['qty'] <= 0 else '🟡'} {k['name']} — {k['qty']} ta (min {k['min']})" for k in ks]
+    if not ks: out = ["✅ Kam qolgan tovar yo'q.", "(Min qoldiq tovar kartasida belgilanadi.)"]
+    rows = [[_btn(f"{k['name'][:30]} · {k['qty']}", f"omb:p:{k['id']}")] for k in ks[:10]]
+    rows.append([_btn("⬅️ Ombor", "omb:menu")] + _x_btn('omb'))
+    return "\n".join(out), rows
+
+def _omb_qiymat_ekran():
+    v = ombor_qiymati()
+    out = ["💰 Ombor qiymati (tannarx bo'yicha):"]
+    for k, (d, s) in sorted(v['kat'].items(), key=lambda x: -x[1][1]):
+        out.append(f"▪️ {k}: {d} ta · {_usd2(s)}")
+    out.append(f"──────────────\nJami: {v['dona']} ta · {_usd2(v['jami'])} ≈ {v['jami'] * get_exchange_rate():,.0f} so'm")
+    return "\n".join(out), [[_btn("⬅️ Ombor", "omb:menu")] + _x_btn('omb')]
+
+def _omb_log_ekran(page):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, date, time, kind, qty, balance, unit_cost, reason, ref, user_name, supplier, product "
+              "FROM stock_moves ORDER BY id DESC LIMIT 10 OFFSET ?", (page * 10,))
+    rows_ = c.fetchall(); c.execute("SELECT COUNT(*) FROM stock_moves"); n = c.fetchone()[0]; conn.close()
+    pages = max(1, math.ceil(n / 10))
+    out = [f"📜 Oxirgi harakatlar ({page + 1}/{pages}):"] + [f"{m[11][:22]}: " + _sm_qator(m[:11]) for m in rows_]
+    nv = []
+    if page > 0: nv.append(_btn("⬅️", f"omb:log:{page - 1}"))
+    if page < pages - 1: nv.append(_btn("➡️", f"omb:log:{page + 1}"))
+    rows = ([nv] if nv else []) + [[_btn("⬅️ Ombor", "omb:menu")] + _x_btn('omb')]
+    return "\n".join(out), rows
+
+# Inventarizatsiya
+def _inv_ekran(st):
+    inv = st['inv']; pids = inv['pids']
+    if inv['i'] >= len(pids):
+        return _inv_xulosa(st)
+    p = _omb_mahsulot(pids[inv['i']])
+    if not p:
+        inv['i'] += 1; return _inv_ekran(st)
+    tizim = p['qty']
+    joriy = inv['sanoq'].get(str(p['id']))
+    out = [f"🧮 Inventarizatsiya {inv['i'] + 1}/{len(pids)}", f"📦 {p['name']}", f"Tizimda: {tizim} ta"]
+    if joriy: out.append(f"Siz sanagan: {joriy[1]} ta")
+    out.append("\nOmborda nechta bor? (sanab, bosing yoki yozing)")
+    vals = sorted({max(0, tizim + d) for d in (-2, -1, 0, 1, 2)} | {0})
+    rows = [[_btn(f"✅ {v}" if v == tizim else str(v), f"omb:iv:{v}") for v in vals[:6]],
+            [_btn("✍️ Boshqa son", "omb:ivc"), _btn("⏭ O'tkazish", "omb:isk")]]
+    nv = []
+    if inv['i'] > 0: nv.append(_btn("⬅️ Oldingi", "omb:ibk"))
+    nv.append(_btn("🏁 Yakunlash", "omb:ifin"))
+    rows.append(nv)
+    rows.append([_btn("❌ Bekor qilish", "omb:x")])
+    st['inv_tizim'] = tizim
+    return "\n".join(out), rows
+
+def _inv_xulosa(st):
+    inv = st['inv']
+    out = ["🧮 Inventarizatsiya natijasi:"]
+    farqlar = []
+    for spid, (tizim, sanalgan) in inv['sanoq'].items():
+        if sanalgan != tizim:
+            p = _omb_mahsulot(int(spid))
+            if p: farqlar.append((p, tizim, sanalgan))
+    kam = sum((t - s) * p['cost'] for p, t, s in farqlar if s < t)
+    for p, t, s in farqlar:
+        out.append(f"{'🔻' if s < t else '🔺'} {p['name']}: tizim {t} → sanoq {s} ({s - t:+d}) · {_usd2((s - t) * p['cost'])}")
+    out.append(f"\nSanaldi: {len(inv['sanoq'])} ta tovar · farqli: {len(farqlar)} ta")
+    if not farqlar:
+        out.append("✅ Hammasi to'g'ri — hech narsa yozilmaydi.")
+        return "\n".join(out), [[_btn("✅ Yopish", "omb:x")]]
+    out.append(f"Kamomad (xarajat bo'ladi): {_usd2(kam)}. Ortiqcha — faqat astatkaga qo'shiladi.\n\nTasdiqlaysizmi?")
+    rows = [[_btn("✅ Tasdiqlash", f"omb:iok:{st['id']}")], [_btn("⬅️ Sanashga qaytish", "omb:ibk")],
+            [_btn("❌ Bekor qilish", "omb:x")]]
+    return "\n".join(out), rows
+
+async def cmd_ombor(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """📦 Ombor tugmasi / /ombor"""
+    if not can(u, 'stock_view'): return
+    _ui_yangi(ctx, 'omb', mode='card')
+    m, r = _omb_menu(u)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+async def cmd_kam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'stock_view'): return
+    _ui_yangi(ctx, 'omb', mode='card')
+    m, r = _omb_kam_ekran()
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+async def omb_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'stock_view'):
+        await q.answer(); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    def _i(k, dflt=0):
+        try: return int(arg[k])
+        except (IndexError, ValueError): return dflt
+    if act == 'x':
+        ctx.user_data.pop('omb', None); await q.answer()
+        return await _pos_chiqar(q, "📦 Ombor yopildi.", None)
+    st = _ui_ol(ctx, 'omb')
+    if st is None:
+        if act == 'menu':
+            st = _ui_yangi(ctx, 'omb', mode='card')
+        else:
+            await q.answer()
+            return await _pos_chiqar(q, "⏰ Oyna eskirgan. Qaytadan: 📦 Ombor", None)
+    st['wait'] = None
+    yoz = can(u, 'ombor')
+    YOZ_ACTS = {'kirim', 'chiqim', 'pk', 'pc', 'kq', 'kqc', 'kc', 'kcc', 'ks', 'ksc', 'ks0', 'kp', 'kok', 'cq', 'cqc', 'cs',
+                'cok', 'min', 'mv', 'mvc', 'inv', 'ik', 'iv', 'ivc', 'isk', 'ibk', 'ifin', 'iok', 'val', 'log', 'h'}
+    if act in YOZ_ACTS and not yoz:
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    m = r = None; alert = None
+    if act == 'menu':
+        st.update(mode='card', pid=None); m, r = _omb_menu(u)
+    elif act == 'cats':
+        m, r = _omb_kat_ekran(st)
+    elif act == 'k':
+        m, r = _omb_kat_mahsulot(st, _i(0, -1), _i(1))
+    elif act == 's':
+        st['wait'] = 'search'; m, r = "🔍 Tovar nomini yozing:", [[_btn("⬅️ Orqaga", "omb:cats")] + _x_btn('omb')]
+    elif act == 'f':
+        m, r = _omb_qidiruv_ekran(st, _i(0))
+    elif act in ('kirim', 'chiqim'):
+        st.update(mode=act, pid=None); m, r = _omb_kat_ekran(st)
+    elif act in ('p', 'pk', 'pc'):
+        pid = _i(0); p = _omb_mahsulot(pid)
+        mode = {'pk': 'kirim', 'pc': 'chiqim'}.get(act, st.get('mode', 'card'))
+        if not p: alert = "Topilmadi"
+        elif mode == 'kirim':
+            st.update(mode='kirim', pid=pid, qty=None, cost=None, sup=None, pay=None); m, r = _omb_kirim_ekran(st)
+        elif mode == 'chiqim':
+            if p['qty'] <= 0: alert = "Astatkada yo'q"
+            else: st.update(mode='chiqim', pid=pid, qty=None, sabab=None); m, r = _omb_chiqim_ekran(st)
+        else:
+            st['pid'] = pid; m, r = _omb_karta(u, pid)
+    elif act == 'h':
+        m, r = _omb_karta(u, _i(0), _i(1))
+    elif act == 'kq':
+        st['qty'] = max(1, _i(0, 1)); m, r = _omb_kirim_ekran(st)
+    elif act == 'kqc':
+        st['wait'] = 'kq'; m, r = "✍️ Nechta keldi? Sonni yozing:", [_x_btn('omb')]
+    elif act == 'kc':
+        p = _omb_mahsulot(st['pid'])
+        st['cost'] = p['factory'] if (arg[:1] == ['fac'] and p.get('factory')) else p['cost']
+        m, r = _omb_kirim_ekran(st)
+    elif act == 'kcc':
+        st['wait'] = 'kc'; m, r = "✍️ Dona tannarxini yozing ($; so'mda yozsangiz o'giraman):", [_x_btn('omb')]
+    elif act == 'ks':
+        sups = st.get('sups') or []
+        st['sup'] = sups[_i(0)] if _i(0) < len(sups) else ''; m, r = _omb_kirim_ekran(st)
+    elif act == 'ks0':
+        st['sup'] = ''; m, r = _omb_kirim_ekran(st)
+    elif act == 'ksc':
+        st['wait'] = 'ks'; m, r = "✍️ Yetkazuvchi nomini yozing:", [_x_btn('omb')]
+    elif act == 'kp':
+        st['pay'] = arg[0] if arg and arg[0] in ('cash', 'debt', 'none') else None; m, r = _omb_kirim_ekran(st)
+    elif act == 'kok':
+        tok = 'okir' + (arg[0] if arg else '')
+        if not (arg and arg[0] == st.get('id') and st.get('pay')) or not _ui_done(ctx, tok):
+            await q.answer("Allaqachon saqlangan yoki eskirgan", show_alert=True); return
+        res = ombor_kirim(st['pid'], st['qty'], st['cost'], st.get('sup') or '', st['pay'], _ui_user(u))
+        if res['ok']:
+            ctx.user_data.pop('omb', None)
+            m = (f"✅ Kirim saqlandi: {res['product']} +{st['qty']} ta → {res['balance']} ta\n"
+                 f"Yangi tannarx: {_usd2(res['new_cost'])} · Summa: {_usd2(res['summa'])}\n(Bekor qilish: /undo)")
+            r = [[_btn("📦 Ombor", "omb:menu")]]
+        else:
+            ctx.user_data['ui_done'].remove(tok); m, r = "⚠️ " + res['error'], [[_btn("⬅️ Ombor", "omb:menu")]]
+    elif act == 'cq':
+        p = _omb_mahsulot(st['pid'])
+        if _i(0) > p['qty']: alert = f"Astatka: {p['qty']} ta"
+        else: st['qty'] = _i(0); m, r = _omb_chiqim_ekran(st)
+    elif act == 'cqc':
+        st['wait'] = 'cq'; m, r = "✍️ Nechta chiqim? Sonni yozing:", [_x_btn('omb')]
+    elif act == 'cs':
+        st['sabab'] = arg[0] if arg and arg[0] in CHIQIM_SABAB_NOMI else None; m, r = _omb_chiqim_ekran(st)
+    elif act == 'cok':
+        tok = 'ochq' + (arg[0] if arg else '')
+        if not (arg and arg[0] == st.get('id') and st.get('sabab')) or not _ui_done(ctx, tok):
+            await q.answer("Allaqachon saqlangan yoki eskirgan", show_alert=True); return
+        res = ombor_chiqim(st['pid'], st['qty'], st['sabab'], _ui_user(u))
+        if res['ok']:
+            ctx.user_data.pop('omb', None)
+            m = (f"✅ Chiqim saqlandi: {res['product']} −{st['qty']} ta → {res['balance']} ta\n"
+                 f"Xarajat: {_usd2(res['summa'])} (spisanie)\n(Bekor qilish: /undo)")
+            r = [[_btn("📦 Ombor", "omb:menu")]]
+        else:
+            ctx.user_data['ui_done'].remove(tok); m, r = "⚠️ " + res['error'], [[_btn("⬅️ Ombor", "omb:menu")]]
+    elif act == 'min':
+        m, r = _omb_min_ekran(_i(0))
+    elif act == 'mv':
+        set_min_qty(_i(0), _i(1)); alert = None; m, r = _omb_karta(u, _i(0))
+    elif act == 'mvc':
+        st['wait'] = f"min:{_i(0)}"; m, r = "✍️ Minimal qoldiqni yozing:", [_x_btn('omb')]
+    elif act == 'kam':
+        m, r = _omb_kam_ekran()
+    elif act == 'val':
+        m, r = _omb_qiymat_ekran()
+    elif act == 'log':
+        m, r = _omb_log_ekran(_i(0))
+    elif act == 'inv':
+        prods = get_products(); cats = _omb_cats(prods); st['cats'] = cats
+        rows = [[_btn(f"{cn[:26]} ({sum(1 for p in prods if (p['cat'] or 'Boshqa') == cn)})", f"omb:ik:{i}")]
+                for i, cn in enumerate(cats)]
+        rows.append([_btn(f"📋 Hammasi ({len(prods)})", "omb:ik:-1")]); rows.append([_btn("⬅️ Ombor", "omb:menu")] + _x_btn('omb'))
+        m, r = "🧮 Inventarizatsiya — nimani sanaymiz?\n(Tovarlar birma-bir chiqadi; oxirida farqlar ko'rsatiladi va tasdiqlaysiz.)", rows
+    elif act == 'ik':
+        prods = get_products(); cats = st.get('cats') or _omb_cats(prods); ci = _i(0, -1)
+        sel = prods if not (0 <= ci < len(cats)) else [p for p in prods if (p['cat'] or 'Boshqa') == cats[ci]]
+        st['inv'] = {'pids': [p['id'] for p in sorted(sel, key=lambda p: (p['cat'] or '', p['name']))], 'i': 0, 'sanoq': {}}
+        st['id'] = secrets.token_hex(4)
+        m, r = _inv_ekran(st)
+    elif act in ('iv', 'isk', 'ibk', 'ifin'):
+        inv = st.get('inv')
+        if not inv: alert = "Inventarizatsiya boshlanmagan"
+        else:
+            if act == 'iv' and inv['i'] < len(inv['pids']):
+                inv['sanoq'][str(inv['pids'][inv['i']])] = [st.get('inv_tizim', 0), max(0, _i(0))]; inv['i'] += 1
+            elif act == 'isk': inv['i'] += 1
+            elif act == 'ibk': inv['i'] = max(0, min(inv['i'], len(inv['pids'])) - 1)
+            elif act == 'ifin': inv['i'] = len(inv['pids'])
+            m, r = _inv_ekran(st)
+    elif act == 'ivc':
+        st['wait'] = 'iv'; m, r = "✍️ Sanagan sonni yozing:", [_x_btn('omb')]
+    elif act == 'iok':
+        tok = 'oinv' + (arg[0] if arg else '')
+        if not (arg and arg[0] == st.get('id') and st.get('inv')) or not _ui_done(ctx, tok):
+            await q.answer("Allaqachon saqlangan yoki eskirgan", show_alert=True); return
+        sanoq = {int(k): tuple(v) for k, v in st['inv']['sanoq'].items()}
+        res = ombor_inventar(sanoq, _ui_user(u))
+        if res['ok']:
+            ctx.user_data.pop('omb', None)
+            m = (f"✅ Inventarizatsiya saqlandi: {len(res['qatorlar'])} ta tuzatish"
+                 + (f", kamomad xarajati {_usd2(res['kamomad'])}" if res['kamomad'] else "") + "\n(Bekor qilish: /undo)")
+            r = [[_btn("📦 Ombor", "omb:menu")]]
+        else:
+            ctx.user_data['ui_done'].remove(tok); m, r = "⚠️ " + res['error'], [[_btn("⬅️ Ombor", "omb:menu")]]
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, r)
+
+async def omb_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st0 = ctx.user_data.get('omb')
+    if not st0 or not st0.get('wait') or not can(u, 'stock_view'): return False
+    st = _ui_ol(ctx, 'omb')
+    if st is None:
+        await u.message.reply_text("⏰ Oyna eskirgan. Qaytadan: 📦 Ombor"); return True
+    w = st['wait']; st['wait'] = None
+    msg = (u.message.text or '').strip()
+    def son():
+        t = re.sub(r'[^\d]', '', msg)
+        return int(t) if t and len(t) < 9 else None
+    m = r = None
+    def qayta(x):
+        st['wait'] = w; return f"⚠️ {x}\nQaytadan yozing.", [_x_btn('omb')]
+    if w == 'search':
+        topildi = pos_qidir(msg); st['found'] = [p['id'] for p in topildi]
+        m, r = _omb_qidiruv_ekran(st)
+        if not topildi: st['wait'] = 'search'; m = f"🔍 '{msg[:40]}' topilmadi. Boshqacha yozing:"
+    elif not can(u, 'ombor'):
+        return False
+    elif w == 'kq':
+        n = son()
+        if not n: m, r = qayta("Musbat son yozing")
+        else: st['qty'] = n; m, r = _omb_kirim_ekran(st)
+    elif w == 'kc':
+        v = _pos_son(msg)
+        if v is None or v < 0: m, r = qayta("Narxni raqam bilan yozing")
+        else: st['cost'] = round(v, 2); m, r = _omb_kirim_ekran(st)
+    elif w == 'ks':
+        st['sup'] = msg[:60]; m, r = _omb_kirim_ekran(st)
+    elif w == 'cq':
+        n = son(); p = _omb_mahsulot(st['pid'])
+        if not n: m, r = qayta("Musbat son yozing")
+        elif n > p['qty']: m, r = qayta(f"Astatka: {p['qty']} ta")
+        else: st['qty'] = n; m, r = _omb_chiqim_ekran(st)
+    elif w.startswith('min:'):
+        n = son()
+        if n is None: m, r = qayta("Son yozing (0 — kuzatilmaydi)")
+        else:
+            pid = int(w.split(':')[1]); set_min_qty(pid, n); m, r = _omb_karta(u, pid)
+    elif w == 'iv':
+        n = son()
+        if n is None: m, r = qayta("Son yozing")
+        else:
+            inv = st['inv']
+            if inv['i'] < len(inv['pids']):
+                inv['sanoq'][str(inv['pids'][inv['i']])] = [st.get('inv_tizim', 0), n]; inv['i'] += 1
+            m, r = _inv_ekran(st)
+    else:
+        return False
+    await u.message.reply_text(m[:4000], reply_markup=InlineKeyboardMarkup(r) if r else None)
+    return True
+
+async def _ertalab_ogohlantirish(app):
+    """Ertalabki xulosadan keyin: kam qolgan tovarlar (+ kechikkan zavod buyurtmalari) — egasiga."""
+    qism = []
+    ks = kam_qolganlar()
+    if ks:
+        qism.append("⚠️ Kam qolgan tovarlar:\n" + "\n".join(f"• {k['name']} — {k['qty']} ta (min {k['min']})" for k in ks[:20]))
+    try:
+        kech = zavod_kechikkanlar()
+    except NameError:
+        kech = []
+    if kech:
+        qism.append("⏰ Kechikkan zavod buyurtmalari:\n" + "\n".join(
+            f"• #{p['id']} {p['supplier']} — kutilgan {p['expected']} ({p['kun']} kun kechikdi)" for p in kech[:10]))
+    if qism and app is not None:
+        await app.bot.send_message(chat_id=OWNER_ID, text="\n\n".join(qism)[:4000])
+    return qism
+
+# ── 👥 MIJOZLAR VA QARZLAR (tugmali) ──────────────────────────────
+# Ko'rish/qo'shish — 'customer_add' (sotuvchi ham: faqat ism, telefon, tur); qarz, tarix, akt, tahrir — 'boshqaruv'.
+QARZ_MUDDAT_KUN = 30          # shundan eski debitorlik — "muddati o'tgan" (⏰)
+
+def _kun_farq(sana):
+    try: return (datetime.now() - datetime.strptime(str(sana)[:10], '%Y-%m-%d')).days
+    except (TypeError, ValueError): return 0
+
+def _mijoz_row(cid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, name, COALESCE(phone,''), COALESCE(type,'B2C'), COALESCE(notes,''), COALESCE(created,'') "
+              "FROM customers WHERE id=?", (cid,))
+    r = c.fetchone(); conn.close()
+    return {'id': r[0], 'name': r[1], 'phone': r[2], 'type': r[3], 'notes': r[4], 'created': r[5]} if r else None
+
+def _mijoz_qarzlari(c, cid, name):
+    """Mijozning ochiq debitorligi: customer_id bo'yicha yoki (bog'lanmagan) ism bo'yicha."""
+    c.execute(f"SELECT id, date, amount, note, COALESCE(customer_id,0), person FROM debts "
+              f"WHERE paid=0 AND amount>0 AND type IN {DEBITOR_SQL}")
+    n = norm_ism(name)
+    return [r for r in c.fetchall() if r[4] == cid or (not r[4] and norm_ism(r[5]) == n)]
+
+def _mijoz_barcha_qarz_idlar(c, cid, name):
+    c.execute(f"SELECT id, COALESCE(customer_id,0), person FROM debts WHERE type IN {DEBITOR_SQL}")
+    n = norm_ism(name)
+    return {r[0] for r in c.fetchall() if r[1] == cid or (not r[1] and norm_ism(r[2]) == n)}
+
+def _qarz_yosh_bolaklari(qarzlar):
+    b = {'0-30': 0.0, '31-60': 0.0, '61-90': 0.0, '90+': 0.0}
+    for r in qarzlar:
+        k = _kun_farq(r[1]); a = r[2] or 0
+        b['0-30' if k <= 30 else '31-60' if k <= 60 else '61-90' if k <= 90 else '90+'] += a
+    return {k: round(v, 2) for k, v in b.items()}
+
+def mijoz_malumot(cid):
+    """Karta uchun: mijoz + jami xarid, oxirgi xarid, ochiq debitorlik, yosh bo'laklari."""
+    m = _mijoz_row(cid)
+    if not m: return None
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*), COALESCE(SUM(revenue),0), MAX(date) FROM sales WHERE reversed=0 AND COALESCE(customer_id,0)=?", (cid,))
+    n, jami, oxirgi = c.fetchone()
+    qarz = _mijoz_qarzlari(c, cid, m['name']); conn.close()
+    m.update(sotuv_soni=n, jami=round(jami or 0, 2), oxirgi=oxirgi or '', qarz=round(sum(r[2] for r in qarz), 2),
+             qarzlar=qarz, yosh=_qarz_yosh_bolaklari(qarz),
+             eng_eski=max((_kun_farq(r[1]) for r in qarz), default=0))
+    return m
+
+def mijoz_xaridlari(cid, limit=8, offset=0):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, date, product, qty, revenue FROM sales WHERE reversed=0 AND COALESCE(customer_id,0)=? "
+              "ORDER BY id DESC LIMIT ? OFFSET ?", (cid, limit, offset))
+    rows = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM sales WHERE reversed=0 AND COALESCE(customer_id,0)=?", (cid,))
+    n = c.fetchone()[0]; conn.close()
+    return rows, n
+
+def mijoz_tahrir(cid, **kv):
+    ruxsat = {'name', 'phone', 'type', 'notes'}
+    sets = [(k, v) for k, v in kv.items() if k in ruxsat]
+    if not sets: return False
+    conn = db(); c = conn.cursor()
+    c.execute('UPDATE customers SET ' + ', '.join(f'{k}=?' for k, _ in sets) + ' WHERE id=?', [v for _, v in sets] + [cid])
+    ok = c.rowcount > 0; conn.commit(); conn.close()
+    return ok
+
+def qarzdorlar(tartib='sum'):
+    """Ochiq debitorlik — mijoz (yoki bog'lanmagan ism) bo'yicha: [{'cid','name','sum','kun','kechikkan'}]"""
+    conn = db(); c = conn.cursor()
+    c.execute(f"SELECT d.date, d.amount, COALESCE(d.customer_id,0), d.person, c.name FROM debts d "
+              f"LEFT JOIN customers c ON c.id=d.customer_id WHERE d.paid=0 AND d.amount>0 AND d.type IN {DEBITOR_SQL}")
+    rows = c.fetchall()
+    c.execute("SELECT id, name FROM customers")
+    by_norm = {}
+    for i, nm in c.fetchall(): by_norm.setdefault(norm_ism(nm), i)
+    conn.close()
+    agg = {}
+    for d, amt, cid, person, cname in rows:
+        cid = cid or by_norm.get(norm_ism(person), 0)
+        key = cid or ('n:' + norm_ism(person))
+        a = agg.setdefault(key, {'cid': cid, 'name': cname or person or '?', 'sum': 0.0, 'kun': 0})
+        a['sum'] += amt or 0; a['kun'] = max(a['kun'], _kun_farq(d))
+    out = [dict(a, sum=round(a['sum'], 2), kechikkan=a['kun'] > QARZ_MUDDAT_KUN) for a in agg.values()]
+    out.sort(key=(lambda a: (-a['kun'], -a['sum'])) if tartib == 'kun' else (lambda a: (-a['sum'], -a['kun'])))
+    return out
+
+def kreditorlar():
+    """Biz qarzdor bo'lganlar (zavod/yetkazuvchi): debts kreditorlik + transit qoldig'i."""
+    conn = db(); c = conn.cursor()
+    c.execute(f"SELECT person, amount, date FROM debts WHERE paid=0 AND amount>0 AND type IN {KREDITOR_SQL}")
+    rows = [(p, a, d) for p, a, d in c.fetchall()]
+    c.execute("SELECT supplier, remaining, date FROM transit WHERE remaining>0")
+    rows += c.fetchall(); conn.close()
+    agg = {}
+    for p, a, d in rows:
+        x = agg.setdefault(norm_ism(p) or '?', {'name': p or '?', 'sum': 0.0, 'kun': 0})
+        x['sum'] += a or 0; x['kun'] = max(x['kun'], _kun_farq(d))
+    return sorted(({**v, 'sum': round(v['sum'], 2)} for v in agg.values()), key=lambda v: -v['sum'])
+
+def eslatma_matni(name, summa, kun):
+    """Mijozga yuborish uchun NUSXA matn (bot o'zi yubormaydi)."""
+    return (f"Assalomu alaykum, {name}!\nThermoCrafts do'konidan bezovta qilyapmiz. "
+            f"Sizning {_usd2(summa)} (≈ {summa * get_exchange_rate():,.0f} so'm) qarzingiz bor"
+            + (f", eng eskisi {kun} kun oldin" if kun else "") + ".\n"
+            "Iltimos, qulay vaqtda to'lab bersangiz. Savollar bo'lsa yozing. Rahmat!")
+
+AKT_DAVRLAR = (('oy', 'Bu oy'), ('otgan', "O'tgan oy"), ('3oy', '3 oy'), ('yil', 'Bu yil'), ('hammasi', 'Hammasi'))
+
+def _akt_oraliq(kod):
+    bugun = datetime.now(); d2 = bugun.strftime('%Y-%m-%d')
+    if kod == 'oy': return bugun.strftime('%Y-%m-01'), d2
+    if kod == 'otgan':
+        oxiri = bugun.replace(day=1) - timedelta(days=1)
+        return oxiri.strftime('%Y-%m-01'), oxiri.strftime('%Y-%m-%d')
+    if kod == '3oy': return (bugun - timedelta(days=90)).strftime('%Y-%m-%d'), d2
+    if kod == 'yil': return bugun.strftime('%Y-01-01'), d2
+    return '2000-01-01', d2
+
+def akt_sverka(cid, d1, d2):
+    """Solishtirish dalolatnomasi (akt sverka): davrdagi xaridlar, qarzga yozilganlar va to'lovlar.
+    Yakuniy qoldiq HOZIRGI ochiq qarzdan orqaga hisoblanadi (doim haqiqiy qoldiq bilan mos)."""
+    m = _mijoz_row(cid)
+    if not m: return None
+    conn = db(); c = conn.cursor()
+    ids = _mijoz_barcha_qarz_idlar(c, cid, m['name'])
+    hozir = round(sum(r[2] for r in _mijoz_qarzlari(c, cid, m['name'])), 2)
+    # Har bir qarz yozuviga tushgan to'lovlar (op_log)
+    c.execute("SELECT id, date, data_json FROM op_log WHERE op_type='debt_payment' AND reversed=0")
+    tolovlar = []; tolangan_qism = defaultdict(float)
+    for oid, sana, dj in c.fetchall():
+        try: d = json.loads(dj or '{}')
+        except ValueError: continue
+        if d.get('kind') != DEBITOR: continue
+        s = sum(it['part'] for it in d.get('items', []) if it.get('src') == 'debt' and it.get('id') in ids)
+        for it in d.get('items', []):
+            if it.get('src') == 'debt' and it.get('id') in ids: tolangan_qism[it['id']] += it['part']
+        if s > 0: tolovlar.append((sana, round(s, 2), d.get('method', ''), oid))
+    # Qarz yozuvlari (asl summa ≈ hozirgi + to'langan qism); sotuvdan kelgan nasiya — sotuv qatorida ko'rinadi
+    qarz_yoz = []
+    if ids:
+        c.execute(f"SELECT id, date, amount, note, paid FROM debts WHERE id IN ({','.join('?' * len(ids))})", list(ids))
+        for did, sana, amt, note, paid in c.fetchall():
+            if paid and 'bekor' in (note or ''): continue            # sotuv bekor qilingani bilan yopilgan
+            asl = round((amt or 0) + tolangan_qism.get(did, 0), 2)
+            qarz_yoz.append((sana, asl, note or '', did))
+    # Xaridlar
+    c.execute("SELECT id, date, product, qty, revenue FROM sales WHERE reversed=0 AND COALESCE(customer_id,0)=? ORDER BY date, id", (cid,))
+    sotuvlar = []
+    for sid, sana, pr, qty, rev in c.fetchall():
+        c.execute("SELECT payment_method FROM cash_box WHERE type='kirim' AND note LIKE ? LIMIT 1", (f'%(#{sid})',))
+        pm = c.fetchone()
+        sotuvlar.append((sana, pr, qty, round(rev or 0, 2), pm[0] if pm else 'nasiya', sid))
+    conn.close()
+    debet = lambda s_, e_: round(sum(a for d_, a, _n, _i in qarz_yoz if s_ <= d_ <= e_), 2)
+    kredit = lambda s_, e_: round(sum(a for d_, a, _m, _o in tolovlar if s_ <= d_ <= e_), 2)
+    keyin_d, keyin_k = debet(d2 + '~', '9999'), kredit(d2 + '~', '9999')
+    yakun = round(hozir - keyin_d + keyin_k, 2)
+    dav_d, dav_k = debet(d1, d2), kredit(d1, d2)
+    boshi = round(yakun - dav_d + dav_k, 2)
+    return {'mijoz': m, 'd1': d1, 'd2': d2, 'boshi': boshi, 'yakun': yakun, 'qarzga': dav_d, 'tolandi': dav_k,
+            'sotuvlar': [s for s in sotuvlar if d1 <= s[0] <= d2],
+            'qarz_yoz': sorted(x for x in qarz_yoz if d1 <= x[0] <= d2),
+            'tolovlar': sorted(x for x in tolovlar if d1 <= x[0] <= d2), 'hozir': hozir}
+
+def akt_matn(a):
+    m = a['mijoz']
+    out = [f"📋 AKT SVERKA — {m['name']}", f"Davr: {a['d1']} … {a['d2']}", "",
+           f"Davr boshiga qarz: {_usd2(a['boshi'])}"]
+    if a['sotuvlar']:
+        out.append("\n🛒 Xaridlar:")
+        for sana, pr, qty, rev, pm, _sid in a['sotuvlar']:
+            out.append(f"{sana} · {pr} × {qty} = {_usd2(rev)} · {'📝 nasiya' if pm == 'nasiya' else pm}")
+        out.append(f"Jami xarid: {_usd2(sum(s[3] for s in a['sotuvlar']))}")
+    if a['qarz_yoz']:
+        out.append("\n➕ Qarzga yozilgan:")
+        out += [f"{sana} · {_usd2(asl)} · {note[:50]}" for sana, asl, note, _ in a['qarz_yoz']]
+    if a['tolovlar']:
+        out.append("\n➖ To'lovlar:")
+        out += [f"{sana} · {_usd2(s)} · {pm}" for sana, s, pm, _ in a['tolovlar']]
+    out += ["", f"Qarzga: +{_usd2(a['qarzga'])} · To'landi: −{_usd2(a['tolandi'])}",
+            f"Davr oxiriga qarz: {_usd2(a['yakun'])}" + (f" (hozir: {_usd2(a['hozir'])})" if a['yakun'] != a['hozir'] else "")]
+    return "\n".join(out)
+
+def akt_html(a, path):
+    def e(v): return _html.escape(str(v if v is not None else ''))
+    m = a['mijoz']
+    qator = []
+    for sana, pr, qty, rev, pm, _ in a['sotuvlar']:
+        qator.append((sana, f"Xarid: {pr} × {qty} ({pm})", rev if pm == 'nasiya' else 0, 0, rev))
+    for sana, asl, note, _ in a['qarz_yoz']:
+        if not note.startswith('nasiya'): qator.append((sana, f"Qarz yozildi: {note}", asl, 0, 0))
+    for sana, s, pm, _ in a['tolovlar']:
+        qator.append((sana, f"To'lov ({pm})", 0, s, 0))
+    qator.sort(key=lambda r: r[0])
+    tr = ''.join(f"<tr><td>{e(s)}</td><td>{e(t)}</td><td class=r>{'' if not d else f'${d:,.2f}'}</td>"
+                 f"<td class=r>{'' if not k else f'${k:,.2f}'}</td></tr>" for s, t, d, k, _x in qator)
+    html = f"""<!DOCTYPE html><html lang=uz><head><meta charset=utf-8><title>Akt sverka</title><style>
+body{{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:0 auto;padding:24px;color:#111}}
+table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:6px;border-bottom:1px solid #ddd;text-align:left}}
+.r{{text-align:right}} .b td{{font-weight:700}}</style></head><body>
+<h2>{e(FIRMA['nom'])} — Solishtirish dalolatnomasi (akt sverka)</h2>
+<p>Mijoz: <b>{e(m['name'])}</b> {e(m['phone'])}<br>Davr: {e(a['d1'])} — {e(a['d2'])}</p>
+<table><thead><tr><th>Sana</th><th>Izoh</th><th class=r>Qarzga (+)</th><th class=r>To'landi (−)</th></tr></thead><tbody>
+<tr class=b><td></td><td>Davr boshiga qarz</td><td class=r>${a['boshi']:,.2f}</td><td></td></tr>{tr}
+<tr class=b><td></td><td>Davr oxiriga qarz</td><td class=r>${a['yakun']:,.2f}</td><td></td></tr></tbody></table>
+<p style="margin-top:40px">Topshirdi: ____________ &nbsp;&nbsp;&nbsp; Qabul qildi: ____________</p></body></html>"""
+    with open(path, 'w', encoding='utf-8') as f: f.write(html)
+    return path
+
+def akt_excel(a, path_base):
+    """openpyxl bo'lsa .xlsx, aks holda .csv. Qaytaradi: yo'l."""
+    rows = [("Sana", "Turi", "Izoh", "Qarzga (+)", "To'landi (−)", "Xarid summasi")]
+    rows.append(("", "", "Davr boshiga qarz", a['boshi'], "", ""))
+    for sana, pr, qty, rev, pm, _ in a['sotuvlar']:
+        rows.append((sana, "xarid", f"{pr} x{qty} ({pm})", rev if pm == 'nasiya' else "", "", rev))
+    for sana, asl, note, _ in a['qarz_yoz']:
+        if not note.startswith('nasiya'): rows.append((sana, "qarz", note, asl, "", ""))
+    for sana, s, pm, _ in a['tolovlar']:
+        rows.append((sana, "to'lov", pm, "", s, ""))
+    rows.append(("", "", "Davr oxiriga qarz", a['yakun'], "", ""))
+    return _jadval_fayl({'Akt sverka': rows}, path_base)
+
+def _jadval_fayl(varaqlar, path_base):
+    """{varaq_nomi: [qatorlar]} → .xlsx (openpyxl) yoki .csv (bo'lmasa). Qaytaradi: yo'l."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+        wb = openpyxl.Workbook(); wb.remove(wb.active)
+        for nom, rows in varaqlar.items():
+            ws = wb.create_sheet(nom[:30])
+            for r in rows: ws.append(list(r))
+            for cell in ws[1]: cell.font = Font(bold=True)
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = min(45, max(10, max(len(str(c.value or '')) for c in col) + 2))
+        p = path_base + '.xlsx'; wb.save(p); return p
+    except ImportError:
+        import csv
+        p = path_base + '.csv'
+        with open(p, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            for nom, rows in varaqlar.items():
+                w.writerow([f"## {nom}"]); w.writerows(rows); w.writerow([])
+        return p
+
+# ── Ekranlar ──
+def _mij_menu(u):
+    rows = [[_btn("🔍 Qidirish", "mij:s"), _btn("📋 Ro'yxat", "mij:l:0")], [_btn("➕ Yangi mijoz", "mij:n")]]
+    if can(u, 'boshqaruv'):
+        rows.append([_btn("💳 Qarzdorlar", "mij:deb:sum:0"), _btn("🏭 Kreditorlar", "mij:kre")])
+    rows.append(_x_btn('mij'))
+    return "👥 Mijozlar — bo'limni tanlang", rows
+
+def _mij_royxat(u, mijozlar, page, nav, sarlavha):
+    bosh = can(u, 'boshqaruv')
+    pages = max(1, math.ceil(len(mijozlar) / POS_SAHIFA)); page = min(max(0, page), pages - 1)
+    rows = []
+    for m in mijozlar[page * POS_SAHIFA:(page + 1) * POS_SAHIFA]:
+        t = m['nom'][:28] + (f" · {m['tel'][-4:]}" if m.get('tel') else "")
+        if bosh and m.get('jami'): t += f" · {_usd2(m['jami'])}"
+        rows.append([_btn(t, f"mij:c:{m['id']}")])
+    if pages > 1:
+        nv = []
+        if page > 0: nv.append(_btn("⬅️", f"{nav}:{page - 1}"))
+        nv.append(_btn(f"{page + 1}/{pages}", "pos:noop"))
+        if page < pages - 1: nv.append(_btn("➡️", f"{nav}:{page + 1}"))
+        rows.append(nv)
+    rows.append([_btn("🔍 Qidirish", "mij:s"), _btn("➕ Yangi", "mij:n")])
+    rows.append([_btn("⬅️ Menyu", "mij:menu")] + _x_btn('mij'))
+    return (f"{sarlavha} ({len(mijozlar)} ta)" if mijozlar else f"{sarlavha}: topilmadi"), rows
+
+def _mij_hammasi(u):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, name, COALESCE(phone,''), COALESCE(total_purchases,0) FROM customers ORDER BY "
+              + ("total_purchases DESC, name" if can(u, 'boshqaruv') else "name"))
+    r = [{'id': x[0], 'nom': x[1], 'tel': x[2], 'jami': x[3]} for x in c.fetchall()]; conn.close()
+    return r
+
+def _mij_karta(u, cid):
+    m = mijoz_malumot(cid)
+    if not m: return "Mijoz topilmadi", [[_btn("⬅️ Menyu", "mij:menu")]]
+    out = [f"👤 {m['name']}", f"📞 {m['phone'] or '-'} · {m['type']}"]
+    rows = []
+    if can(u, 'boshqaruv'):
+        out.append(f"Jami xarid: {_usd2(m['jami'])} ({m['sotuv_soni']} ta) · oxirgi: {m['oxirgi'] or '-'}")
+        if m['qarz'] > 0:
+            y = m['yosh']
+            out.append(f"\n💳 Qarzi (debitorlik): {_usd2(m['qarz'])}" + (" ⏰ muddati o'tgan" if m['eng_eski'] > QARZ_MUDDAT_KUN else ""))
+            out.append("Yoshi: " + " · ".join(f"{k} kun: {_usd2(v)}" for k, v in y.items() if v))
+        else:
+            out.append("✅ Qarzi yo'q")
+        if m['notes']: out.append(f"📝 {m['notes']}")
+        if m['qarz'] > 0: rows.append([_btn("💵 Qarz to'lovi", f"mij:pay:{cid}"), _btn("📝 Eslatma matni", f"mij:rem:{cid}")])
+        rows.append([_btn("📜 Xaridlar", f"mij:h:{cid}:0"), _btn("📋 Akt sverka", f"mij:akt:{cid}")])
+        rows.append([_btn("✏️ Tahrirlash", f"mij:e:{cid}"), _btn("📞 Telefon", f"mij:tel:{cid}")])
+    else:
+        rows.append([_btn("📞 Telefon", f"mij:tel:{cid}")])
+    if can(u, 'pos'): rows.append([_btn("🛒 Shu mijozga sotish", f"mij:sell:{cid}")])
+    rows.append([_btn("⬅️ Ro'yxat", "mij:l:0")] + _x_btn('mij'))
+    return "\n".join(out), rows
+
+def _mij_tarix(cid, page):
+    m = _mijoz_row(cid); rows_, n = mijoz_xaridlari(cid, 8, page * 8)
+    pages = max(1, math.ceil(n / 8))
+    out = [f"📜 {m['name']} — xaridlar ({n} ta, {page + 1}/{pages}):"] + \
+          [f"{d} · {pr} × {qty} = {_usd2(rev)}" for _i, d, pr, qty, rev in rows_] + (["(yo'q)"] if not rows_ else [])
+    nv = []
+    if page > 0: nv.append(_btn("⬅️", f"mij:h:{cid}:{page - 1}"))
+    if page < pages - 1: nv.append(_btn("➡️", f"mij:h:{cid}:{page + 1}"))
+    return "\n".join(out), ([nv] if nv else []) + [[_btn("⬅️ Karta", f"mij:c:{cid}")] + _x_btn('mij')]
+
+def _mij_tahrir_ekran(cid):
+    m = _mijoz_row(cid)
+    return (f"✏️ {m['name']}\n📞 {m['phone'] or '-'} · {m['type']}\n📝 {m['notes'] or '-'}\n\nNimani o'zgartiramiz?",
+            [[_btn("✏️ Ism", f"mij:en:{cid}"), _btn("📞 Telefon", f"mij:ep:{cid}")],
+             [_btn(f"🔁 Tur: {m['type']} → {'B2C' if m['type'] == 'B2B' else 'B2B'}", f"mij:et:{cid}"), _btn("📝 Izoh", f"mij:ez:{cid}")],
+             [_btn("⬅️ Karta", f"mij:c:{cid}")] + _x_btn('mij')])
+
+def _mij_tolov_ekran(st):
+    p = st['pay']
+    out = [f"💵 To'lov: {p['name']} ({'mijoz qarzi' if p['kind'] == DEBITOR else 'biz qarzmiz'})", f"Ochiq qarz: {_usd2(p['qarz'])}"]
+    rows = []
+    if not p.get('summa'):
+        out.append("\nQancha to'landi?")
+        rows.append([_btn(f"To'liq {_usd2(p['qarz'])}", "mij:ps:all")] +
+                    ([_btn(f"Yarmi {_usd2(p['qarz'] / 2)}", "mij:ps:half")] if p['qarz'] >= 2 else []))
+        rows.append([_btn("✍️ Summa yozish", "mij:psc")])
+    elif not p.get('usul'):
+        out.append(f"Summa: {_usd2(p['summa'])}\n\nQanday to'landi?")
+        b = [_btn(nom, f"mij:pm:{k}") for k, nom in POS_USULLAR if k != 'nasiya']
+        rows += [b[i:i + 2] for i in range(0, len(b), 2)]
+    else:
+        out.append(f"Summa: {_usd2(p['summa'])} · Usul: {POS_USUL_NOMI.get(p['usul'], p['usul'])}\n\nTasdiqlaysizmi?")
+        rows.append([_btn("✅ Tasdiqlash", f"mij:pok:{st['id']}")])
+    rows.append([_btn("⬅️ Orqaga", f"mij:c:{p['cid']}" if p.get('cid') else ("mij:kre" if p['kind'] == KREDITOR else "mij:deb:sum:0"))]
+                + _x_btn('mij'))
+    return "\n".join(out), rows
+
+def _mij_deb_ekran(st, tartib, page):
+    ds = qarzdorlar(tartib); st['deb'] = ds
+    jami = round(sum(d['sum'] for d in ds), 2)
+    pages = max(1, math.ceil(len(ds) / POS_SAHIFA)); page = min(max(0, page), pages - 1)
+    out = [f"💳 Qarzdorlar (debitorlik): {len(ds)} ta · jami {_usd2(jami)}",
+           f"Tartib: {'summa' if tartib == 'sum' else 'yoshi'} · ⏰ — {QARZ_MUDDAT_KUN} kundan eski"]
+    rows = [[_btn(f"{'⏰ ' if d['kechikkan'] else ''}{d['name'][:24]} · {_usd2(d['sum'])} · {d['kun']} kun", f"mij:dc:{page * POS_SAHIFA + i}")]
+            for i, d in enumerate(ds[page * POS_SAHIFA:(page + 1) * POS_SAHIFA])]
+    nv = []
+    if page > 0: nv.append(_btn("⬅️", f"mij:deb:{tartib}:{page - 1}"))
+    if pages > 1: nv.append(_btn(f"{page + 1}/{pages}", "pos:noop"))
+    if page < pages - 1: nv.append(_btn("➡️", f"mij:deb:{tartib}:{page + 1}"))
+    if nv: rows.append(nv)
+    rows.append([_btn("↕️ Summa bo'yicha" if tartib == 'kun' else "↕️ Yoshi bo'yicha", f"mij:deb:{'sum' if tartib == 'kun' else 'kun'}:0")])
+    rows.append([_btn("⬅️ Menyu", "mij:menu")] + _x_btn('mij'))
+    return "\n".join(out), rows
+
+def _mij_kre_ekran(st):
+    ks = kreditorlar(); st['kre'] = ks
+    out = [f"🏭 Kreditorlar (biz qarzmiz): jami {_usd2(sum(k['sum'] for k in ks))}"] + \
+          [f"• {k['name']}: {_usd2(k['sum'])} · eng eskisi {k['kun']} kun" for k in ks] + (["✅ Qarzimiz yo'q"] if not ks else [])
+    rows = [[_btn(f"💵 {k['name'][:24]} · {_usd2(k['sum'])}", f"mij:kp:{i}")] for i, k in enumerate(ks[:10])]
+    rows.append([_btn("⬅️ Menyu", "mij:menu")] + _x_btn('mij'))
+    return "\n".join(out), rows
+
+async def cmd_mijozlar_ui(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'customer_add'): return
+    _ui_yangi(ctx, 'mij')
+    m, r = _mij_menu(u)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+async def cmd_qarzdorlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'boshqaruv'): return
+    st = _ui_yangi(ctx, 'mij')
+    m, r = _mij_deb_ekran(st, 'sum', 0)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+async def _mij_fayl(u, ctx, a, tur):
+    base = f"/tmp/akt_{a['mijoz']['id']}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    p = await asyncio.to_thread(akt_html, a, base + '.html') if tur == 'html' else await asyncio.to_thread(akt_excel, a, base)
+    try:
+        with open(p, 'rb') as fh:
+            await ctx.bot.send_document(chat_id=u.effective_chat.id, document=fh,
+                                        filename=f"akt_{norm_ism(a['mijoz']['name']).replace(' ', '_') or 'mijoz'}{os.path.splitext(p)[1]}",
+                                        caption=f"📋 Akt sverka · {a['mijoz']['name']} · {a['d1']}…{a['d2']}")
+    finally:
+        try: os.remove(p)
+        except OSError: pass
+
+async def mij_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'customer_add'):
+        await q.answer(); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    def _i(k, dflt=0):
+        try: return int(arg[k])
+        except (IndexError, ValueError): return dflt
+    if act == 'x':
+        ctx.user_data.pop('mij', None); await q.answer()
+        return await _pos_chiqar(q, "👥 Mijozlar yopildi.", None)
+    st = _ui_ol(ctx, 'mij')
+    if st is None:
+        if act == 'menu': st = _ui_yangi(ctx, 'mij')
+        else:
+            await q.answer(); return await _pos_chiqar(q, "⏰ Oyna eskirgan. Qaytadan: 👥 Mijozlar", None)
+    st['wait'] = None
+    BOSH = {'h', 'akt', 'ap', 'af', 'e', 'en', 'ep', 'et', 'ez', 'pay', 'ps', 'psc', 'pm', 'pok', 'deb', 'dc', 'kre', 'kp', 'rem'}
+    if act in BOSH and not can(u, 'boshqaruv'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    m = r = None; alert = None
+    if act == 'menu': m, r = _mij_menu(u)
+    elif act == 'l': m, r = _mij_royxat(u, _mij_hammasi(u), _i(0), "mij:l", "📋 Mijozlar")
+    elif act == 's':
+        st['wait'] = 'search'; m, r = "🔍 Mijoz ismi yoki telefonini yozing:", [[_btn("⬅️ Menyu", "mij:menu")] + _x_btn('mij')]
+    elif act == 'f':
+        m, r = _mij_royxat(u, st.get('found') or [], _i(0), "mij:f", "🔍 Natija")
+    elif act == 'n':
+        st['wait'] = 'new'
+        m, r = ("➕ Yangi mijoz: ism va telefonni yozing (B2B bo'lsa oxiriga B2B)\nMasalan: Alisher Karimov +998901234567",
+                [[_btn("⬅️ Menyu", "mij:menu")] + _x_btn('mij')])
+    elif act == 'c': m, r = _mij_karta(u, _i(0))
+    elif act == 'h': m, r = _mij_tarix(_i(0), _i(1))
+    elif act == 'tel':
+        mm = _mijoz_row(_i(0))
+        if not mm or not mm['phone']: alert = "Telefon yozilmagan"
+        else:
+            await q.answer()
+            await q.message.reply_text(f"📞 {mm['name']}: {mm['phone']}")
+            return
+    elif act == 'sell':
+        mm = _mijoz_row(_i(0))
+        if not mm or not can(u, 'pos'): alert = "Ruxsat yo'q"
+        else:
+            pos = _pos_ol(ctx) or _pos_yangi(ctx)
+            pos['cust'] = {'id': mm['id'], 'name': mm['name'], 'phone': mm['phone'], 'type': mm['type']}
+            ctx.user_data.pop('mij', None)
+            m, r = pos_ekran_kategoriya(pos); m = f"👤 Mijoz: {mm['name']}\n" + m
+    elif act == 'e': m, r = _mij_tahrir_ekran(_i(0))
+    elif act in ('en', 'ep', 'ez'):
+        st['wait'] = f"{act}:{_i(0)}"
+        m, r = ({'en': "✍️ Yangi ismni yozing:", 'ep': "✍️ Yangi telefonni yozing:", 'ez': "✍️ Izohni yozing:"}[act],
+                [[_btn("⬅️ Orqaga", f"mij:e:{_i(0)}")] + _x_btn('mij')])
+    elif act == 'et':
+        mm = _mijoz_row(_i(0))
+        mijoz_tahrir(_i(0), type='B2C' if mm['type'] == 'B2B' else 'B2B'); m, r = _mij_tahrir_ekran(_i(0))
+    elif act == 'rem':
+        mm = mijoz_malumot(_i(0))
+        await q.answer()
+        await q.message.reply_text("📝 Nusxa olib, mijozga o'zingiz yuboring (bot yubormaydi):\n\n"
+                                   + eslatma_matni(mm['name'], mm['qarz'], mm['eng_eski']))
+        return
+    elif act == 'pay':
+        mm = mijoz_malumot(_i(0))
+        if not mm or mm['qarz'] <= 0: alert = "Ochiq qarz yo'q"
+        else:
+            st['id'] = secrets.token_hex(4)
+            st['pay'] = {'kind': DEBITOR, 'name': mm['name'], 'cid': mm['id'], 'qarz': mm['qarz']}
+            m, r = _mij_tolov_ekran(st)
+    elif act == 'kp':
+        ks = st.get('kre') or kreditorlar()
+        if _i(0) >= len(ks): alert = "Eskirgan"
+        else:
+            k = ks[_i(0)]; st['id'] = secrets.token_hex(4)
+            st['pay'] = {'kind': KREDITOR, 'name': k['name'], 'cid': 0, 'qarz': k['sum']}
+            m, r = _mij_tolov_ekran(st)
+    elif act == 'ps' and st.get('pay'):
+        st['pay']['summa'] = st['pay']['qarz'] if arg[:1] == ['all'] else round(st['pay']['qarz'] / 2, 2)
+        m, r = _mij_tolov_ekran(st)
+    elif act == 'psc' and st.get('pay'):
+        st['wait'] = 'pay'; m, r = "✍️ Summani yozing ($; so'mda yozsangiz o'giraman):", [_x_btn('mij')]
+    elif act == 'pm' and st.get('pay'):
+        st['pay']['usul'] = arg[0] if arg and arg[0] in TOLOV_USULLARI else None; m, r = _mij_tolov_ekran(st)
+    elif act == 'pok':
+        p = st.get('pay') or {}
+        tok = 'mpay' + (arg[0] if arg else '')
+        if not (arg and arg[0] == st.get('id') and p.get('usul') and p.get('summa')) or not _ui_done(ctx, tok):
+            await q.answer("Allaqachon saqlangan yoki eskirgan", show_alert=True); return
+        res = await asyncio.to_thread(pay_debt, p['kind'], p['name'], p['summa'], p['usul'], "tugma orqali")
+        st.pop('pay', None)
+        if res.get('ok'):
+            m = (f"✅ To'lov saqlandi: {res['person']} · {_usd2(res['paid'])} ({res['method']})\n"
+                 f"Qolgan qarz: {_usd2(res['qoldiq'])} · Kassa: {_usd2(res['kassa'])}\n(Bekor qilish: /undo)")
+        else:
+            ctx.user_data['ui_done'].remove(tok)
+            m = "⚠️ " + res.get('error', "Saqlanmadi") + (("\nVariantlar: " + ", ".join(res['variantlar'][:6])) if res.get('variantlar') else "")
+        r = [[_btn("⬅️ Karta", f"mij:c:{p['cid']}")] if p.get('cid') else [_btn("⬅️ Menyu", "mij:menu")]]
+    elif act == 'akt':
+        cid = _i(0)
+        m, r = ("📋 Akt sverka — davrni tanlang:",
+                [[_btn(nom, f"mij:ap:{cid}:{k}") for k, nom in AKT_DAVRLAR[:3]],
+                 [_btn(nom, f"mij:ap:{cid}:{k}") for k, nom in AKT_DAVRLAR[3:]],
+                 [_btn("⬅️ Karta", f"mij:c:{cid}")] + _x_btn('mij')])
+    elif act == 'ap':
+        cid, kod = _i(0), (arg[1] if len(arg) > 1 else 'oy')
+        a = akt_sverka(cid, *_akt_oraliq(kod))
+        if not a: alert = "Mijoz topilmadi"
+        else:
+            m = akt_matn(a)
+            r = [[_btn("🌐 HTML", f"mij:af:{cid}:{kod}:html"), _btn("📊 Excel", f"mij:af:{cid}:{kod}:xlsx")],
+                 [_btn("⬅️ Karta", f"mij:c:{cid}")] + _x_btn('mij')]
+    elif act == 'af':
+        cid, kod, tur = _i(0), (arg[1] if len(arg) > 1 else 'oy'), (arg[2] if len(arg) > 2 else 'html')
+        a = akt_sverka(cid, *_akt_oraliq(kod))
+        if not a: alert = "Mijoz topilmadi"
+        else:
+            await q.answer("⏳ Fayl tayyorlanmoqda...")
+            await _mij_fayl(u, ctx, a, tur)
+            return
+    elif act == 'deb':
+        m, r = _mij_deb_ekran(st, arg[0] if arg and arg[0] in ('sum', 'kun') else 'sum', _i(1))
+    elif act == 'dc':
+        ds = st.get('deb') or qarzdorlar()
+        if _i(0) >= len(ds): alert = "Eskirgan"
+        else:
+            d = ds[_i(0)]
+            if d['cid']: m, r = _mij_karta(u, d['cid'])
+            else:
+                st['id'] = secrets.token_hex(4)
+                st['pay'] = {'kind': DEBITOR, 'name': d['name'], 'cid': 0, 'qarz': d['sum']}
+                m, r = _mij_tolov_ekran(st)
+                m = f"(Mijozlar ro'yxatida yo'q ism)\n📝 Eslatma:\n{eslatma_matni(d['name'], d['sum'], d['kun'])}\n\n" + m
+    elif act == 'kre': m, r = _mij_kre_ekran(st)
+    else: alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, r)
+
+async def mij_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st0 = ctx.user_data.get('mij')
+    if not st0 or not st0.get('wait') or not can(u, 'customer_add'): return False
+    st = _ui_ol(ctx, 'mij')
+    if st is None:
+        await u.message.reply_text("⏰ Oyna eskirgan. Qaytadan: 👥 Mijozlar"); return True
+    w = st['wait']; st['wait'] = None
+    msg = (u.message.text or '').strip()
+    m = r = None
+    if w == 'search':
+        st['found'] = mijoz_qidir(msg)
+        for f in st['found']: f['jami'] = 0
+        m, r = _mij_royxat(u, st['found'], 0, "mij:f", f"🔍 '{msg[:30]}'")
+    elif w == 'new':
+        b2b = bool(re.search(r'\bB2B\b', msg, re.I)); msg2 = re.sub(r'\bB2[BC]\b', '', msg, flags=re.I).strip()
+        tel_m = re.search(r'(\+?\d[\d\s\-()]{6,}\d)', msg2)
+        tel = re.sub(r'[^\d+]', '', tel_m.group(1)) if tel_m else ''
+        ism = (msg2[:tel_m.start()] + msg2[tel_m.end():]).strip(' ,;-') if tel_m else msg2
+        if len(ism) < 2:
+            st['wait'] = w; m, r = "⚠️ Ism yozilmadi. Masalan: Alisher +998901234567", [_x_btn('mij')]
+        else:
+            holat, cid = add_customer(ism, tel, 'B2B' if b2b else 'B2C')
+            m, r = _mij_karta(u, cid)
+            m = ("➕ Yangi mijoz qo'shildi\n" if holat == 'qoshildi' else "👤 Bu ism bor edi — ma'lumot yangilandi\n") + m
+    elif not can(u, 'boshqaruv'):
+        return False
+    elif w == 'pay':
+        v = _pos_son(msg); p = st.get('pay')
+        if not p: return False
+        if v is None or v <= 0:
+            st['wait'] = w; m, r = "⚠️ Summani raqam bilan yozing", [_x_btn('mij')]
+        elif v > p['qarz'] + 0.005:
+            st['wait'] = w; m, r = f"⚠️ Ortiqcha: ochiq qarz {_usd2(p['qarz'])}", [_x_btn('mij')]
+        else:
+            p['summa'] = round(v, 2); m, r = _mij_tolov_ekran(st)
+    elif w[:3] in ('en:', 'ep:', 'ez:'):
+        cid = int(w.split(':')[1]); fld = {'en': 'name', 'ep': 'phone', 'ez': 'notes'}[w[:2]]
+        if fld == 'name' and len(msg) < 2:
+            st['wait'] = w; m, r = "⚠️ Ism juda qisqa", [_x_btn('mij')]
+        else:
+            mijoz_tahrir(cid, **{fld: msg[:200]}); m, r = _mij_tahrir_ekran(cid); m = "✅ Saqlandi\n" + m
+    else:
+        return False
+    await u.message.reply_text(m[:4000], reply_markup=InlineKeyboardMarkup(r) if r else None)
+    return True
+
+
+# ══ 7-BOSQICH (Faza 3/4): 📊 HISOBOTLAR — davr, foyda, kassa, grafik, Excel (egasi/admin) ══
+HIS_DAVRLAR = [('bugun', "Bugun"), ('kecha', "Kecha"), ('hafta', "Shu hafta"), ('oy', "Shu oy"),
+               ('otgan', "O'tgan oy"), ('yil', "Shu yil")]
+
+def _d(s): return datetime.strptime(s, '%Y-%m-%d')
+def _ds(d): return d.strftime('%Y-%m-%d')
+
+def his_oraliq(kalit, bugun=None):
+    """Davr kaliti → (d1, d2, oldingi_d1, oldingi_d2, nomi). Oldingi davr — solishtirish uchun teng bo'lak."""
+    b = bugun or datetime.now()
+    b = datetime(b.year, b.month, b.day)
+    if kalit == 'bugun':
+        return _ds(b), _ds(b), _ds(b - timedelta(1)), _ds(b - timedelta(1)), "Bugun"
+    if kalit == 'kecha':
+        k = b - timedelta(1)
+        return _ds(k), _ds(k), _ds(k - timedelta(1)), _ds(k - timedelta(1)), "Kecha"
+    if kalit == 'hafta':
+        d1 = b - timedelta(b.weekday())
+        return _ds(d1), _ds(b), _ds(d1 - timedelta(7)), _ds(b - timedelta(7)), "Shu hafta"
+    if kalit == 'oy':
+        d1 = b.replace(day=1); p1 = (d1 - timedelta(1)).replace(day=1)
+        p2 = p1.replace(day=min(b.day, calendar.monthrange(p1.year, p1.month)[1]))
+        return _ds(d1), _ds(b), _ds(p1), _ds(p2), "Shu oy"
+    if kalit == 'otgan':
+        d2 = b.replace(day=1) - timedelta(1); d1 = d2.replace(day=1)
+        p2 = d1 - timedelta(1); p1 = p2.replace(day=1)
+        return _ds(d1), _ds(d2), _ds(p1), _ds(p2), "O'tgan oy"
+    if kalit == 'yil':
+        d1 = b.replace(month=1, day=1)
+        try: p2 = b.replace(year=b.year - 1)
+        except ValueError: p2 = b.replace(year=b.year - 1, day=28)
+        return _ds(d1), _ds(b), _ds(d1.replace(year=b.year - 1)), _ds(p2), "Shu yil"
+    raise ValueError(kalit)
+
+def his_ixtiyoriy(d1, d2):
+    """Ixtiyoriy oraliq: oldingi davr — xuddi shu uzunlikdagi undan oldingi kunlar."""
+    a, z = _d(d1), _d(d2)
+    if z < a: a, z = z, a
+    n = (z - a).days + 1
+    return _ds(a), _ds(z), _ds(a - timedelta(n)), _ds(a - timedelta(1)), f"{_ds(a)} … {_ds(z)}"
+
+def _sana_parse(s):
+    s = s.strip()
+    for f in ('%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y', '%d-%m-%Y'):
+        try: return datetime.strptime(s, f)
+        except ValueError: pass
+    return None
+
+def _his_asos(c, d1, d2):
+    """P&L asosi — pl_hisobot bilan bir xil qoida (oraliq uchun)."""
+    c.execute("SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(unit_cost*qty),0), COUNT(*), COALESCE(SUM(qty),0), "
+              "COALESCE(SUM(CASE WHEN discount>0 AND discount<100 THEN revenue*discount/(100-discount) ELSE 0 END),0) "
+              "FROM sales WHERE date BETWEEN ? AND ? AND reversed=0", (d1, d2))
+    tushum, cogs, soni, dona, cheg = c.fetchone()
+    c.execute("SELECT expense_type, COALESCE(category,'boshqa'), COALESCE(SUM(amount),0) FROM expenses "
+              "WHERE date BETWEEN ? AND ? AND reversed=0 GROUP BY expense_type, category", (d1, d2))
+    togri = {}; xar = {}
+    for et, cat, amt in c.fetchall():
+        dd = togri if et in ('cogs_bank', 'cogs_delivery') else xar
+        dd[cat] = dd.get(cat, 0) + amt
+    t_togri = sum(togri.values()); t_xar = sum(xar.values())
+    tannarx = cogs + t_togri
+    yalpi = tushum - tannarx; sof = yalpi - t_xar
+    r2 = lambda v: round(v or 0, 2)
+    return {'tushum': r2(tushum), 'cogs': r2(cogs), 'togri': r2(t_togri), 'togri_tafsil': {k: r2(v) for k, v in togri.items()},
+            'tannarx': r2(tannarx), 'yalpi': r2(yalpi), 'xarajat': r2(t_xar),
+            'xarajat_tafsil': dict(sorted(((k, r2(v)) for k, v in xar.items()), key=lambda kv: -kv[1])),
+            'sof': r2(sof), 'soni': soni, 'dona': dona or 0, 'chegirma': r2(cheg),
+            'marja': round(yalpi / tushum * 100, 1) if tushum else 0.0,
+            'sof_pct': round(sof / tushum * 100, 1) if tushum else 0.0}
+
+def hisobot(d1, d2, od1=None, od2=None, nomi=''):
+    """To'liq hisobot (egasi/admin). Barcha raqamlar $ da."""
+    conn = db(); c = conn.cursor()
+    h = _his_asos(c, d1, d2)
+    h.update({'d1': d1, 'd2': d2, 'nomi': nomi or f"{d1} … {d2}"})
+    # Kassa: usul va kategoriya bo'yicha
+    c.execute("SELECT COALESCE(SUM(CASE WHEN type='kirim' THEN amount ELSE -amount END),0) FROM cash_box WHERE date < ?", (d1,))
+    boshi = c.fetchone()[0] or 0
+    c.execute("SELECT type, COALESCE(NULLIF(payment_method,''),'naqd'), COALESCE(NULLIF(category,''),'boshqa'), COALESCE(SUM(amount),0) "
+              "FROM cash_box WHERE date BETWEEN ? AND ? GROUP BY 1, 2, 3", (d1, d2))
+    k = {'kirim_usul': {}, 'chiqim_usul': {}, 'kirim_kat': {}, 'chiqim_kat': {}}
+    for t, usul, kat, amt in c.fetchall():
+        pre = 'kirim' if t == 'kirim' else 'chiqim'
+        k[pre + '_usul'][usul] = round(k[pre + '_usul'].get(usul, 0) + amt, 2)
+        k[pre + '_kat'][kat] = round(k[pre + '_kat'].get(kat, 0) + amt, 2)
+    k['jami_kirim'] = round(sum(k['kirim_usul'].values()), 2); k['jami_chiqim'] = round(sum(k['chiqim_usul'].values()), 2)
+    k['boshi'] = round(boshi, 2); k['oxiri'] = round(boshi + k['jami_kirim'] - k['jami_chiqim'], 2)
+    h['kassa'] = k
+    # Top mahsulotlar
+    c.execute("SELECT product, SUM(qty), ROUND(SUM(revenue),2), ROUND(SUM(revenue - unit_cost*qty),2) FROM sales "
+              "WHERE date BETWEEN ? AND ? AND reversed=0 GROUP BY product", (d1, d2))
+    mah = [{'nom': r[0], 'dona': r[1], 'tushum': r[2], 'foyda': r[3]} for r in c.fetchall()]
+    h['mahsulotlar'] = mah
+    h['top_tushum'] = sorted(mah, key=lambda x: -x['tushum'])[:5]
+    h['top_foyda'] = sorted(mah, key=lambda x: -x['foyda'])[:5]
+    c.execute("SELECT customer, COUNT(*), ROUND(SUM(revenue),2), ROUND(SUM(revenue - unit_cost*qty),2) FROM sales "
+              "WHERE date BETWEEN ? AND ? AND reversed=0 AND TRIM(COALESCE(customer,''))<>'' GROUP BY customer ORDER BY 3 DESC", (d1, d2))
+    h['mijozlar'] = [{'nom': r[0], 'soni': r[1], 'tushum': r[2], 'foyda': r[3]} for r in c.fetchall()]
+    h['top_mijoz'] = h['mijozlar'][:5]
+    c.execute("SELECT COALESCE(NULLIF(seller_name,''),'Egasi / AI'), COUNT(*), COALESCE(SUM(qty),0), ROUND(SUM(revenue),2), "
+              "ROUND(SUM(revenue - unit_cost*qty),2) FROM sales WHERE date BETWEEN ? AND ? AND reversed=0 GROUP BY 1 ORDER BY 4 DESC", (d1, d2))
+    h['sotuvchilar'] = [{'nom': r[0], 'soni': r[1], 'dona': r[2], 'tushum': r[3], 'foyda': r[4]} for r in c.fetchall()]
+    c.execute("SELECT date, ROUND(SUM(revenue),2), ROUND(SUM(revenue - unit_cost*qty),2) FROM sales "
+              "WHERE date BETWEEN ? AND ? AND reversed=0 GROUP BY date ORDER BY date", (d1, d2))
+    h['kunlik'] = [{'sana': r[0], 'tushum': r[1], 'foyda': r[2]} for r in c.fetchall()]
+    c.execute(f"SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL}")
+    deb = c.fetchone()[0] or 0
+    c.execute(f"SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {KREDITOR_SQL}")
+    kre = c.fetchone()[0] or 0
+    c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
+    zav = c.fetchone()[0] or 0
+    h['debitor'] = round(deb, 2); h['kreditor'] = round(kre + zav, 2); h['zavod_qarzi'] = round(zav, 2)
+    h['oldingi'] = _his_asos(c, od1, od2) if od1 and od2 else None
+    h['od1'], h['od2'] = od1, od2
+    conn.close()
+    h['ombor'] = ombor_qiymati()['jami']
+    return h
+
+def _foiz(yangi, eski):
+    if not eski:
+        return "" if not yangi else " (yangi)"
+    p = (yangi - eski) / abs(eski) * 100
+    return f" ({'▲' if p >= 0 else '▼'} {abs(p):.0f}%)"
+
+def his_matn(h):
+    o = h.get('oldingi') or {}
+    f = (lambda key: _foiz(h[key], o.get(key, 0))) if o else (lambda key: "")
+    L = [f"📊 HISOBOT — {h['nomi']}", f"📅 {h['d1']} … {h['d2']}", "",
+         f"🧾 Sotuvlar: {h['soni']} ta qator, {h['dona']} dona",
+         f"💵 Tushum: {_usd2(h['tushum'])}{f('tushum')}",
+         f"📦 Tannarx: {_usd2(h['tannarx'])}" + (f" (tovar {_usd2(h['cogs'])} + bank/yetkazish {_usd2(h['togri'])})" if h['togri'] else ""),
+         f"🟢 Yalpi foyda: {_usd2(h['yalpi'])} · marja {h['marja']}%{f('yalpi')}"]
+    if h['chegirma']: L.append(f"🏷 Berilgan chegirma: {_usd2(h['chegirma'])}")
+    L.append(f"💸 Xarajatlar: {_usd2(h['xarajat'])}{f('xarajat')}")
+    for kat, v in list(h['xarajat_tafsil'].items())[:8]:
+        L.append(f"   • {kat}: {_usd2(v)}")
+    L.append(f"{'✅' if h['sof'] >= 0 else '🔴'} Sof foyda: {_usd2(h['sof'])} ({h['sof_pct']}%){f('sof')}")
+    k = h['kassa']
+    L += ["", f"💰 Kassa: +{_usd2(k['jami_kirim'])} / −{_usd2(k['jami_chiqim'])} → qoldiq {_usd2(k['oxiri'])}",
+          f"🏬 Ombor (tannarxda, hozir): {_usd2(h['ombor'])}",
+          f"📥 Bizga qarz (debitorlik): {_usd2(h['debitor'])}",
+          f"📤 Bizning qarz (kreditorlik, zavod bilan): {_usd2(h['kreditor'])}"]
+    if o: L.append(f"\n↔️ Solishtirish: {h['od1']} … {h['od2']} bilan")
+    L += ["", "💡 Qanday hisoblanadi:", "Tushum − Tannarx = Yalpi foyda", "Yalpi foyda − Xarajatlar = Sof foyda"]
+    return "\n".join(L)
+
+def his_mahsulot_matn(h):
+    L = [f"📦 Mahsulotlar — {h['nomi']}", "", "💵 Tushum bo'yicha TOP:"]
+    L += [f"{i}. {m['nom'][:30]} — {_usd2(m['tushum'])} ({m['dona']} dona)" for i, m in enumerate(h['top_tushum'], 1)] or ["—"]
+    L += ["", "🟢 Foyda bo'yicha TOP:"]
+    L += [f"{i}. {m['nom'][:30]} — {_usd2(m['foyda'])}" for i, m in enumerate(h['top_foyda'], 1)] or ["—"]
+    return "\n".join(L)
+
+def his_mijoz_matn(h):
+    L = [f"👥 TOP mijozlar — {h['nomi']}", ""]
+    L += [f"{i}. {m['nom'][:30]} — {_usd2(m['tushum'])} ({m['soni']} ta)" for i, m in enumerate(h['top_mijoz'], 1)] or ["Ismi yozilgan sotuv yo'q"]
+    return "\n".join(L)
+
+def his_sotuvchi_matn(h):
+    L = [f"👷 Sotuvchilar — {h['nomi']}", ""]
+    L += [f"• {s['nom']}: {_usd2(s['tushum'])} · {s['dona']} dona · foyda {_usd2(s['foyda'])}" for s in h['sotuvchilar']] or ["Sotuv yo'q"]
+    return "\n".join(L)
+
+def his_kassa_matn(h):
+    k = h['kassa']
+    L = [f"💰 Kassa — {h['nomi']}", f"Davr boshida: {_usd2(k['boshi'])}", "", f"⬆️ Kirim: {_usd2(k['jami_kirim'])}"]
+    L += [f"   • {u_}: {_usd2(v)}" for u_, v in sorted(k['kirim_usul'].items(), key=lambda kv: -kv[1])]
+    L += [f"   ({kat}: {_usd2(v)})" for kat, v in sorted(k['kirim_kat'].items(), key=lambda kv: -kv[1])]
+    L += ["", f"⬇️ Chiqim: {_usd2(k['jami_chiqim'])}"]
+    L += [f"   • {u_}: {_usd2(v)}" for u_, v in sorted(k['chiqim_usul'].items(), key=lambda kv: -kv[1])]
+    L += [f"   ({kat}: {_usd2(v)})" for kat, v in sorted(k['chiqim_kat'].items(), key=lambda kv: -kv[1])]
+    L += ["", f"Davr oxirida: {_usd2(k['oxiri'])}"]
+    return "\n".join(L)
+
+def his_grafik_matn(h):
+    """matplotlib bo'lmasa — matnli grafik."""
+    qism = [("Tushum", h['tushum']), ("Tannarx", h['tannarx']), ("Xarajat", h['xarajat']), ("Sof foyda", h['sof'])]
+    mx = max([abs(v) for _, v in qism] + [1])
+    L = [f"📈 {h['nomi']} (matnli grafik)", ""]
+    for n, v in qism:
+        L.append(f"{n:<10} {'█' * max(0, round(abs(v) / mx * 16)) or '·'} {_usd2(v)}")
+    if len(h['kunlik']) > 1:
+        mk = max([d['tushum'] for d in h['kunlik']] + [1])
+        L += ["", "Kunlik tushum:"]
+        for d in h['kunlik'][-14:]:
+            L.append(f"{d['sana'][5:]} {'▇' * max(0, round(d['tushum'] / mk * 12)) or '·'} {_usd2(d['tushum'])}")
+    return "\n".join(L)
+
+def his_grafik_png(h, path):
+    """PNG grafik (matplotlib). Kutubxona yo'q yoki xato bo'lsa None."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    try:
+        kun = h['kunlik']
+        fig, axes = plt.subplots(1, 2 if len(kun) > 1 else 1, figsize=(11 if len(kun) > 1 else 6, 4.2))
+        ax = axes[0] if len(kun) > 1 else axes
+        nom = ["Tushum", "Tannarx", "Xarajat", "Sof foyda"]
+        val = [h['tushum'], h['tannarx'], h['xarajat'], h['sof']]
+        bars = ax.bar(nom, val, color=['#2e86de', '#8395a7', '#ee5253', '#10ac84' if h['sof'] >= 0 else '#c0392b'])
+        for b_, v in zip(bars, val, strict=True):
+            ax.annotate(f"${v:,.0f}", (b_.get_x() + b_.get_width() / 2, b_.get_height()), ha='center', va='bottom', fontsize=9)
+        ax.set_title(f"{h['nomi']}: {h['d1']} … {h['d2']}"); ax.grid(axis='y', alpha=.3)
+        if len(kun) > 1:
+            a2 = axes[1]
+            xs = [d['sana'][5:] for d in kun]
+            a2.plot(xs, [d['tushum'] for d in kun], marker='o', label='Tushum')
+            a2.plot(xs, [d['foyda'] for d in kun], marker='o', label='Yalpi foyda')
+            a2.set_title("Kunlik"); a2.legend(); a2.grid(alpha=.3)
+            step = max(1, len(xs) // 10)
+            a2.set_xticks(range(0, len(xs), step)); a2.set_xticklabels(xs[::step], rotation=45, fontsize=8)
+        fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
+        return path
+    except Exception as e:
+        log.warning(f"Grafik chizilmadi: {e}")
+        try: plt.close('all')
+        except Exception: pass
+        return None
+
+def his_excel(h, path_base):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, date, time, product, qty, unit_cost, revenue, ROUND(revenue - unit_cost*qty,2), discount, customer, "
+              "COALESCE(seller_name,'') FROM sales WHERE date BETWEEN ? AND ? AND reversed=0 ORDER BY date, id", (h['d1'], h['d2']))
+    sot = c.fetchall()
+    c.execute("SELECT date, category, expense_type, amount, note FROM expenses WHERE date BETWEEN ? AND ? AND reversed=0 ORDER BY date", (h['d1'], h['d2']))
+    xar = c.fetchall()
+    c.execute("SELECT date, time, type, amount, category, payment_method, note FROM cash_box WHERE date BETWEEN ? AND ? ORDER BY date, id", (h['d1'], h['d2']))
+    kas = c.fetchall(); conn.close()
+    xul = [["Ko'rsatkich", "Qiymat ($)"], ["Davr", f"{h['d1']} … {h['d2']}"], ["Tushum", h['tushum']], ["Tannarx (tovar)", h['cogs']],
+           ["Bank/yetkazish (to'g'ridan)", h['togri']], ["Yalpi foyda", h['yalpi']], ["Marja %", h['marja']],
+           ["Chegirma", h['chegirma']], ["Xarajatlar", h['xarajat']], ["Sof foyda", h['sof']],
+           ["Kassa kirim", h['kassa']['jami_kirim']], ["Kassa chiqim", h['kassa']['jami_chiqim']], ["Kassa qoldiq", h['kassa']['oxiri']],
+           ["Ombor qiymati (hozir)", h['ombor']], ["Debitorlik", h['debitor']], ["Kreditorlik", h['kreditor']]]
+    return _jadval_fayl({
+        "Xulosa": xul,
+        "Mahsulotlar": [["Mahsulot", "Dona", "Tushum", "Foyda"]] + [[m['nom'], m['dona'], m['tushum'], m['foyda']] for m in sorted(h['mahsulotlar'], key=lambda x: -x['tushum'])],
+        "Mijozlar": [["Mijoz", "Soni", "Tushum", "Foyda"]] + [[m['nom'], m['soni'], m['tushum'], m['foyda']] for m in h['mijozlar']],
+        "Sotuvchilar": [["Sotuvchi", "Soni", "Dona", "Tushum", "Foyda"]] + [[s['nom'], s['soni'], s['dona'], s['tushum'], s['foyda']] for s in h['sotuvchilar']],
+        "Xarajatlar": [["Sana", "Kategoriya", "Turi", "Summa", "Izoh"]] + [list(r) for r in xar],
+        "Kassa": [["Sana", "Vaqt", "Tur", "Summa", "Kategoriya", "Usul", "Izoh"]] + [list(r) for r in kas],
+        "Sotuvlar": [["ID", "Sana", "Vaqt", "Mahsulot", "Dona", "Tannarx", "Tushum", "Foyda", "Chegirma %", "Mijoz", "Sotuvchi"]] + [list(r) for r in sot],
+    }, path_base)
+
+# ── UI ──
+def _his_menu():
+    rows = []; ks = HIS_DAVRLAR
+    for i in range(0, len(ks), 2):
+        rows.append([_btn(n, f"his:p:{k}") for k, n in ks[i:i + 2]])
+    rows.append([_btn("📅 Oraliq (sanadan-sanagacha)", "his:c")])
+    rows.append(_x_btn('his'))
+    return "📊 Hisobotlar — davrni tanlang", rows
+
+def _his_tugmalar():
+    return [[_btn("📦 Mahsulotlar", "his:v:mah"), _btn("👥 Mijozlar", "his:v:mij")],
+            [_btn("👷 Sotuvchilar", "his:v:sot"), _btn("💰 Kassa", "his:v:kas")],
+            [_btn("📈 Grafik", "his:g"), _btn("📥 Excel", "his:xl")],
+            [_btn("📊 Xulosa", "his:v:x"), _btn("⬅️ Davrlar", "his:menu")], _x_btn('his')]
+
+def _his_ol(st):
+    if not st.get('d1'): return None
+    return hisobot(st['d1'], st['d2'], st.get('od1'), st.get('od2'), st.get('nomi', ''))
+
+async def cmd_hisobotlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'boshqaruv'): return
+    _ui_yangi(ctx, 'his')
+    m, r = _his_menu()
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+async def his_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'boshqaruv'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    if act == 'x':
+        ctx.user_data.pop('his', None); await q.answer()
+        return await _pos_chiqar(q, "📊 Hisobotlar yopildi.", None)
+    st = _ui_ol(ctx, 'his')
+    if st is None:
+        if act in ('menu', 'p'): st = _ui_yangi(ctx, 'his')
+        else:
+            await q.answer(); return await _pos_chiqar(q, "⏰ Oyna eskirgan. Qaytadan: 📊 Hisobotlar", None)
+    st['wait'] = None
+    m = r = None; alert = None
+    if act == 'menu': m, r = _his_menu()
+    elif act == 'p':
+        try: d1, d2, od1, od2, nomi = his_oraliq(arg[0] if arg else '')
+        except ValueError: d1 = None
+        if not d1: alert = "Eski tugma"
+        else:
+            st.update(d1=d1, d2=d2, od1=od1, od2=od2, nomi=nomi)
+            m, r = his_matn(await asyncio.to_thread(_his_ol, st)), _his_tugmalar()
+    elif act == 'c':
+        st['wait'] = 'range'
+        m, r = ("📅 Oraliqni yozing: boshlanish va tugash sanasi\nMasalan: 2026-09-01 2026-09-30\nyoki: 01.09.2026 30.09.2026",
+                [[_btn("⬅️ Davrlar", "his:menu")] + _x_btn('his')])
+    elif act in ('v', 'g', 'xl'):
+        h = await asyncio.to_thread(_his_ol, st)
+        if h is None: alert = "Avval davrni tanlang"
+        elif act == 'v':
+            fn = {'x': his_matn, 'mah': his_mahsulot_matn, 'mij': his_mijoz_matn, 'sot': his_sotuvchi_matn, 'kas': his_kassa_matn}.get(arg[0] if arg else 'x', his_matn)
+            m, r = fn(h), _his_tugmalar()
+        elif act == 'g':
+            await q.answer("Grafik tayyorlanmoqda…")
+            p = f"/tmp/his_{u.effective_user.id}_{secrets.token_hex(3)}.png"
+            got = await asyncio.to_thread(his_grafik_png, h, p)
+            try:
+                if got:
+                    with open(got, 'rb') as fh:
+                        await ctx.bot.send_photo(chat_id=u.effective_chat.id, photo=fh, caption=f"📈 {h['nomi']}: {h['d1']} … {h['d2']}")
+                else:
+                    await ctx.bot.send_message(chat_id=u.effective_chat.id, text=his_grafik_matn(h))
+            finally:
+                if got:
+                    try: os.remove(got)
+                    except OSError: pass
+            return
+        else:
+            await q.answer("Excel tayyorlanmoqda…")
+            p = await asyncio.to_thread(his_excel, h, f"/tmp/hisobot_{h['d1']}_{h['d2']}_{secrets.token_hex(3)}")
+            try:
+                with open(p, 'rb') as fh:
+                    await ctx.bot.send_document(chat_id=u.effective_chat.id, document=fh,
+                                                filename=f"hisobot_{h['d1']}_{h['d2']}{os.path.splitext(p)[1]}",
+                                                caption=f"📥 Hisobot {h['d1']} … {h['d2']}")
+            finally:
+                try: os.remove(p)
+                except OSError: pass
+            return
+    else: alert = "Eski tugma"
+    await q.answer(alert if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m[:4000], r)
+
+async def his_matn_kirit(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st0 = ctx.user_data.get('his')
+    if not st0 or not st0.get('wait') or not can(u, 'boshqaruv'): return False
+    st = _ui_ol(ctx, 'his')
+    if st is None:
+        await u.message.reply_text("⏰ Oyna eskirgan. Qaytadan: 📊 Hisobotlar"); return True
+    st['wait'] = None
+    sanalar = [_sana_parse(s) for s in re.split(r'\s+|…|—|-(?=\d{2}\.)', (u.message.text or '').replace('...', ' ').strip()) if s.strip()]
+    sanalar = [s for s in sanalar if s]
+    if len(sanalar) != 2:
+        st['wait'] = 'range'
+        await u.message.reply_text("⚠️ Ikki sana kerak. Masalan: 2026-09-01 2026-09-30",
+                                   reply_markup=InlineKeyboardMarkup([[_btn("⬅️ Davrlar", "his:menu")] + _x_btn('his')]))
+        return True
+    d1, d2, od1, od2, nomi = his_ixtiyoriy(_ds(sanalar[0]), _ds(sanalar[1]))
+    st.update(d1=d1, d2=d2, od1=od1, od2=od2, nomi=nomi)
+    h = await asyncio.to_thread(_his_ol, st)
+    await u.message.reply_text(his_matn(h)[:4000], reply_markup=InlineKeyboardMarkup(_his_tugmalar()))
+    return True
+
+
+# ══ 8-BOSQICH (Faza 5): 🏭 ZAVOD BUYURTMALARI (egasi/admin) ═══════════════════
+# Buyurtma (purchase_orders) → har bir tovar qatori transit jadvalidagi bitta qator (po_id bilan).
+# Shuning uchun zavod qarzi (transit.remaining) avvalgidek kreditorlikda, /zavod_tolov, pay_debt, balans, /undo bilan ishlaydi.
+PO_HOLATLAR = [('buyurtma', "📝 Buyurtma berildi"), ('qisman_tolandi', "💵 To'landi qisman"), ('yolda', "🚢 Yo'lda"),
+               ('bojxona', "🛃 Bojxonada"), ('keldi', "📦 Keldi"), ('yopildi', "✅ Yopildi"), ('bekor', "🗑 Bekor qilingan")]
+PO_NOM = dict(PO_HOLATLAR)
+PO_OCHIQ = ('buyurtma', 'qisman_tolandi', 'yolda', 'bojxona', 'keldi')
+PO_KELMAGAN = ('buyurtma', 'qisman_tolandi', 'yolda', 'bojxona')
+
+def init_po_tables():
+    conn = db(); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS purchase_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, supplier TEXT, status TEXT DEFAULT 'buyurtma',
+        expected_date TEXT DEFAULT '', deposit REAL DEFAULT 0, bank_fee REAL DEFAULT 0, delivery_fee REAL DEFAULT 0,
+        note TEXT DEFAULT '', created_by TEXT DEFAULT '', closed_date TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS po_status_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, po_id INTEGER, ts TEXT, status TEXT, note TEXT DEFAULT '', user TEXT DEFAULT '')''')
+    for ddl in ("ALTER TABLE transit ADD COLUMN po_id INTEGER DEFAULT 0",
+                "ALTER TABLE transit ADD COLUMN received_qty INTEGER DEFAULT 0",
+                "ALTER TABLE transit ADD COLUMN expected_date TEXT DEFAULT ''",
+                "ALTER TABLE transit ADD COLUMN product_id INTEGER DEFAULT 0"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass
+    # Eski "keldi" qatorlar — to'liq kelgan deb belgilanadi (idempotent)
+    c.execute("UPDATE transit SET received_qty=qty WHERE status='keldi' AND COALESCE(received_qty,0)=0 AND COALESCE(po_id,0)=0")
+    c.execute('CREATE INDEX IF NOT EXISTS idx_transit_po ON transit(po_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_po_log ON po_status_log(po_id)')
+    conn.commit(); conn.close()
+
+def _po_kim(user):
+    return (user[1] if isinstance(user, (tuple, list)) and len(user) > 1 else str(user or '')) or ''
+
+def _po_log(c, po_id, status, note='', user=None):
+    c.execute('INSERT INTO po_status_log (po_id, ts, status, note, user) VALUES (?,?,?,?,?)',
+              (po_id, datetime.now().strftime('%Y-%m-%d %H:%M'), status, note, _po_kim(user)))
+
+def _po_xarajat_tx(c, po_id, amount, kind):
+    """Bank/yetkazish xarajatini HALI KELMAGAN dona qiymatiga mutanosib taqsimlaydi (landed cost, _taqsimla).
+    Har qatorning real_cost (dona tannarxi) qolgan donalar uchun oshadi. Kelmagan tovar bo'lmasa False."""
+    c.execute("SELECT id, qty, COALESCE(received_qty,0), COALESCE(unit_cost,0) FROM transit WHERE po_id=? AND status='yolda'", (po_id,))
+    rows = [r for r in c.fetchall() if (r[1] or 0) - r[2] > 0]
+    if not rows or amount <= 0: return False
+    col = 'bank_fee' if kind == 'bank' else 'delivery_fee'
+    for r, s in zip(rows, _taqsimla(amount, [(r[1] - r[2]) * r[3] for r in rows]), strict=True):
+        if s <= 0: continue
+        c.execute(f"UPDATE transit SET {col}=ROUND(COALESCE({col},0)+?,2), "
+                  f"real_cost=ROUND(COALESCE(real_cost,unit_cost)+?,4) WHERE id=?", (s, s / (r[1] - r[2]), r[0]))
+    c.execute(f"UPDATE purchase_orders SET {col}=ROUND(COALESCE({col},0)+?,2) WHERE id=?", (amount, po_id))
+    return True
+
+def _po_holat_avto(c, po_id, user=None):
+    """Avtomatik holat: hammasi keldi → 'keldi'; keldi va qarz 0 → 'yopildi'; to'lov bo'lsa → 'qisman_tolandi'.
+    /undo bilan qarz qaytsa 'yopildi' → 'keldi' (qayta ochiladi)."""
+    c.execute('SELECT status FROM purchase_orders WHERE id=?', (po_id,))
+    r = c.fetchone()
+    if not r or r[0] == 'bekor': return r[0] if r else None
+    st = r[0]
+    c.execute("SELECT COALESCE(SUM(qty),0), COALESCE(SUM(received_qty),0), COALESCE(SUM(remaining),0), "
+              "COALESCE(SUM(total_cost-remaining),0) FROM transit WHERE po_id=? AND status<>'bekor'", (po_id,))
+    q, rq, qol, tol = c.fetchone()
+    yangi = st
+    if q > 0 and rq >= q and qol <= 0.005: yangi = 'yopildi'
+    elif q > 0 and rq >= q: yangi = 'keldi'
+    elif st == 'buyurtma' and tol > 0.005 and qol > 0.005: yangi = 'qisman_tolandi'
+    if st == 'yopildi' and yangi != 'yopildi': yangi = 'keldi' if rq >= q else st
+    if yangi != st:
+        c.execute("UPDATE purchase_orders SET status=?, closed_date=? WHERE id=?",
+                  (yangi, today() if yangi == 'yopildi' else '', po_id))
+        _po_log(c, po_id, yangi, 'avtomatik', user)
+    return yangi
+
+def zavod_yarat(supplier, lines, deposit=0, bank_fee=0, delivery_fee=0, expected='', method='naqd', user=None, note=''):
+    """Yangi zavod buyurtmasi. lines: [{'pid','qty','cost'}].
+    Avans — kassadan chiqim ('zavod_qarz'); bank/yetkazish — kassadan chiqim ('zavod_xarajat') va tannarxga qo'shiladi."""
+    supplier = (supplier or '').strip()
+    if not supplier: return {'ok': False, 'error': "Zavod (yetkazuvchi) nomi kerak"}
+    if is_closed(today()): return {'ok': False, 'error': f"{today()[:7]} davri yopilgan (/och)"}
+    usul = tolov_usuli(method or 'naqd')
+    if not usul: return {'ok': False, 'error': f"To'lov usuli noma'lum: {method}"}
+    try:
+        deposit = round(float(deposit or 0), 2); bank_fee = round(float(bank_fee or 0), 2); delivery_fee = round(float(delivery_fee or 0), 2)
+        toza = [(int(x['pid']), int(x['qty']), round(float(x['cost']), 4)) for x in lines or []]
+    except (TypeError, ValueError, KeyError):
+        return {'ok': False, 'error': "Noto'g'ri raqam"}
+    if not toza: return {'ok': False, 'error': "Kamida bitta tovar kerak"}
+    if any(q <= 0 or cst < 0 for _, q, cst in toza) or min(deposit, bank_fee, delivery_fee) < 0:
+        return {'ok': False, 'error': "Miqdor > 0, narx va summalar ≥ 0 bo'lishi kerak"}
+    qiymat = [round(q * cst, 2) for _, q, cst in toza]; jami = round(sum(qiymat), 2)
+    if deposit > jami + 0.005: return {'ok': False, 'error': f"Avans ({_usd2(deposit)}) tovar summasidan ({_usd2(jami)}) katta"}
+    conn = db(); c = conn.cursor()
+    try:
+        nomlar = {}
+        for pid, _, _ in toza:
+            c.execute('SELECT name FROM products WHERE id=?', (pid,))
+            r = c.fetchone()
+            if not r: conn.close(); return {'ok': False, 'error': f"Tovar #{pid} topilmadi"}
+            nomlar[pid] = r[0]
+        d = today()
+        holat = 'qisman_tolandi' if 0 < deposit < jami - 0.005 else 'buyurtma'
+        c.execute('INSERT INTO purchase_orders (date, supplier, status, expected_date, deposit, note, created_by) VALUES (?,?,?,?,?,?,?)',
+                  (d, supplier, holat, expected or '', deposit, note or '', _po_kim(user)))
+        po = c.lastrowid
+        _po_log(c, po, 'buyurtma', f"{len(toza)} xil tovar, {_usd2(jami)}", user)
+        if holat != 'buyurtma': _po_log(c, po, holat, f"avans {_usd2(deposit)}", user)
+        for (pid, q, cst), v, dep in zip(toza, qiymat, _taqsimla(deposit, qiymat), strict=True):
+            c.execute('''INSERT INTO transit (date, supplier, product, qty, unit_cost, total_cost, deposit, remaining,
+                         bank_fee, delivery_fee, real_cost, status, note, po_id, received_qty, expected_date, product_id)
+                         VALUES (?,?,?,?,?,?,?,?,0,0,?,'yolda',?,?,0,?,?)''',
+                      (d, supplier, nomlar[pid], q, cst, v, dep, round(v - dep, 2), cst, f"zakaz #Z{po}", po, expected or '', pid))
+        if bank_fee: _po_xarajat_tx(c, po, bank_fee, 'bank')
+        if delivery_fee: _po_xarajat_tx(c, po, delivery_fee, 'yetkazish')
+        t_ = datetime.now().strftime('%H:%M')
+        if deposit > 0:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d, t_, 'chiqim', deposit, 'zavod_qarz', f"{supplier} zakaz #Z{po} avans", usul))
+        if bank_fee + delivery_fee > 0:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d, t_, 'chiqim', round(bank_fee + delivery_fee, 2), 'zavod_xarajat', f"{supplier} zakaz #Z{po} bank/yetkazish", usul))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'po_id': po, 'jami': jami, 'deposit': deposit, 'qoldiq': round(jami - deposit, 2), 'holat': holat}
+
+def po_malumot(po_id):
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT id, date, supplier, status, COALESCE(expected_date,\'\'), deposit, bank_fee, delivery_fee, note, created_by, '
+              'COALESCE(closed_date,\'\') FROM purchase_orders WHERE id=?', (po_id,))
+    r = c.fetchone()
+    if not r: conn.close(); return None
+    c.execute("SELECT id, product, COALESCE(product_id,0), qty, COALESCE(received_qty,0), unit_cost, COALESCE(real_cost,unit_cost), "
+              "total_cost, remaining, COALESCE(bank_fee,0)+COALESCE(delivery_fee,0), status FROM transit WHERE po_id=? ORDER BY id", (po_id,))
+    qat = [{'tid': x[0], 'nom': x[1], 'pid': x[2], 'qty': x[3] or 0, 'kelgan': x[4], 'narx': x[5] or 0, 'tannarx': x[6] or 0,
+            'summa': x[7] or 0, 'qoldiq': round(x[8] or 0, 2), 'xarajat': x[9], 'holat': x[10]} for x in c.fetchall()]
+    c.execute('SELECT ts, status, note, user FROM po_status_log WHERE po_id=? ORDER BY id', (po_id,))
+    log_ = c.fetchall(); conn.close()
+    akt = [q for q in qat if q['holat'] != 'bekor']
+    p = {'id': r[0], 'date': r[1], 'supplier': r[2], 'status': r[3], 'expected': r[4], 'note': r[8], 'by': r[9], 'closed': r[10],
+         'qatorlar': qat, 'log': log_,
+         'jami': round(sum(q['summa'] for q in akt), 2), 'qoldiq': round(sum(q['qoldiq'] for q in akt), 2),
+         'xarajat': round(sum(q['xarajat'] for q in qat), 2),
+         'dona': sum(q['qty'] for q in akt), 'kelgan': sum(q['kelgan'] for q in akt)}
+    p['tolangan'] = round(p['jami'] - p['qoldiq'], 2)
+    p['kech'] = _kun_farq(p['expected']) if p['expected'] and p['status'] in PO_KELMAGAN and p['expected'] < today() else 0
+    return p
+
+def zavod_holat(po_id, status, user=None, note=''):
+    p = po_malumot(po_id)
+    if not p: return {'ok': False, 'error': "Buyurtma topilmadi"}
+    if p['status'] in ('yopildi', 'bekor'): return {'ok': False, 'error': f"Buyurtma {PO_NOM[p['status']].lower()} — o'zgartirib bo'lmaydi"}
+    if status not in PO_NOM or status == 'bekor': return {'ok': False, 'error': "Noma'lum holat"}
+    if status == 'keldi' and p['kelgan'] < p['dona']:
+        return {'ok': False, 'error': "Tovarni '📦 Qabul qilish' orqali kiriting — hammasi kelganda holat o'zi 'Keldi' bo'ladi"}
+    if status == 'yopildi' and (p['kelgan'] < p['dona'] or p['qoldiq'] > 0.005):
+        return {'ok': False, 'error': f"Yopish uchun hamma tovar kelishi va qarz 0 bo'lishi kerak (kelgan {p['kelgan']}/{p['dona']}, qarz {_usd2(p['qoldiq'])})"}
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE purchase_orders SET status=?, closed_date=? WHERE id=?", (status, today() if status == 'yopildi' else '', po_id))
+    _po_log(c, po_id, status, note, user)
+    conn.commit(); conn.close()
+    return {'ok': True, 'status': status}
+
+def _po_pid(c, row_pid, nom):
+    if row_pid:
+        c.execute('SELECT id FROM products WHERE id=?', (row_pid,))
+        if c.fetchone(): return row_pid
+    c.execute('SELECT id FROM products WHERE name=?', (nom,))
+    r = c.fetchone()
+    if r: return r[0]
+    p, _ = match_product(nom, prods=get_products(active_only=False))
+    return p['id'] if p else None
+
+def zavod_qabul(po_id, miqdor=None, user=None):
+    """Qisman/to'liq qabul: {tid: dona} (None — hammasi). Har biri ombor jurnaliga 'zavod_kirim' (landed tannarx,
+    o'rtacha tortilgan sebest). Bitta tranzaksiya."""
+    if is_closed(today()): return {'ok': False, 'error': f"{today()[:7]} davri yopilgan (/och)"}
+    p = po_malumot(po_id)
+    if not p: return {'ok': False, 'error': "Buyurtma topilmadi"}
+    if p['status'] in ('yopildi', 'bekor'): return {'ok': False, 'error': f"Buyurtma {PO_NOM[p['status']].lower()}"}
+    qolgan = {q['tid']: q for q in p['qatorlar'] if q['holat'] == 'yolda' and q['qty'] > q['kelgan']}
+    reja = {t: q['qty'] - q['kelgan'] for t, q in qolgan.items()} if miqdor is None else {int(t): int(n) for t, n in miqdor.items() if int(n) > 0}
+    if not reja: return {'ok': False, 'error': "Qabul qilinadigan tovar yo'q"}
+    for t, n in reja.items():
+        if t not in qolgan: return {'ok': False, 'error': "Bu qator allaqachon to'liq kelgan"}
+        if n > qolgan[t]['qty'] - qolgan[t]['kelgan']:
+            return {'ok': False, 'error': f"{qolgan[t]['nom']}: faqat {qolgan[t]['qty'] - qolgan[t]['kelgan']} dona kutilmoqda"}
+    conn = db(); c = conn.cursor(); out = []
+    try:
+        for t, n in reja.items():
+            q = qolgan[t]
+            pid = _po_pid(c, q['pid'], q['nom'])
+            if not pid:
+                conn.rollback(); conn.close(); return {'ok': False, 'error': f"'{q['nom']}' mahsuloti ombordan topilmadi"}
+            c.execute('SELECT COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+            oq, oc = c.fetchone(); oq = max(0, oq)
+            yangi = round((oq * oc + n * q['tannarx']) / (oq + n), 2) if oq + n > 0 else q['tannarx']
+            stock_move(c, pid, n, 'zavod_kirim', reason=f"zavod #Z{po_id}", ref=f"t{t}", user=user, unit_cost=round(q['tannarx'], 4),
+                       new_cost=yangi, supplier=p['supplier'], allow_negative=True)
+            toliq = q['kelgan'] + n >= q['qty']
+            c.execute("UPDATE transit SET received_qty=COALESCE(received_qty,0)+?, status=CASE WHEN ? THEN 'keldi' ELSE status END, "
+                      "arrived_date=CASE WHEN ? THEN ? ELSE arrived_date END, product_id=? WHERE id=?",
+                      (n, 1 if toliq else 0, 1 if toliq else 0, today(), pid, t))
+            out.append({'nom': q['nom'], 'dona': n, 'tannarx': round(q['tannarx'], 2)})
+        _po_log(c, po_id, p['status'], "📦 qabul: " + ", ".join(f"{o['nom']} × {o['dona']}" for o in out), user)
+        holat = _po_holat_avto(c, po_id, user)
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'qabul': out, 'holat': holat}
+
+def zavod_tolov(po_id, amount, method='naqd', user=None):
+    """Aynan shu buyurtma qatorlari bo'yicha zavodga to'lov (pay_debt kreditorlik, transit_ids filtri — /undo ishlaydi)."""
+    p = po_malumot(po_id)
+    if not p: return {'ok': False, 'error': "Buyurtma topilmadi"}
+    ids = [q['tid'] for q in p['qatorlar'] if q['holat'] != 'bekor' and q['qoldiq'] > 0.004]
+    if not ids: return {'ok': False, 'error': "Bu buyurtma bo'yicha qarz qolmagan"}
+    r = pay_debt('kreditorlik', p['supplier'], amount, method, note=f"zakaz #Z{po_id}", transit_ids=ids)
+    if r.get('ok'):
+        conn = db(); c = conn.cursor()
+        _po_log(c, po_id, p['status'], f"💵 to'lov {_usd2(r['paid'])} ({r['method']})", user)
+        r['holat'] = _po_holat_avto(c, po_id, user)
+        conn.commit(); conn.close()
+        r['po_qoldiq'] = po_malumot(po_id)['qoldiq']
+    return r
+
+def zavod_xarajat(po_id, amount, kind='yetkazish', method='naqd', user=None):
+    """Keyin qo'shilgan bank/yetkazish/bojxona xarajati: kassadan chiqim + kelmagan donalar tannarxiga taqsimlanadi."""
+    if is_closed(today()): return {'ok': False, 'error': f"{today()[:7]} davri yopilgan (/och)"}
+    usul = tolov_usuli(method or 'naqd')
+    if not usul: return {'ok': False, 'error': f"To'lov usuli noma'lum: {method}"}
+    try: amount = round(float(amount), 2)
+    except (TypeError, ValueError): amount = 0
+    if amount <= 0: return {'ok': False, 'error': "Summa 0 dan katta bo'lsin"}
+    p = po_malumot(po_id)
+    if not p or p['status'] in ('yopildi', 'bekor'): return {'ok': False, 'error': "Buyurtma ochiq emas"}
+    conn = db(); c = conn.cursor()
+    try:
+        if not _po_xarajat_tx(c, po_id, amount, kind):
+            conn.rollback(); conn.close()
+            return {'ok': False, 'error': "Kelmagan tovar qolmagan — bu xarajatni oddiy xarajat sifatida yozing (tannarxga qo'shib bo'lmaydi)"}
+        now = datetime.now()
+        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                  (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'), 'chiqim', amount, 'zavod_xarajat',
+                   f"{p['supplier']} zakaz #Z{po_id} {kind}", usul))
+        _po_log(c, po_id, p['status'], f"➕ {kind} xarajati {_usd2(amount)} (tannarxga)", user)
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True}
+
+def zavod_bekor(po_id, user=None):
+    """Faqat hech narsa kelmagan buyurtma bekor qilinadi. To'langan avans → zavodning bizga qarzi (debitorlik),
+    bank/yetkazish → davr xarajati ('zavod_bekor', kassaga tegmaydi — pul avval chiqqan)."""
+    if is_closed(today()): return {'ok': False, 'error': f"{today()[:7]} davri yopilgan (/och)"}
+    p = po_malumot(po_id)
+    if not p: return {'ok': False, 'error': "Buyurtma topilmadi"}
+    if p['status'] in ('yopildi', 'bekor'): return {'ok': False, 'error': f"Buyurtma allaqachon {PO_NOM[p['status']].lower()}"}
+    if p['kelgan'] > 0: return {'ok': False, 'error': "Tovar qisman kelgan — bekor qilib bo'lmaydi (qolganini qabul qiling yoki holatini o'zgartiring)"}
+    conn = db(); c = conn.cursor(); d = today()
+    try:
+        c.execute("UPDATE transit SET status='bekor', remaining=0 WHERE po_id=? AND status='yolda'", (po_id,))
+        c.execute("UPDATE purchase_orders SET status='bekor', closed_date=? WHERE id=? AND status<>'bekor'", (d, po_id))
+        if c.rowcount != 1:
+            conn.rollback(); conn.close(); return {'ok': False, 'error': "Allaqachon bekor qilingan"}
+        if p['tolangan'] > 0.004:
+            c.execute('INSERT INTO debts (date, person, amount, type, note) VALUES (?,?,?,?,?)',
+                      (d, p['supplier'], p['tolangan'], DEBITOR, f"zavod avansi qaytishi kerak (#Z{po_id} bekor)"))
+        if p['xarajat'] > 0.004:
+            c.execute('INSERT INTO expenses (date, amount, category, expense_type, note) VALUES (?,?,?,?,?)',
+                      (d, p['xarajat'], 'zavod_bekor', 'period', f"#Z{po_id} bekor — bank/yetkazish"))
+        _po_log(c, po_id, 'bekor', f"avans {_usd2(p['tolangan'])} → debitorlik" if p['tolangan'] > 0.004 else '', user)
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'avans': p['tolangan'], 'xarajat': p['xarajat']}
+
+def zavod_kechikkanlar():
+    """Kutilgan sanasi o'tgan, hali kelmagan buyurtmalar (ertalabki ogohlantirish)."""
+    conn = db(); c = conn.cursor()
+    c.execute(f"SELECT id, supplier, expected_date FROM purchase_orders WHERE status IN {PO_KELMAGAN} "
+              "AND COALESCE(expected_date,'')<>'' AND expected_date < ? ORDER BY expected_date", (today(),))
+    rows = c.fetchall(); conn.close()
+    return [{'id': r[0], 'supplier': r[1], 'expected': r[2], 'kun': _kun_farq(r[2])} for r in rows]
+
+def zavod_royxat(ochiq=True):
+    conn = db(); c = conn.cursor()
+    w = f"p.status IN {PO_OCHIQ}" if ochiq else "p.status IN ('yopildi','bekor')"
+    c.execute(f"""SELECT p.id, p.date, p.supplier, p.status, COALESCE(p.expected_date,''),
+                 COALESCE(SUM(CASE WHEN t.status<>'bekor' THEN t.total_cost END),0),
+                 COALESCE(SUM(CASE WHEN t.status<>'bekor' THEN t.remaining END),0),
+                 COALESCE(SUM(CASE WHEN t.status<>'bekor' THEN t.qty END),0),
+                 COALESCE(SUM(CASE WHEN t.status<>'bekor' THEN t.received_qty END),0)
+                 FROM purchase_orders p LEFT JOIN transit t ON t.po_id=p.id WHERE {w} GROUP BY p.id ORDER BY p.id DESC""")
+    rows = c.fetchall(); conn.close()
+    bugun = today()
+    return [{'id': r[0], 'date': r[1], 'supplier': r[2], 'status': r[3], 'expected': r[4], 'jami': round(r[5], 2),
+             'qoldiq': round(r[6], 2), 'tolangan': round(r[5] - r[6], 2), 'dona': r[7], 'kelgan': r[8],
+             'kech': bool(r[4] and r[4] < bugun and r[3] in PO_KELMAGAN)} for r in rows]
+
+def zavod_balans():
+    """Zavodlar bo'yicha: biz qarzmiz (kreditorlik: zavod qoldig'i + qarzlar), ular bizga qarz (masalan qaytariladigan avans)."""
+    kre = {norm_ism(k['name']): k for k in kreditorlar()}
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT DISTINCT supplier FROM purchase_orders UNION SELECT DISTINCT supplier FROM transit")
+    sup = {norm_ism(r[0]): r[0] for r in c.fetchall() if r[0]}
+    c.execute(f"SELECT person, COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL} GROUP BY person")
+    deb = defaultdict(float)
+    for p_, s in c.fetchall(): deb[norm_ism(p_)] += s
+    c.execute(f"SELECT supplier, COUNT(*) FROM purchase_orders WHERE status IN {PO_OCHIQ} GROUP BY supplier")
+    och = defaultdict(int)
+    for s_, n in c.fetchall(): och[norm_ism(s_)] += n
+    conn.close()
+    out = []
+    for k in set(sup) | set(kre):
+        if k not in sup and k not in och: continue        # zavod bo'lmagan kreditorlar — 👥 Mijozlar → Kreditorlar
+        out.append({'name': (kre.get(k) or {}).get('name') or sup.get(k, k), 'kre': round((kre.get(k) or {}).get('sum', 0), 2),
+                    'deb': round(deb.get(k, 0), 2), 'ochiq': och.get(k, 0)})
+    return sorted(out, key=lambda x: -x['kre'])
+
+# ── UI ──
+def _zav_menu():
+    o = zavod_royxat(True); k = zavod_kechikkanlar()
+    t = (f"🏭 Zavod buyurtmalari\nOchiq: {len(o)} ta · qarzimiz {_usd2(sum(x['qoldiq'] for x in o))}"
+         + (f"\n⏰ Kechikkan: {len(k)} ta" if k else ""))
+    rows = [[_btn("➕ Yangi buyurtma", "zav:n")],
+            [_btn(f"📋 Ochiq ({len(o)})", "zav:o:0"), _btn(f"⏰ Kechikkan ({len(k)})", "zav:k")],
+            [_btn("🗂 Yopilganlar", "zav:a:0"), _btn("🏭 Zavodlar balansi", "zav:bal")], _x_btn('zav')]
+    return t, rows
+
+def _zav_holat_belgi(x):
+    return PO_NOM.get(x['status'], x['status']).split()[0] + (" ⏰" if x.get('kech') else "")
+
+def _zav_royxat_ekran(ochiq, page):
+    ps = zavod_royxat(ochiq)
+    pages = max(1, math.ceil(len(ps) / POS_SAHIFA)); page = min(max(0, page), pages - 1)
+    t = (f"📋 Ochiq buyurtmalar: {len(ps)} ta\nTovar summasi: {_usd2(sum(x['jami'] for x in ps))} · "
+         f"to'langan {_usd2(sum(x['tolangan'] for x in ps))} · qarz {_usd2(sum(x['qoldiq'] for x in ps))}"
+         if ochiq else f"🗂 Yopilgan / bekor buyurtmalar: {len(ps)} ta")
+    if not ps: t += "\n\nHozircha yo'q."
+    rows = [[_btn(f"{_zav_holat_belgi(x)} #Z{x['id']} {x['supplier'][:16]} · {x['kelgan']}/{x['dona']} · {_usd2(x['qoldiq'])}",
+                  f"zav:c:{x['id']}")] for x in ps[page * POS_SAHIFA:(page + 1) * POS_SAHIFA]]
+    nav = "zav:o" if ochiq else "zav:a"
+    if pages > 1:
+        nv = []
+        if page > 0: nv.append(_btn("⬅️", f"{nav}:{page - 1}"))
+        nv.append(_btn(f"{page + 1}/{pages}", "pos:noop"))
+        if page < pages - 1: nv.append(_btn("➡️", f"{nav}:{page + 1}"))
+        rows.append(nv)
+    rows.append([_btn("⬅️ Menyu", "zav:menu")] + _x_btn('zav'))
+    return t, rows
+
+def _zav_karta(po_id):
+    conn = db(); c = conn.cursor(); _po_holat_avto(c, po_id); conn.commit(); conn.close()   # /undo dan keyin holat to'g'rilanadi
+    p = po_malumot(po_id)
+    if not p: return None, None
+    L = [f"🏭 Buyurtma #Z{p['id']} — {p['supplier']}", f"Holat: {PO_NOM.get(p['status'], p['status'])}",
+         f"Sana: {p['date']}" + (f" · kutilgan: {p['expected']}" if p['expected'] else "")]
+    if p['kech']: L.append(f"⏰ {p['kech']} kun kechikdi!")
+    L.append("\nTovarlar:")
+    for q in p['qatorlar']:
+        bel = "🗑" if q['holat'] == 'bekor' else ("✅" if q['kelgan'] >= q['qty'] else ("🟡" if q['kelgan'] else "⏳"))
+        L.append(f"{bel} {q['nom'][:28]}: {q['kelgan']}/{q['qty']} × {_usd2(q['narx'])}"
+                 + (f" → tannarx {_usd2(q['tannarx'])}" if abs(q['tannarx'] - q['narx']) > 0.004 else ""))
+    L += ["", f"Tovar summasi: {_usd2(p['jami'])}", f"To'langan: {_usd2(p['tolangan'])}", f"Qarzimiz: {_usd2(p['qoldiq'])}"]
+    if p['xarajat']: L.append(f"Bank/yetkazish (tannarxga qo'shilgan): {_usd2(p['xarajat'])}")
+    L.append(f"Kelgan: {p['kelgan']}/{p['dona']} dona")
+    ochiq = p['status'] not in ('yopildi', 'bekor')
+    rows = []
+    if ochiq:
+        rows += [[_btn("🔄 Holat", f"zav:st:{po_id}"), _btn("📦 Qabul qilish", f"zav:r:{po_id}")],
+                 [_btn("💵 To'lov", f"zav:p:{po_id}"), _btn("➕ Xarajat", f"zav:f:{po_id}")],
+                 [_btn("📜 Tarix", f"zav:h:{po_id}"), _btn("🗑 Bekor qilish", f"zav:cx:{po_id}")]]
+    else:
+        rows.append([_btn("📜 Tarix", f"zav:h:{po_id}")])
+    rows.append([_btn("⬅️ Ro'yxat", "zav:o:0" if ochiq else "zav:a:0")] + _x_btn('zav'))
+    return "\n".join(L), rows
+
+def _zav_tarix(po_id):
+    p = po_malumot(po_id)
+    L = [f"📜 #Z{po_id} tarixi:"] + [f"{ts} · {PO_NOM.get(s, s).split(' ', 1)[-1]}" + (f" — {n}" if n else "") + (f" ({u_})" if u_ else "")
+                                     for ts, s, n, u_ in (p['log'] if p else [])[-15:]]
+    return "\n".join(L), [[_btn("⬅️ Buyurtma", f"zav:c:{po_id}")] + _x_btn('zav')]
+
+def _zav_sup_ekran(st):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT DISTINCT supplier FROM products WHERE active=1 AND TRIM(COALESCE(supplier,''))<>'' "
+              "UNION SELECT DISTINCT supplier FROM purchase_orders UNION SELECT DISTINCT supplier FROM transit")
+    sups = sorted({r[0] for r in c.fetchall() if r[0] and r[0].strip()}); conn.close()
+    st['sups'] = sups[:24]
+    rows = [[_btn(s[:30], f"zav:ns:{i}")] for i, s in enumerate(st['sups'])]
+    rows.append([_btn("✍️ Boshqa nom yozish", "zav:nsw")])
+    rows.append([_btn("⬅️ Menyu", "zav:menu")] + _x_btn('zav'))
+    return "➕ Yangi buyurtma — 1/3: zavodni tanlang", rows
+
+def _zav_tovar_ekran(st, page, hammasi):
+    d = st['d']; prods = get_products()
+    if not hammasi:
+        f = [p for p in prods if norm_ism(p['sup'] or '') == norm_ism(d['sup'])]
+        if f: prods = f
+        else: hammasi = 1
+    pages = max(1, math.ceil(len(prods) / POS_SAHIFA)); page = min(max(0, page), pages - 1)
+    rows = [[_btn(f"{p['name'][:30]} · {p['qty']} ta", f"zav:pk:{p['id']}")] for p in prods[page * POS_SAHIFA:(page + 1) * POS_SAHIFA]]
+    nv = []
+    if page > 0: nv.append(_btn("⬅️", f"zav:pp:{page - 1}:{hammasi}"))
+    if pages > 1: nv.append(_btn(f"{page + 1}/{pages}", "pos:noop"))
+    if page < pages - 1: nv.append(_btn("➡️", f"zav:pp:{page + 1}:{hammasi}"))
+    if nv: rows.append(nv)
+    rows.append([_btn("📚 Barcha tovarlar" if not hammasi else f"🏭 Faqat {d['sup'][:14]}", f"zav:pp:0:{0 if hammasi else 1}")])
+    rows.append(([_btn("📝 Qoralama", "zav:d")] if d['lines'] else []) + _x_btn('zav'))
+    return f"➕ {d['sup']} — 2/3: tovarni tanlang" + (f"\nQoralamada: {len(d['lines'])} xil" if d['lines'] else ""), rows
+
+def _zav_qoralama(st):
+    d = st['d']; jami = round(sum(x['qty'] * x['cost'] for x in d['lines']), 2)
+    L = [f"📝 Buyurtma qoralamasi — {d['sup']}", ""]
+    L += [f"{i}. {x['name'][:28]} — {x['qty']} × {_usd2(x['cost'])} = {_usd2(x['qty'] * x['cost'])}" for i, x in enumerate(d['lines'], 1)] or ["(tovar yo'q)"]
+    L += ["", f"Tovar summasi: {_usd2(jami)}", f"💵 Avans (hozir to'lanadi): {_usd2(d['dep'])} · qoladigan qarz {_usd2(max(0, jami - d['dep']))}",
+          f"🏦 Bank: {_usd2(d['bank'])} · 🚚 Yetkazish: {_usd2(d['del'])} (tannarxga qo'shiladi)",
+          f"📅 Kutilgan sana: {d['exp'] or '—'}", f"💳 To'lov usuli: {d['m']}"]
+    rows = [[_btn("➕ Tovar", "zav:pp:0:0"), _btn("🗑 Oxirgisini o'chirish", "zav:dl")],
+            [_btn("💵 Avans", "zav:nd"), _btn("🏦 Bank", "zav:nb"), _btn("🚚 Yetkazish", "zav:nf")],
+            [_btn("📅 Sana", "zav:ne"), _btn(f"💳 {d['m']}", "zav:nm")]]
+    if d['lines']: rows.append([_btn("✅ Buyurtmani yaratish", f"zav:nok:{d['tok']}")])
+    rows.append([_btn("⬅️ Menyu", "zav:menu")] + _x_btn('zav'))
+    return "\n".join(L), rows
+
+def _zav_qabul_ekran(po_id):
+    p = po_malumot(po_id)
+    qol = [q for q in p['qatorlar'] if q['holat'] == 'yolda' and q['qty'] > q['kelgan']]
+    L = [f"📦 #Z{po_id} qabul qilish — {p['supplier']}", "Qisman kelgan bo'lsa — tovarni bosing va sonini yozing.", ""]
+    L += [f"• {q['nom'][:28]}: kutilmoqda {q['qty'] - q['kelgan']} ta (tannarx {_usd2(q['tannarx'])})" for q in qol] or ["Hammasi kelgan ✅"]
+    rows = [[_btn(f"📦 {q['nom'][:24]} ({q['qty'] - q['kelgan']})", f"zav:rl:{po_id}:{q['tid']}")] for q in qol[:12]]
+    if qol: rows.append([_btn("✅ Hammasi keldi", f"zav:ra:{po_id}:{p['kelgan']}")])
+    rows.append([_btn("⬅️ Buyurtma", f"zav:c:{po_id}")] + _x_btn('zav'))
+    return "\n".join(L), rows
+
+def _zav_tolov_ekran(st):
+    p = st['pay']; po = po_malumot(p['po'])
+    L = [f"💵 #Z{p['po']} — {po['supplier']} ga to'lov", f"Qarzimiz: {_usd2(po['qoldiq'])}"]
+    if p.get('sum'):
+        L += [f"Summa: {_usd2(p['sum'])}", f"Usul: {p['m']}"]
+        rows = [[_btn(("✅ " if p['m'] == m else "") + m, f"zav:pm:{m}") for m in TOLOV_USULLARI[:3]],
+                [_btn(("✅ " if p['m'] == m else "") + m, f"zav:pm:{m}") for m in TOLOV_USULLARI[3:]],
+                [_btn("✅ Tasdiqlash", f"zav:pok:{p['tok']}")]]
+    else:
+        rows = [[_btn(f"To'liq {_usd2(po['qoldiq'])}", f"zav:pa:{p['po']}:all"), _btn("Yarmi", f"zav:pa:{p['po']}:half")],
+                [_btn("✍️ Boshqa summa", f"zav:pc:{p['po']}")]]
+    rows.append([_btn("⬅️ Buyurtma", f"zav:c:{p['po']}")] + _x_btn('zav'))
+    return "\n".join(L), rows
+
+def _zav_balans_ekran():
+    bs = zavod_balans()
+    L = ["🏭 Zavodlar balansi", ""]
+    L += [f"• {b['name']}: biz qarzmiz {_usd2(b['kre'])}" + (f" · ular bizga {_usd2(b['deb'])}" if b['deb'] else "")
+          + (f" · ochiq buyurtma {b['ochiq']}" if b['ochiq'] else "") for b in bs] or ["Hozircha zavod yo'q"]
+    L += ["", f"Jami zavodlarga qarzimiz: {_usd2(sum(b['kre'] for b in bs))}"]
+    return "\n".join(L), [[_btn("💵 To'lash (Kreditorlar)", "zav:kre")], [_btn("⬅️ Menyu", "zav:menu")] + _x_btn('zav')]
+
+async def cmd_zavod_ui(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'boshqaruv'): return
+    _ui_yangi(ctx, 'zav')
+    m, r = _zav_menu()
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+async def zav_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'boshqaruv'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    def _i(k, dflt=0):
+        try: return int(arg[k])
+        except (IndexError, ValueError): return dflt
+    if act == 'x':
+        ctx.user_data.pop('zav', None); await q.answer()
+        return await _pos_chiqar(q, "🏭 Zavod oynasi yopildi.", None)
+    st = _ui_ol(ctx, 'zav')
+    if st is None:
+        if act == 'menu': st = _ui_yangi(ctx, 'zav')
+        else:
+            await q.answer(); return await _pos_chiqar(q, "⏰ Oyna eskirgan. Qaytadan: 🏭 Zavod", None)
+    st['wait'] = None
+    m = r = None; alert = None; user = _ui_user(u)
+    d = st.get('d')
+    if act == 'menu': m, r = _zav_menu()
+    elif act == 'o': m, r = _zav_royxat_ekran(True, _i(0))
+    elif act == 'a': m, r = _zav_royxat_ekran(False, _i(0))
+    elif act == 'k':
+        ks = zavod_kechikkanlar()
+        m = "⏰ Kechikkan buyurtmalar:\n" + ("\n".join(f"• #Z{k['id']} {k['supplier']} — kutilgan {k['expected']} ({k['kun']} kun)" for k in ks) or "Yo'q ✅")
+        r = [[_btn(f"#Z{k['id']} {k['supplier'][:20]}", f"zav:c:{k['id']}")] for k in ks[:10]] + [[_btn("⬅️ Menyu", "zav:menu")] + _x_btn('zav')]
+    elif act == 'bal': m, r = _zav_balans_ekran()
+    elif act == 'kre':
+        st2 = _ui_yangi(ctx, 'mij'); m, r = _mij_kre_ekran(st2)
+    elif act == 'n': m, r = _zav_sup_ekran(st)
+    elif act == 'ns':
+        sups = st.get('sups') or []
+        if _i(0) >= len(sups): alert = "Eskirgan"
+        else:
+            st['d'] = {'sup': sups[_i(0)], 'lines': [], 'dep': 0.0, 'bank': 0.0, 'del': 0.0, 'exp': '', 'm': 'naqd', 'tok': secrets.token_hex(3)}
+            m, r = _zav_tovar_ekran(st, 0, 0)
+    elif act == 'nsw':
+        st['wait'] = 'sup'; m, r = "✍️ Zavod (yetkazuvchi) nomini yozing:", [[_btn("⬅️ Orqaga", "zav:n")] + _x_btn('zav')]
+    elif not d and act in ('pp', 'pk', 'd', 'dl', 'nd', 'nb', 'nf', 'ne', 'nE', 'nEw', 'nm', 'nok'):
+        alert = "Qoralama yo'q — ➕ Yangi buyurtma"
+    elif act == 'pp': m, r = _zav_tovar_ekran(st, _i(0), _i(1))
+    elif act == 'pk':
+        p = next((x for x in get_products() if x['id'] == _i(0)), None)
+        if not p: alert = "Tovar topilmadi"
+        else:
+            nar = p.get('factory') or p.get('cost') or 0
+            st['wait'] = f"qty:{p['id']}"
+            m, r = (f"📦 {p['name']}\nNechta va dona narxi ($)?\nMasalan: 20 {nar:g}\n(narx yozilmasa: {_usd2(nar)} — zavod narxi)",
+                    [[_btn("⬅️ Tovarlar", "zav:pp:0:0")] + _x_btn('zav')])
+    elif act == 'd': m, r = _zav_qoralama(st)
+    elif act == 'dl':
+        if d['lines']: d['lines'].pop()
+        m, r = _zav_qoralama(st)
+    elif act in ('nd', 'nb', 'nf'):
+        st['wait'] = {'nd': 'dep', 'nb': 'bank', 'nf': 'del'}[act]
+        m, r = ({'nd': "💵 Avans summasini yozing ($, hozir kassadan to'lanadi; 0 — avanssiz):",
+                 'nb': "🏦 Bank xarajatini yozing ($):", 'nf': "🚚 Yetkazish xarajatini yozing ($):"}[act],
+                [[_btn("⬅️ Qoralama", "zav:d")] + _x_btn('zav')])
+    elif act == 'ne':
+        m = "📅 Tovar qachon kelishi kutilmoqda?"
+        r = [[_btn(f"+{n} kun", f"zav:nE:{n}") for n in (7, 14, 30)], [_btn(f"+{n} kun", f"zav:nE:{n}") for n in (45, 60, 90)],
+             [_btn("✍️ Sanani yozish", "zav:nEw"), _btn("⬅️ Qoralama", "zav:d")]]
+    elif act == 'nE':
+        d['exp'] = _ds(datetime.now() + timedelta(days=_i(0))); m, r = _zav_qoralama(st)
+    elif act == 'nEw':
+        st['wait'] = 'exp'; m, r = "📅 Sanani yozing (2026-11-20 yoki 20.11.2026):", [[_btn("⬅️ Qoralama", "zav:d")] + _x_btn('zav')]
+    elif act == 'nm':
+        us = list(TOLOV_USULLARI); d['m'] = us[(us.index(d['m']) + 1) % len(us)] if d['m'] in us else 'naqd'
+        m, r = _zav_qoralama(st)
+    elif act == 'nok':
+        if (arg[0] if arg else '') != d['tok'] or not _ui_done(ctx, 'zavnok' + d['tok']):
+            await q.answer("Allaqachon yaratilgan yoki eskirgan", show_alert=True); return
+        res = zavod_yarat(d['sup'], [{'pid': x['pid'], 'qty': x['qty'], 'cost': x['cost']} for x in d['lines']],
+                          d['dep'], d['bank'], d['del'], d['exp'], d['m'], user)
+        if not res['ok']:
+            done_ = ctx.user_data.get('ui_done', [])
+            if 'zavnok' + d['tok'] in done_: done_.remove('zavnok' + d['tok'])      # xatoni tuzatib qayta bosish mumkin
+            alert = res['error']
+        else:
+            st.pop('d', None)
+            m, r = _zav_karta(res['po_id']); m = f"✅ Buyurtma #Z{res['po_id']} yaratildi\n\n" + m
+    elif act == 'c':
+        m, r = _zav_karta(_i(0))
+        if m is None: alert = "Buyurtma topilmadi"
+    elif act == 'h': m, r = _zav_tarix(_i(0))
+    elif act == 'st':
+        p = po_malumot(_i(0))
+        if not p: alert = "Topilmadi"
+        else:
+            m = f"🔄 #Z{p['id']} holati: {PO_NOM.get(p['status'])}\nYangi holatni tanlang:"
+            vs = [(k, n) for k, n in PO_HOLATLAR if k not in (p['status'], 'bekor')]
+            r = [[_btn(n, f"zav:ss:{p['id']}:{k}") for k, n in vs[i:i + 2]] for i in range(0, len(vs), 2)]
+            r.append([_btn("⬅️ Buyurtma", f"zav:c:{p['id']}")] + _x_btn('zav'))
+    elif act == 'ss':
+        res = zavod_holat(_i(0), arg[1] if len(arg) > 1 else '', user)
+        if not res['ok']: alert = res['error']
+        else: m, r = _zav_karta(_i(0)); m = f"✅ Holat: {PO_NOM[res['status']]}\n\n" + m
+    elif act == 'r': m, r = _zav_qabul_ekran(_i(0))
+    elif act == 'rl':
+        st['wait'] = f"rqty:{_i(0)}:{_i(1)}"
+        m, r = "📦 Nechta keldi? Sonini yozing:", [[_btn("⬅️ Qabul", f"zav:r:{_i(0)}")] + _x_btn('zav')]
+    elif act == 'ra':
+        if not _ui_done(ctx, f"zavra{st['id']}_{_i(0)}_{_i(1)}"):
+            await q.answer("Allaqachon qabul qilingan", show_alert=True); return
+        res = zavod_qabul(_i(0), None, user)
+        if not res['ok']: alert = res['error']
+        else:
+            m, r = _zav_karta(_i(0))
+            m = "✅ Omborga kirdi: " + ", ".join(f"{o['nom']} × {o['dona']} ({_usd2(o['tannarx'])})" for o in res['qabul']) + "\n\n" + m
+    elif act == 'p':
+        st['pay'] = {'po': _i(0), 'sum': 0, 'm': 'naqd', 'tok': secrets.token_hex(3)}; m, r = _zav_tolov_ekran(st)
+    elif act in ('pa', 'pc', 'pm', 'pok') and not st.get('pay'): alert = "Eskirgan"
+    elif act == 'pa':
+        po = po_malumot(st['pay']['po']); s = po['qoldiq'] if (arg[1] if len(arg) > 1 else '') == 'all' else round(po['qoldiq'] / 2, 2)
+        if s <= 0: alert = "Qarz qolmagan"
+        else: st['pay']['sum'] = s; m, r = _zav_tolov_ekran(st)
+    elif act == 'pc':
+        st['wait'] = 'pay'; m, r = "✍️ Summani yozing ($):", [[_btn("⬅️ Buyurtma", f"zav:c:{st['pay']['po']}")] + _x_btn('zav')]
+    elif act == 'pm':
+        if arg and arg[0] in TOLOV_USULLARI: st['pay']['m'] = arg[0]
+        m, r = _zav_tolov_ekran(st)
+    elif act == 'pok':
+        p = st['pay']
+        if (arg[0] if arg else '') != p['tok'] or not p.get('sum') or not _ui_done(ctx, 'zavpok' + p['tok']):
+            await q.answer("Allaqachon saqlangan yoki eskirgan", show_alert=True); return
+        res = zavod_tolov(p['po'], p['sum'], p['m'], user)
+        if not res.get('ok'): alert = res.get('error', 'Xato')
+        else:
+            st.pop('pay', None)
+            m, r = _zav_karta(p['po'])
+            m = f"✅ To'lov saqlandi: {_usd2(res['paid'])} ({res['method']}). Buyurtma qarzi: {_usd2(res['po_qoldiq'])}\n\n" + m
+    elif act == 'f':
+        m = "➕ Qaysi xarajat? (kelmagan tovar tannarxiga qo'shiladi, kassadan chiqadi)"
+        r = [[_btn("🏦 Bank", f"zav:fk:{_i(0)}:bank"), _btn("🚚 Yetkazish", f"zav:fk:{_i(0)}:yetkazish"), _btn("🛃 Bojxona", f"zav:fk:{_i(0)}:bojxona")],
+             [_btn("⬅️ Buyurtma", f"zav:c:{_i(0)}")] + _x_btn('zav')]
+    elif act == 'fk':
+        kind = arg[1] if len(arg) > 1 and arg[1] in ('bank', 'yetkazish', 'bojxona') else 'yetkazish'
+        st['wait'] = f"fee:{_i(0)}:{kind}"
+        m, r = f"✍️ {kind} summasini yozing ($). Usul kerak bo'lsa: 50 karta", [[_btn("⬅️ Buyurtma", f"zav:c:{_i(0)}")] + _x_btn('zav')]
+    elif act == 'cx':
+        p = po_malumot(_i(0))
+        if not p: alert = "Topilmadi"
+        else:
+            m = (f"🗑 #Z{p['id']} ni bekor qilasizmi?\n• To'langan {_usd2(p['tolangan'])} → zavodning bizga qarzi (debitorlik)\n"
+                 f"• Bank/yetkazish {_usd2(p['xarajat'])} → xarajat\nTovar qisman kelgan bo'lsa bekor qilib bo'lmaydi.")
+            r = [[_btn("✅ Ha, bekor qilish", f"zav:cxok:{p['id']}"), _btn("⬅️ Yo'q", f"zav:c:{p['id']}")]]
+    elif act == 'cxok':
+        res = zavod_bekor(_i(0), user)
+        if not res['ok']: alert = res['error']
+        else: m, r = _zav_karta(_i(0)); m = "🗑 Bekor qilindi.\n\n" + m
+    else: alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m[:4000], r)
+
+def _son(s):
+    try: return float(str(s).replace(',', '.').replace('$', '').strip())
+    except ValueError: return None
+
+async def zav_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st0 = ctx.user_data.get('zav')
+    if not st0 or not st0.get('wait') or not can(u, 'boshqaruv'): return False
+    st = _ui_ol(ctx, 'zav')
+    if st is None:
+        await u.message.reply_text("⏰ Oyna eskirgan. Qaytadan: 🏭 Zavod"); return True
+    w = st['wait']; st['wait'] = None
+    msg = (u.message.text or '').strip(); user = _ui_user(u)
+    m = r = None; d = st.get('d')
+    def qayta(xato):
+        st['wait'] = w
+        return f"⚠️ {xato}", [_x_btn('zav')]
+    if w == 'sup':
+        if len(msg) < 2: m, r = qayta("Nom juda qisqa")
+        else:
+            st['d'] = {'sup': msg[:60], 'lines': [], 'dep': 0.0, 'bank': 0.0, 'del': 0.0, 'exp': '', 'm': 'naqd', 'tok': secrets.token_hex(3)}
+            m, r = _zav_tovar_ekran(st, 0, 0)
+    elif not d and (w in ('dep', 'bank', 'del', 'exp') or w.startswith('qty:')):
+        m, r = "Qoralama eskirgan — ➕ Yangi buyurtma", [_x_btn('zav')]
+    elif w.startswith('qty:'):
+        pid = int(w.split(':')[1]); p = next((x for x in get_products(active_only=False) if x['id'] == pid), None)
+        bo = msg.replace('×', ' ').replace('x', ' ').split()
+        n = _son(bo[0]) if bo else None
+        narx = _son(bo[1]) if len(bo) > 1 else ((p.get('factory') or p.get('cost') or 0) if p else None)
+        if not p or n is None or n <= 0 or n != int(n) or narx is None or narx < 0:
+            m, r = qayta("Masalan: 20 45.5 (son va narx)")
+        else:
+            d['lines'].append({'pid': pid, 'name': p['name'], 'qty': int(n), 'cost': round(narx, 4)})
+            m, r = _zav_qoralama(st)
+    elif w in ('dep', 'bank', 'del'):
+        v = _son(msg)
+        if v is None or v < 0: m, r = qayta("Summani raqam bilan yozing")
+        else:
+            d[w] = round(v, 2); m, r = _zav_qoralama(st)
+    elif w == 'exp':
+        s = _sana_parse(msg)
+        if not s: m, r = qayta("Sana noto'g'ri. Masalan: 2026-11-20")
+        else: d['exp'] = _ds(s); m, r = _zav_qoralama(st)
+    elif w.startswith('rqty:'):
+        _, po, tid = w.split(':'); v = _son(msg)
+        if v is None or v <= 0 or v != int(v): m, r = qayta("Butun son yozing")
+        else:
+            res = zavod_qabul(int(po), {int(tid): int(v)}, user)
+            if not res['ok']: m, r = qayta(res['error'])
+            else:
+                m, r = _zav_karta(int(po))
+                m = "✅ Omborga kirdi: " + ", ".join(f"{o['nom']} × {o['dona']} ({_usd2(o['tannarx'])})" for o in res['qabul']) + "\n\n" + m
+    elif w == 'pay':
+        v = _son(msg); p = st.get('pay')
+        if not p: m, r = "Eskirgan", [_x_btn('zav')]
+        elif v is None or v <= 0: m, r = qayta("Summani raqam bilan yozing")
+        else:
+            qol = po_malumot(p['po'])['qoldiq']
+            if v > qol + 0.005: m, r = qayta(f"Ortiqcha: bu buyurtma qarzi faqat {_usd2(qol)}")
+            else: p['sum'] = round(v, 2); m, r = _zav_tolov_ekran(st)
+    elif w.startswith('fee:'):
+        _, po, kind = w.split(':'); bo = msg.split()
+        v = _son(bo[0]) if bo else None; usul = tolov_usuli(bo[1]) if len(bo) > 1 else 'naqd'
+        if v is None or v <= 0 or not usul: m, r = qayta("Masalan: 50 yoki 50 karta")
+        else:
+            res = zavod_xarajat(int(po), v, kind, usul, user)
+            if not res['ok']: m, r = qayta(res['error'])
+            else: m, r = _zav_karta(int(po)); m = f"✅ {kind} {_usd2(v)} tannarxga qo'shildi\n\n" + m
+    else:
+        return False
+    await u.message.reply_text(m[:4000], reply_markup=InlineKeyboardMarkup(r) if r else None)
+    return True
+
 
 async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
@@ -6323,8 +8808,10 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rol: return
     msg = u.message.text
     if msg in MENU_MAP:
-        if ctx.user_data.get('pos'): ctx.user_data['pos']['wait'] = None   # menyu bosildi — POS kutishi bekor
-    elif await pos_matn(u, ctx):
+        for _k in ('pos', 'omb', 'mij', 'his', 'zav'):            # menyu bosildi — tugmali oynalar kutishi bekor
+            if ctx.user_data.get(_k): ctx.user_data[_k]['wait'] = None
+    elif (await pos_matn(u, ctx) or await omb_matn(u, ctx) or await mij_matn(u, ctx)
+          or await his_matn_kirit(u, ctx) or await zav_matn(u, ctx)):
         return
     if rol == 'sotuvchi':
         await sotuvchi_matn(u, ctx, msg); return
@@ -7897,16 +10384,18 @@ def _xl_apply_one(c, pl):
     for st in pl['stock']:
         if st['new']:
             c.execute("SELECT id FROM products WHERE name=?", (st['name'],))
-            if c.fetchone():
-                c.execute("UPDATE products SET qty=?, cost=?, price=?, active=1 WHERE name=?",
-                          (st['qty'], st['cost'], st['price'], st['name']))
+            bor = c.fetchone()
+            if bor:
+                stock_set(c, bor[0], st['qty'], 'tuzatish', f"Excel {P}", new_cost=st['cost'])
+                c.execute("UPDATE products SET price=?, active=1 WHERE id=?", (st['price'], bor[0]))
             else:
                 c.execute("INSERT INTO products (name,cat,supplier,qty,cost,price,factory_price,warranty_days,active) "
                           "VALUES (?,?,?,?,?,?,0,90,1)",
                           (st['name'], st['cat'], st['sup'], st['qty'], st['cost'], st['price']))
+                if st['qty']: _sm_yoz(c, c.lastrowid, st['name'], int(st['qty']), int(st['qty']), 'yangi_tovar', st['cost'], f"Excel {P}")
         else:
-            c.execute("UPDATE products SET qty=?, cost=?, price=? WHERE id=?",
-                      (st['qty'], st['cost'], st['price'], st['pid']))
+            stock_set(c, st['pid'], st['qty'], 'tuzatish', f"Excel {P}", new_cost=st['cost'])
+            c.execute("UPDATE products SET price=? WHERE id=?", (st['price'], st['pid']))
     # 3) sotuvlar + kassa
     for s in pl['sales']:
         c.execute("INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) "
@@ -8258,8 +10747,8 @@ async def cmd_stock_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         (1,  15,  18, 21),  # Hc12g-B: 1ta
     ]
     for qty, cost, price, pid in updates:
-        c.execute('UPDATE products SET qty=?, cost=?, price=? WHERE id=?',
-                  (qty, cost, price, pid))
+        stock_set(c, pid, qty, 'tuzatish', '/stock_reset', new_cost=cost)
+        c.execute('UPDATE products SET price=? WHERE id=?', (price, pid))
     # Kassa qoldig'i ham yangilansin
     conn.commit(); conn.close()
     await u.message.reply_text(
@@ -8410,6 +10899,11 @@ def main():
     app.add_handler(CommandHandler('xodimlar', cmd_xodimlar))
     app.add_handler(CommandHandler('xodim_ochir', cmd_xodim_ochir))
     app.add_handler(CommandHandler('sotuvchilar', cmd_sotuvchilar))
+    app.add_handler(CommandHandler('ombor', cmd_ombor))
+    app.add_handler(CommandHandler('kam', cmd_kam))
+    app.add_handler(CommandHandler('qarzdorlar', cmd_qarzdorlar))
+    app.add_handler(CommandHandler('hisobotlar', cmd_hisobotlar))
+    app.add_handler(CommandHandler('zavod', cmd_zavod_ui))
     app.add_handler(CommandHandler('help', cmd_yordam))
     app.add_handler(CommandHandler('yordam', cmd_yordam))
     app.add_handler(CommandHandler('astatka', cmd_astatka))
@@ -8475,6 +10969,10 @@ def main():
     app.add_handler(CommandHandler('post_taklif', cmd_post_taklif))
     app.add_handler(CallbackQueryHandler(pos_callback, pattern=r'^pos:'))
     app.add_handler(CallbackQueryHandler(xodim_callback, pattern=r'^xod:'))
+    app.add_handler(CallbackQueryHandler(omb_callback, pattern=r'^omb:'))
+    app.add_handler(CallbackQueryHandler(mij_callback, pattern=r'^mij:'))
+    app.add_handler(CallbackQueryHandler(his_callback, pattern=r'^his:'))
+    app.add_handler(CallbackQueryHandler(zav_callback, pattern=r'^zav:'))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & STAFF, handle_text))
