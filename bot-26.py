@@ -2144,7 +2144,20 @@ async def _post_init(app):
     init_crm_tables()
     init_excel_tables()
     _bk_set_baseline()          # hozirgi holat = zaxiradagi holat (keraksiz zaxira bo'lmasin)
+    upd = _check_update_marker()
+    if upd:
+        _BK['migrate'] = True   # belgi o'chirilgani zaxiraga ham tushsin (keyingi restartda qayta aytmasin)
     asyncio.create_task(_scheduler(app))
+    if upd:
+        d, running = upd
+        if d.get('sha') and d.get('sha') == running:
+            text = (f"✅ Bot yangi versiyada ishga tushdi ({_local_now().strftime('%H:%M')}).\n"
+                    f"Fayl: {d.get('src', '')}, yuborilgan: {d.get('at', '')}")
+        else:
+            text = ("ℹ️ Bot qayta ishga tushdi, lekin ishlayotgan kod siz yuborgan fayldan farq qiladi — "
+                    "Railway hali eski versiyani ishlatayotgan bo'lishi mumkin. Bir necha daqiqadan keyin /start bosib tekshiring.")
+        try: await app.bot.send_message(chat_id=OWNER_ID, text=text)
+        except Exception: log.exception("yangilanish xabari")
     if _BK.get('restore_msg'):
         try: await app.bot.send_message(chat_id=OWNER_ID, text=_BK['restore_msg'])
         except Exception: log.exception("restore xabari")
@@ -5437,7 +5450,8 @@ async def handle_video_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── SELF-UPDATE (GitHub API) ──────────────────────────────────────
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 GITHUB_REPO  = os.getenv('GITHUB_REPO', 'ilyosbekdot/thermocraft-bot')
-BOT_FILENAME = os.getenv('BOT_FILENAME', 'bot-20.py')
+# Railway qaysi faylni ishga tushirayotgan bo'lsa — yangilanish o'sha faylga yoziladi
+BOT_FILENAME = os.getenv('BOT_FILENAME') or os.path.basename(os.path.abspath(__file__))
 
 # ── BAZA ZAXIRASI (GitHub) ────────────────────────────────────────
 # MUHIM: zaxira ALOHIDA branch'ga ("db-backup") yoziladi, main'ga EMAS.
@@ -5587,6 +5601,90 @@ def _gh_put_file(path, raw, message, branch):
         except Exception: err = r.text[:120]
         return False, f"GitHub {r.status_code}: {err}"
     return False, "GitHub: urinishlar tugadi"
+
+def _set_meta(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
+        if value is None:
+            conn.execute("DELETE FROM _meta WHERE key=?", (key,))
+        else:
+            conn.execute("INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)", (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _gh_json(r):
+    try: return r.json()
+    except Exception: return {}
+
+def _gh_err(r):
+    """GitHub xatosini o'qiladigan qilib beradi (javob JSON bo'lmasa ham yiqilmaydi)"""
+    j = _gh_json(r)
+    m = (j.get('message') if isinstance(j, dict) else '') or (r.text or '').strip()[:120]
+    return f"GitHub {r.status_code}" + (f": {m}" if m else "")
+
+def _gh_commit_contents(path, data, message, branch):
+    """Contents API orqali yozish → (ok, xato, status)"""
+    st, sha = _gh_file_sha(path, branch)
+    if st not in (200, 404): return False, f"GitHub {st}", st
+    payload = {"message": message, "content": base64.b64encode(data).decode(), "branch": branch}
+    if sha: payload["sha"] = sha
+    r = requests.put(_gh_api(f"contents/{path}"), json=payload, headers=_gh_headers(), timeout=120)
+    if r.status_code in (200, 201): return True, '', r.status_code
+    return False, _gh_err(r), r.status_code
+
+def _gh_commit_gitdata(path, data, message, branch):
+    """Zaxira yo'l — Git Data API (blob → tree → commit → ref). Contents API 5xx bersa ishlatiladi."""
+    H = _gh_headers()
+    r = requests.post(_gh_api("git/blobs"), headers=H, timeout=120,
+                      json={"content": base64.b64encode(data).decode(), "encoding": "base64"})
+    if r.status_code != 201: return False, "blob: " + _gh_err(r)
+    blob = _gh_json(r).get('sha')
+    for attempt in range(3):
+        r = requests.get(_gh_api(f"git/ref/heads/{branch}"), headers=H, timeout=20)
+        if r.status_code != 200: return False, "ref: " + _gh_err(r)
+        head = (_gh_json(r).get('object') or {}).get('sha')
+        r = requests.get(_gh_api(f"git/commits/{head}"), headers=H, timeout=20)
+        if r.status_code != 200: return False, "commit: " + _gh_err(r)
+        base_tree = (_gh_json(r).get('tree') or {}).get('sha')
+        r = requests.post(_gh_api("git/trees"), headers=H, timeout=60, json={
+            "base_tree": base_tree,
+            "tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob}]})
+        if r.status_code != 201: return False, "tree: " + _gh_err(r)
+        r = requests.post(_gh_api("git/commits"), headers=H, timeout=30,
+                          json={"message": message, "tree": _gh_json(r).get('sha'), "parents": [head]})
+        if r.status_code != 201: return False, "commit: " + _gh_err(r)
+        new = _gh_json(r).get('sha')
+        r = requests.patch(_gh_api(f"git/refs/heads/{branch}"), headers=H, timeout=20,
+                           json={"sha": new, "force": False})
+        if r.status_code == 200: return True, ''
+        if r.status_code == 422 and attempt < 2:        # branch shu orada siljidi — qayta
+            time.sleep(2); continue
+        return False, "ref: " + _gh_err(r)
+    return False, "urinishlar tugadi"
+
+def gh_commit_file(path, data, message, branch=None):
+    """Faylni GitHub'ga yozadi: 3 marta urinish, 5xx bo'lsa zaxira yo'l. → (ok, xabar)"""
+    branch = branch or _gh_default_branch()
+    last, st = '', 0
+    for wait in (0, 4, 10):
+        if wait: time.sleep(wait)
+        try:
+            ok, err, st = _gh_commit_contents(path, data, message, branch)
+        except Exception as e:
+            ok, err, st = False, str(e)[:120], 0
+        if ok: return True, ''
+        last = err
+        if not (st == 0 or st >= 500 or st in (409, 422)): break     # 401/403/404 — qayta urinish befoyda
+    if st == 0 or st >= 500:
+        try:
+            ok, err = _gh_commit_gitdata(path, data, message, branch)
+            if ok: return True, ''
+            last = f"{last}; {err}"
+        except Exception as e:
+            last = f"{last}; {str(e)[:120]}"
+    return False, last
 
 def db_backup_to_github(reason='', force=False):
     """Bazani GitHub'dagi ALOHIDA branch'ga zaxiralaydi (main'ga emas — deploy bo'lmaydi)"""
@@ -5776,65 +5874,94 @@ async def cmd_restore(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                f"💵 Kassa: {fmt(get_cash_balance())}")
 
 
-async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Bot o'zini yangilaydi — /update <raw_url>"""
-    if not is_owner(u): return
-    if not GITHUB_TOKEN:
-        await u.message.reply_text("❌ GITHUB_TOKEN Railway da sozlanmagan!"); return
-    args = ctx.args
-    if not args:
-        await u.message.reply_text(
-            "📌 *Bot yangilash*\n\nFormat:\n`/update <raw_url>`\n\n"
-            "Men yangi kod yozganda raw URL beraman!", parse_mode='Markdown'); return
+# ── BOT KODINI YANGILASH (Telegram'ga .py yuborish yoki /update <url>) ─────────
+def _git_blob_sha(data):
+    """GitHub'dagi fayl sha si bilan bir xil hisoblanadi (git blob sha1)"""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
-    raw_url = args[0]
-    await u.message.reply_text("⏳ Yangilanmoqda...")
-
+def _check_bot_code(data):
+    """Yangi kodni GitHub'ga yuborishdan OLDIN tekshiradi → (ok, sabab).
+    Buzuq fayl yuklansa Railway uni ishga tushira olmaydi va bot to'xtab qoladi."""
+    if len(data) < 20000:
+        return False, f"fayl juda kichik ({len(data) // 1024} KB) — chala yuklangan yoki boshqa fayl"
     try:
-        # 1. Yangi kodni yuklab olish
-        r = requests.get(raw_url, timeout=15)
-        if r.status_code != 200:
-            await u.message.reply_text(f"❌ URL topilmadi: {r.status_code}"); return
-        new_code = r.text
-        if len(new_code) < 100:
-            await u.message.reply_text("❌ Kod juda qisqa, xato URL?"); return
+        src = data.decode('utf-8')
+    except UnicodeDecodeError:
+        return False, "fayl matn (UTF-8) emas"
+    try:
+        compile(src, BOT_FILENAME, 'exec')
+    except SyntaxError as e:
+        return False, f"kodda xato: {e.msg} ({e.lineno}-qator) — bu fayl bilan bot ishga tushmaydi"
+    for need in ('def main(', 'Application.builder', 'BOT_TOKEN'):
+        if need not in src:
+            return False, f"bu ThermoCrafts bot fayliga o'xshamaydi ('{need}' yo'q)"
+    return True, ''
 
-        # 2. Hozirgi fayl SHA ni olish
-        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{BOT_FILENAME}"
-        headers = {
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        r2 = requests.get(api_url, headers=headers, timeout=10)
-        if r2.status_code != 200:
-            await u.message.reply_text(f"❌ GitHub API xato: {r2.status_code}"); return
-        sha = r2.json().get('sha', '')
+def _check_update_marker():
+    """Ishga tushganda: yangilash belgisi bo'lsa → (belgi, ishlayotgan_fayl_sha), belgini o'chiradi"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            v = _meta_get(conn, 'pending_update')
+            if not v: return None
+            conn.execute("DELETE FROM _meta WHERE key='pending_update'"); conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    try: d = json.loads(v)
+    except Exception: d = {}
+    try:
+        with open(os.path.abspath(__file__), 'rb') as f: running = _git_blob_sha(f.read())
+    except Exception: running = ''
+    return d, running
 
-        # 3. Faylni yangilash (GitHub API PUT)
-        content_b64 = base64.b64encode(new_code.encode('utf-8')).decode('utf-8')
-        payload = {
-            "message": f"Bot auto-update by owner",
-            "content": content_b64,
-            "sha": sha
-        }
-        r3 = requests.put(api_url, json=payload, headers=headers, timeout=30)
+async def _deploy_bot_code(msg, data, source):
+    """Tekshiradi → bazani zaxiralaydi → GitHub'ga yozadi (Railway o'zi qayta deploy qiladi)"""
+    if not GITHUB_TOKEN:
+        await msg.reply_text("❌ GITHUB_TOKEN Railway'da sozlanmagan."); return False
+    ok, why = _check_bot_code(data)
+    if not ok:
+        await msg.reply_text(f"❌ Yuklanmadi: {why}.\nHozirgi bot o'zgarishsiz ishlayapti."); return False
+    new_sha = _git_blob_sha(data)
+    branch = await asyncio.to_thread(_gh_default_branch)
+    try:
+        st, cur = await asyncio.to_thread(_gh_file_sha, BOT_FILENAME, branch)
+    except Exception:
+        st, cur = 0, None
+    if cur and cur == new_sha:
+        await msg.reply_text(f"ℹ️ Bu fayl GitHub'dagi {BOT_FILENAME} bilan bir xil — yangilash shart emas."); return False
+    await msg.reply_text(f"✅ Kod tekshirildi: {len(data) // 1024} KB, xatosiz.\n⏳ Avval baza zaxiralanmoqda...")
+    _set_meta('pending_update', json.dumps({'sha': new_sha, 'at': now_t(), 'src': source}, ensure_ascii=False))
+    bok, bmsg = await asyncio.to_thread(db_backup_to_github, "yangilanishdan oldin")
+    await msg.reply_text(("💾 " if bok else "⚠️ Zaxira: ") + bmsg + f"\n⏳ {BOT_FILENAME} GitHub'ga yuklanmoqda...")
+    cmsg = f"Bot update via Telegram — {datetime.now().strftime('%Y-%m-%d %H:%M')} ({source})"
+    ok, info = await asyncio.to_thread(gh_commit_file, BOT_FILENAME, data, cmsg, branch)
+    if ok:
+        await msg.reply_text(f"✅ {BOT_FILENAME} GitHub'ga yuklandi.\n"
+                             f"🚀 Railway 2–3 daqiqada yangi versiyani ishga tushiradi — bot ishga tushgach o'zi xabar beradi.")
+        return True
+    _set_meta('pending_update', None)
+    await msg.reply_text(
+        f"❌ GitHub faylni qabul qilmadi ({info}).\n"
+        "Odatda bu GitHub tomonidagi vaqtinchalik muammo. Hozirgi bot o'zgarishsiz ishlayapti.\n\n"
+        "• 15–30 daqiqadan keyin faylni qayta yuboring, yoki\n"
+        f"• sayt orqali yuklang: github.com/{GITHUB_REPO}/upload/{branch} (fayl nomi aynan {BOT_FILENAME})")
+    return False
 
-        if r3.status_code in (200, 201):
-            await u.message.reply_text(
-                "✅ *Bot yangilandi!*\n\n"
-                "📦 GitHub ga commit qilindi\n"
-                "🚀 Railway qayta deploy qilmoqda...\n"
-                "⏳ 1-2 daqiqada yangi bot ishlaydi!",
-                parse_mode='Markdown')
-        else:
-            err = r3.json().get('message', r3.text[:200])
-            await u.message.reply_text(f"❌ GitHub xato: {err}")
-
-    except requests.Timeout:
-        await u.message.reply_text("❌ Timeout — internet muammosi?")
+async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/update <raw_url> — kodni havoladan olib yangilaydi"""
+    if not is_owner(u): return
+    if not ctx.args:
+        await u.message.reply_text("Bot yangilash: .py faylni shu chatga yuboring, yoki /update <raw_url>"); return
+    await u.message.reply_text("⏳ Kod yuklab olinmoqda...")
+    try:
+        r = await asyncio.to_thread(requests.get, ctx.args[0], timeout=30)
     except Exception as e:
-        await u.message.reply_text(f"❌ Xato: {str(e)[:200]}")
+        await u.message.reply_text(f"❌ Havolani ochib bo'lmadi: {str(e)[:150]}"); return
+    if r.status_code != 200:
+        await u.message.reply_text(f"❌ Havola ishlamadi: HTTP {r.status_code}"); return
+    await _deploy_bot_code(u.message, r.content, 'url')
 
 
 # ── FAYL ORQALI AUTO-UPDATE ───────────────────────────────────────
@@ -5852,56 +5979,17 @@ async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("Qabul qilinadigan fayllar:\n• .xlsx — Excel jadval (astatka, sotuv, xarajat, kassa import)\n"
                                    "• .py — bot kodini yangilash")
         return
-    if not GITHUB_TOKEN:
-        await u.message.reply_text("❌ GITHUB_TOKEN sozlanmagan!")
-        return
-
-    await u.message.reply_text("⏳ Fayl qabul qilindi. Avval baza zaxiralanmoqda...")
-    bok, bmsg = await asyncio.to_thread(db_backup_to_github, "yangilanishdan oldin")
-    await u.message.reply_text(("💾 " if bok else "⚠️ Zaxira: ") + bmsg + "\n⏳ Kod yuklanmoqda...")
-
+    await u.message.reply_text(f"⏳ {doc.file_name} qabul qilindi, tekshirilmoqda...")
     try:
-        # 1. Telegram dan faylni yuklab olish
-        file = await ctx.bot.get_file(doc.file_id)
-        r = requests.get(file.file_path, timeout=30)
-        new_code = r.content
-
-        # 2. Hozirgi fayl SHA ni olish
-        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{BOT_FILENAME}"
-        headers = {
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        r2 = requests.get(api_url, headers=headers, timeout=10)
-        if r2.status_code != 200:
-            await u.message.reply_text(f"❌ GitHub API xato: {r2.status_code}")
-            return
-        sha = r2.json().get('sha', '')
-
-        # 3. GitHub ga yuklash
-        content_b64 = base64.b64encode(new_code).decode('utf-8')
-        payload = {
-            "message": f"Bot update via Telegram — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "content": content_b64,
-            "sha": sha
-        }
-        r3 = requests.put(api_url, json=payload, headers=headers, timeout=30)
-
-        if r3.status_code in (200, 201):
-            await u.message.reply_text(
-                "✅ *Bot yangilandi!*\n\n"
-                f"📄 Fayl: {doc.file_name}\n"
-                "📦 GitHub ga commit qilindi\n"
-                "🚀 Railway qayta deploy qilmoqda...\n"
-                "⏳ 1-2 daqiqada yangi bot ishlaydi!",
-                parse_mode='Markdown')
-        else:
-            err = r3.json().get('message', r3.text[:200])
-            await u.message.reply_text(f"❌ GitHub xato: {err}")
-
+        f = await ctx.bot.get_file(doc.file_id)
+        data = bytes(await f.download_as_bytearray())
     except Exception as e:
-        await u.message.reply_text(f"❌ Xato: {str(e)[:300]}")
+        await u.message.reply_text(f"❌ Faylni Telegram'dan yuklab bo'lmadi: {str(e)[:150]}"); return
+    try:
+        await _deploy_bot_code(u.message, data, doc.file_name or 'telegram')
+    except Exception as e:
+        log.exception("deploy")
+        await u.message.reply_text(f"❌ Yangilashda kutilmagan xato: {str(e)[:200]}\nHozirgi bot o'zgarishsiz ishlayapti.")
 
 
 # ══════════════════════════════════════════════════════════════════
