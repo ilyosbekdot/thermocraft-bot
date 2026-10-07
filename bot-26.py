@@ -549,33 +549,47 @@ def add_photo(product_id, file_id):
               (product_id, file_id, order))
     conn.commit(); conn.close()
 
-def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C', cash=True, method='naqd'):
-    """Sotuv BITTA tranzaksiyada: astatka kamayadi + sotuv yoziladi + kassaga kirim + kafolat.
-    Astatka yetmasa hech narsa yozilmaydi (avval sotuv yozilib, astatka/kassa o'zgarmay qolardi)."""
+def _sotuv_tx(c, now, pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C',
+              cash=True, method='naqd', seller_id=0, seller_name=''):
+    """Bitta sotuv qatori — CHAQIRUVCHINING tranzaksiyasi ichida (commit/rollback chaqiruvchida).
+    Astatka yetmasa None qaytaradi (hech narsa yozilmaydi). Aks holda (sale_id, revenue, profit)."""
     revenue = round(price * qty, 2)              # pul — sentgacha (313.3333*3 = 939.9999 bo'lib qolmasin)
     profit = round(revenue - (cost or 0) * qty, 2)
-    now = datetime.now()
     d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+    c.execute('UPDATE products SET qty=qty-? WHERE id=? AND qty>=?', (qty, pid, qty))
+    if c.rowcount == 0:
+        return None
+    c.execute('INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) VALUES (?,?,?,?,?,?,?,?,?,?)',
+              (d, t, pname, qty, cost, revenue, profit, discount, customer, ctype))
+    sale_id = c.lastrowid
+    if seller_id or seller_name:
+        c.execute('UPDATE sales SET seller_id=?, seller_name=? WHERE id=?', (int(seller_id or 0), seller_name or '', sale_id))
+    # Kafolat
+    c.execute('SELECT COALESCE(warranty_days,0) FROM products WHERE id=?', (pid,))
+    w = c.fetchone(); wdays = (w[0] or 0) if w else 0
+    if wdays > 0:
+        end = (now + timedelta(days=wdays)).strftime('%Y-%m-%d')
+        c.execute('INSERT INTO warranties (sale_id,product,customer,start_date,end_date) VALUES (?,?,?,?,?)',
+                  (sale_id, pname, customer, d, end))
+    # Kassa — shu tranzaksiya ichida (sotuv bor-u kassa yo'q holati bo'lmasin)
+    if cash:
+        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                  (d, t, 'kirim', revenue, 'sotuv', f'{pname} x{qty} (#{sale_id})', method or 'naqd'))
+    return sale_id, revenue, profit
+
+def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C', cash=True, method='naqd',
+              seller_id=0, seller_name=''):
+    """Sotuv BITTA tranzaksiyada: astatka kamayadi + sotuv yoziladi + kassaga kirim + kafolat.
+    Astatka yetmasa hech narsa yozilmaydi (avval sotuv yozilib, astatka/kassa o'zgarmay qolardi)."""
+    now = datetime.now()
     conn = db(); c = conn.cursor()
     try:
-        c.execute('UPDATE products SET qty=qty-? WHERE id=? AND qty>=?', (qty, pid, qty))
-        if c.rowcount == 0:
+        r = _sotuv_tx(c, now, pid, pname, qty, price, cost, discount, customer, ctype, cash, method,
+                      seller_id, seller_name)
+        if r is None:
             conn.rollback(); conn.close()
             return False, None
-        c.execute('INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                  (d, t, pname, qty, cost, revenue, profit, discount, customer, ctype))
-        sale_id = c.lastrowid
-        # Kafolat
-        c.execute('SELECT COALESCE(warranty_days,0) FROM products WHERE id=?', (pid,))
-        w = c.fetchone(); wdays = (w[0] or 0) if w else 0
-        if wdays > 0:
-            end = (now + timedelta(days=wdays)).strftime('%Y-%m-%d')
-            c.execute('INSERT INTO warranties (sale_id,product,customer,start_date,end_date) VALUES (?,?,?,?,?)',
-                      (sale_id, pname, customer, d, end))
-        # Kassa — shu tranzaksiya ichida (sotuv bor-u kassa yo'q holati bo'lmasin)
-        if cash:
-            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
-                      (d, t, 'kirim', revenue, 'sotuv', f'{pname} x{qty} (#{sale_id})', method or 'naqd'))
+        sale_id, revenue, profit = r
         conn.commit()
     except Exception:
         conn.rollback(); conn.close()
@@ -597,6 +611,76 @@ def save_sale(pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C'
     if ok:
         log_op('sale', {'sale_id':sale_id,'product':pname,'qty':qty,'price':price,'profit':profit})
     return ok, sale_id
+
+class _AstatkaYetmadi(Exception):
+    pass
+
+def pos_saqlash(qatorlar, mijoz='', cid=0, method='naqd', seller_id=0, seller_name='', ctype='B2C'):
+    """Savatni BITTA tranzaksiyada saqlaydi (hammasi yoki hech narsa).
+    qatorlar: [{'pid','name','qty','unit','disc'}] — unit: chegirmadan keyingi dona narxi ($).
+    Tannarx savatdan emas, bazadan olinadi. Nasiya: kassaga tushmaydi, mijozga bitta debitorlik yoziladi.
+    Qaytaradi: {'ok':True,'sales':[...],'jami','foyda','debt_id'} yoki {'ok':False,'error':...}."""
+    if not qatorlar:
+        return {'ok': False, 'error': "Savat bo'sh"}
+    if is_closed(today()):
+        return {'ok': False, 'error': f"{today()[:7]} davri yopilgan — sotuv yozib bo'lmaydi (/och)"}
+    nasiya = method == 'nasiya'
+    mijoz = (mijoz or '').strip()
+    if nasiya and not (mijoz and cid):
+        return {'ok': False, 'error': "Nasiya uchun mijoz tanlanishi kerak"}
+    if not nasiya and method not in TOLOV_USULLARI:
+        return {'ok': False, 'error': f"To'lov usuli noma'lum: {method}"}
+    now = datetime.now()
+    d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+    conn = db(); c = conn.cursor()
+    done = []; debt_id = None
+    try:
+        for q in qatorlar:
+            qty = int(q['qty'])
+            if qty <= 0: raise ValueError("Soni noto'g'ri")
+            c.execute('SELECT name, cost FROM products WHERE id=?', (q['pid'],))
+            row = c.fetchone()
+            if not row: raise _AstatkaYetmadi(q.get('name') or str(q['pid']))
+            r = _sotuv_tx(c, now, q['pid'], row[0], qty, float(q['unit']), row[1] or 0, round(float(q.get('disc') or 0), 1),
+                          mijoz, ctype, cash=not nasiya, method=(method if not nasiya else 'naqd'),
+                          seller_id=seller_id, seller_name=seller_name)
+            if r is None: raise _AstatkaYetmadi(row[0])
+            sid, rev, prof = r
+            if cid:
+                c.execute('UPDATE sales SET customer_id=? WHERE id=?', (cid, sid))
+            # Bekor qilish (undo) ro'yxati uchun — o'sha tranzaksiyada
+            c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)',
+                      (d, t, 'sale', json.dumps({'sale_id': sid, 'product': row[0], 'qty': qty,
+                                                  'price': float(q['unit']), 'profit': prof}, ensure_ascii=False)))
+            done.append({'sale_id': sid, 'product': row[0], 'qty': qty, 'summa': rev, 'foyda': prof})
+        jami = round(sum(x['summa'] for x in done), 2)
+        if nasiya:
+            izoh = ("nasiya: " + ", ".join(f"{x['product']} x{x['qty']}" for x in done)
+                    + " (" + ",".join(f"#s{x['sale_id']}" for x in done) + ")")
+            c.execute('INSERT INTO debts (date,person,amount,type,note) VALUES (?,?,?,?,?)',
+                      (d, mijoz, jami, DEBITOR, izoh))
+            debt_id = c.lastrowid
+            try:
+                c.execute('UPDATE debts SET customer_id=? WHERE id=?', (cid, debt_id))
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+    except _AstatkaYetmadi as e:
+        conn.rollback(); conn.close()
+        return {'ok': False, 'error': f"Astatka yetmadi: {e}. Savat saqlanmadi — hech narsa yozilmadi."}
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    # Muhim bo'lmagan yangilashlar (xato bo'lsa ham sotuv saqlangan)
+    if cid:
+        try:
+            yangila_jami(cid)
+            for x in done: reorder_yangila(cid, x['product'], d)
+        except Exception as e:
+            log.warning(f'pos mijoz yangilash: {e}')
+    return {'ok': True, 'sales': done, 'jami': jami,
+            'foyda': round(sum(x['foyda'] for x in done), 2), 'debt_id': debt_id}
 
 def reverse_sale(sale_id):
     """Sotuvni bekor qiladi: sotuv belgisi + astatka + kafolat + kassa qaytimi BITTA tranzaksiyada
@@ -1251,7 +1335,105 @@ def fmtuzs(n, rate=12500): return f"{n*rate:,.0f} so'm"
 def today(): return datetime.now().strftime('%Y-%m-%d')
 def this_month(): return datetime.now().strftime('%Y-%m')
 def now_t(): return datetime.now().strftime('%d.%m.%Y %H:%M')
-def is_owner(u): return u.effective_user.id == OWNER_ID
+
+# ── ROLLAR (owner / admin / sotuvchi) ─────────────────────────────
+# Egasi — OWNER_ID (bazada saqlanmaydi, uni o'zgartirib/o'chirib bo'lmaydi).
+# Xodimlar — `users` jadvalida. Rol har chaqiriqda bazadan o'qiladi: o'zgarish darhol kuchga kiradi.
+ROLLAR = ('admin', 'sotuvchi')
+ROL_NOMI = {'owner': 'egasi', 'admin': 'admin', 'sotuvchi': 'sotuvchi'}
+# Sotuvchi faqat shularni qila oladi (tannarx/foyda, hisobot, o'chirish, kassa, sozlama — yo'q)
+_SOTUVCHI_RUXSAT = frozenset({'pos', 'stock_view', 'customer_add', 'own_sales'})
+# Faqat egasi: xodimlarni boshqarish va tizim (kod yangilash, bazani tiklash, astatkani nollash)
+_FAQAT_EGA = frozenset({'roles', 'system'})
+try:
+    SOTUVCHI_MAX_CHEGIRMA = max(0.0, float(os.getenv('SELLER_MAX_DISCOUNT', '5') or 5))  # ixtiyoriy, majburiy emas
+except ValueError:
+    SOTUVCHI_MAX_CHEGIRMA = 5.0
+
+def init_users_table():
+    """Additiv: users jadvali + sotuvga sotuvchi ustunlari. Idempotent."""
+    conn = db(); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY, name TEXT DEFAULT '',
+        role TEXT DEFAULT 'sotuvchi', active INTEGER DEFAULT 1,
+        max_discount_pct REAL, created_at TEXT DEFAULT ''
+    )''')
+    for ddl in ("ALTER TABLE sales ADD COLUMN seller_id INTEGER DEFAULT 0",
+                "ALTER TABLE sales ADD COLUMN seller_name TEXT DEFAULT ''"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass       # ustun allaqachon bor
+    conn.commit(); conn.close()
+
+def _uid(u):
+    if isinstance(u, int): return u
+    us = getattr(u, 'effective_user', None) or getattr(u, 'from_user', None)
+    return getattr(us, 'id', None)
+
+def xodim(u):
+    """Foydalanuvchi ma'lumoti: {'id','name','role','active','max_discount'} yoki None (ro'yxatda yo'q / nofaol)."""
+    uid = _uid(u)
+    if uid is None: return None
+    if uid == OWNER_ID:
+        return {'id': uid, 'name': 'Egasi', 'role': 'owner', 'active': 1, 'max_discount': 100.0}
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute('SELECT name, role, active, max_discount_pct FROM users WHERE telegram_id=?', (uid,))
+        r = c.fetchone(); conn.close()
+    except sqlite3.OperationalError:
+        return None                                  # jadval hali yaratilmagan
+    if not r or not r[2] or r[1] not in ROLLAR: return None
+    md = r[3] if r[3] is not None else (SOTUVCHI_MAX_CHEGIRMA if r[1] == 'sotuvchi' else 100.0)
+    return {'id': uid, 'name': r[0] or str(uid), 'role': r[1], 'active': 1, 'max_discount': float(md)}
+
+def user_role(u):
+    x = xodim(u)
+    return x['role'] if x else None
+
+def can(u, perm):
+    """Markaziy ruxsat tekshiruvi. 'boshqaruv' — egasi/admin uchun umumiy boshqaruv (oldingi is_owner joylari)."""
+    rol = user_role(u)
+    if rol == 'owner': return True
+    if rol == 'admin': return perm not in _FAQAT_EGA
+    if rol == 'sotuvchi': return perm in _SOTUVCHI_RUXSAT
+    return False
+
+def is_owner(u): return _uid(u) == OWNER_ID      # faqat egasi (eski nom saqlandi)
+
+def xodim_saqla(tid, name, role, max_pct=None):
+    """Qo'shadi yoki yangilaydi (faollashtiradi). Qaytaradi: 'qoshildi' | 'yangilandi'."""
+    if role not in ROLLAR: raise ValueError(f"Rol noma'lum: {role}")
+    if int(tid) == OWNER_ID: raise ValueError("Egasi xodim sifatida qo'shilmaydi")
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT 1 FROM users WHERE telegram_id=?', (int(tid),))
+    bor = c.fetchone() is not None
+    if bor:
+        c.execute('UPDATE users SET name=?, role=?, active=1, max_discount_pct=COALESCE(?, max_discount_pct) '
+                  'WHERE telegram_id=?', (name, role, max_pct, int(tid)))
+    else:
+        c.execute('INSERT INTO users (telegram_id,name,role,active,max_discount_pct,created_at) VALUES (?,?,?,1,?,?)',
+                  (int(tid), name, role, max_pct, datetime.now().strftime('%Y-%m-%d %H:%M')))
+    conn.commit(); conn.close()
+    return 'yangilandi' if bor else 'qoshildi'
+
+def xodimlar_royxati():
+    conn = db(); c = conn.cursor()
+    c.execute('SELECT telegram_id, name, role, active, max_discount_pct, created_at FROM users ORDER BY active DESC, name')
+    rows = c.fetchall(); conn.close()
+    return [{'id': r[0], 'name': r[1] or str(r[0]), 'role': r[2], 'active': r[3],
+             'max_discount': (r[4] if r[4] is not None else (SOTUVCHI_MAX_CHEGIRMA if r[2] == 'sotuvchi' else 100.0)),
+             'created': r[5]} for r in rows]
+
+def xodim_ozgartir(tid, **kv):
+    """kv: role / active / max_discount_pct"""
+    ruxsat = {'role', 'active', 'max_discount_pct'}
+    sets = [(k, v) for k, v in kv.items() if k in ruxsat]
+    if not sets: return False
+    conn = db(); c = conn.cursor()
+    c.execute('UPDATE users SET ' + ', '.join(f'{k}=?' for k, _ in sets) + ' WHERE telegram_id=?',
+              [v for _, v in sets] + [int(tid)])
+    ok = c.rowcount > 0
+    conn.commit(); conn.close()
+    return ok
 
 def cash_flow_forecast():
     """30 kunlik cash flow prognozi"""
@@ -2427,12 +2609,12 @@ async def ai_agent(user_id: int, user_msg, ctx=None, persist=True) -> str:
     return final_text
 
 async def cmd_ai_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     hist_clear(u.effective_user.id)
     await u.message.reply_text("🧹 Suhbat tozalandi. Doimiy xotira saqlanib qoldi (/xotira).")
 
 async def cmd_xotira(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     mem = mem_list(60)
     if not mem:
         await u.message.reply_text(f"🧠 {AI_NAME} xotirasi hali bo'sh. Suhbatda mijoz, qaror, odatlaringizni ayting — eslab qoladi."); return
@@ -2444,7 +2626,7 @@ async def cmd_xotira(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Rasm → AI (vision) ───────────────────────────────────────────
 async def handle_photo_ai(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Rasm: caption'da 'kanal'/'post' bo'lsa — kanalga; aks holda AI tahlil qiladi"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     cap = (u.message.caption or "").strip()
     if any(w in cap.lower() for w in ("kanal", "post", "e'lon", "elon")):
         return await handle_photo_post(u, ctx)
@@ -2572,6 +2754,7 @@ def init_all_tables():
     init_erp_tables()
     init_crm_tables()
     init_excel_tables()
+    init_users_table()
 
 _BG_TASKS = set()
 
@@ -2581,6 +2764,7 @@ async def _post_init(app):
     init_erp_tables()
     init_crm_tables()
     init_excel_tables()
+    init_users_table()
     _bk_set_baseline()          # hozirgi holat = zaxiradagi holat (keraksiz zaxira bo'lmasin)
     upd = _check_update_marker()
     if upd:
@@ -3541,7 +3725,7 @@ def build_dashboard(path):
 
 async def cmd_dashboard(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/dashboard — biznes holatini bitta HTML faylda yuboradi"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     await u.message.reply_text("⏳ Dashboard tayyorlanmoqda...")
     try:
         p = f"/tmp/ThermoCrafts_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
@@ -3693,7 +3877,7 @@ td{{padding:8px 6px;border-bottom:1px solid #eee}} .c{{text-align:center}} .r{{t
 # ── BUYRUQLAR ─────────────────────────────────────────────────────
 async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/moliya [YYYY-MM|yil] — P&L, balans, cash flow"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     a = (ctx.args or [])
     davr = a[0] if a else this_month()
     if davr.lower() in ('yil', 'year'): davr = datetime.now().strftime('%Y')
@@ -3739,7 +3923,7 @@ async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_qarz_yosh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/qarz_yosh — qarzdorlik yoshi bo'yicha"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     q = qarz_yoshi()
     def blok(g, sarlavha, emoji):
         jami = sum(x['summa'] for b in g.values() for x in b)
@@ -3768,7 +3952,7 @@ async def cmd_qarz_yosh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_aylanish(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/aylanish — tovar aylanishi va band kapital"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     a = aylanish(90)
     t = "\U0001F504 TOVAR AYLANISHI (90 kun)\n\n"
     t += f"Band kapital: {fmt(a['jami_band_kapital'])}\n"
@@ -3799,7 +3983,7 @@ async def cmd_aylanish(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_yop(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/yop YYYY-MM — oyni yopadi"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     a = ctx.args or []
     if not a:
         yop = closed_list()
@@ -3821,7 +4005,7 @@ async def cmd_yop(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_och(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     a = ctx.args or []
     if not a or not re.match(r'^\d{4}-\d{2}$', a[0].strip()):
         await u.message.reply_text("Format: /och 2026-09"); return
@@ -3831,7 +4015,7 @@ async def cmd_och(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_hujjat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/hujjat [faktura|chek] Mijoz | Mahsulot x soni"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     a = ctx.args or []
     if not a:
         await u.message.reply_text(
@@ -3889,7 +4073,7 @@ async def cmd_hujjat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_deps(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/deps — PDF kutubxonasini GitHub requirements.txt ga qo'shadi"""
-    if not is_owner(u): return
+    if not can(u, 'system'): return
     if not GITHUB_TOKEN:
         await u.message.reply_text("GITHUB_TOKEN sozlanmagan."); return
     try:
@@ -3938,7 +4122,7 @@ _KAN_EMOJI = {'olx': '\U0001F4E6', 'instagram': '\U0001F4F8', 'telegram': '✈�
 
 
 async def cmd_mijoz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     q = ' '.join(ctx.args).strip() if ctx.args else ''
     if not q:
         await u.message.reply_text(
@@ -4011,7 +4195,7 @@ async def cmd_mijoz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_mijozlar_yangi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     c.execute("""SELECT cu.id, cu.name, cu.phone, cu.type, COALESCE(cu.channel,''),
                         COUNT(s.id), COALESCE(SUM(s.revenue),0), COALESCE(SUM(s.profit),0),
@@ -4060,7 +4244,7 @@ async def cmd_mijozlar_yangi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_bogla(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     msg = await u.message.reply_text("⏳ Bog'lanmoqda...")
     r = await asyncio.to_thread(bogla_hammasi)
     nsub = await asyncio.to_thread(sub_bogla)
@@ -4078,7 +4262,7 @@ async def cmd_bogla(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_birlashtir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     arg = ' '.join(ctx.args) if ctx.args else ''
     if '|' not in arg:
         await u.message.reply_text(
@@ -4098,7 +4282,7 @@ async def cmd_birlashtir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ulash(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Mijoz kartasini botdagi obunachiga ulash"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     args = ctx.args or []
     if len(args) < 2 or not args[-1].lstrip('-').isdigit():
         conn = db(); c = conn.cursor()
@@ -4128,7 +4312,7 @@ async def cmd_ulash(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_kanal(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     if len(ctx.args or []) < 2:
         await u.message.reply_text(
             "\U0001F4E1 *Mijoz kanali*\n\n`/kanal Alisher instagram`\n\n"
@@ -4144,7 +4328,7 @@ async def cmd_kanal(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_kanallar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     davr = (ctx.args[0] if ctx.args else '').strip()
     rows = await asyncio.to_thread(kanal_hisobot, davr)
     if not rows:
@@ -4170,7 +4354,7 @@ async def cmd_kanallar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_qayta(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     lst = await asyncio.to_thread(qayta_buyurtma, 5)
     rx = await asyncio.to_thread(rasxodniklar)
     if not lst:
@@ -4198,7 +4382,7 @@ async def cmd_qayta(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_qayta_ochir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     arg = ' '.join(ctx.args) if ctx.args else ''
     if '|' not in arg:
         await u.message.reply_text("`/qayta_ochir Alisher | qog'oz`", parse_mode='Markdown')
@@ -4212,7 +4396,7 @@ async def cmd_qayta_ochir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_rasxodnik(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     args = ctx.args or []
     if len(args) < 2 or not args[-1].isdigit():
         rx = await asyncio.to_thread(rasxodniklar)
@@ -4239,7 +4423,7 @@ async def cmd_rasxodnik(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_dalolatnoma(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     q = ' '.join(ctx.args).strip() if ctx.args else ''
     if not q:
         await u.message.reply_text(
@@ -4281,7 +4465,7 @@ async def cmd_dalolatnoma(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_brief(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/brief — ertalabki xulosani hozir ko'rish"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     await _briefing(ctx.application, 'evening' if _local_now().hour >= 15 else 'morning')
 
 
@@ -4308,6 +4492,11 @@ MENU_MAP = {
     "📢 OLX": "olx",
     "➕ Yangi tovar": "new_product",
     "↩️ Qayt etish": "undo_list",
+    "🛒 Sotuv": "pos",
+    "👷 Sotuvchilar": "sotuvchilar",
+    "📦 Qoldiq": "qoldiq",
+    "📋 Bugungi sotuvlarim": "mening",
+    "❓ Yordam": "yordam",
     "💵 Kassa": "kassa",
     "📉 Nelikvid": "nelikvid",
     "🔔 Eslatmalar": "eslatmalar",
@@ -4352,6 +4541,11 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'nelikvid':      await cmd_nelikvid(u, ctx)
     elif action == 'eslatmalar':    await cmd_eslatmalar(u, ctx)
     elif action == 'new_product':   await conv_start(u, ctx)
+    elif action == 'pos':           await pos_start(u, ctx)
+    elif action == 'sotuvchilar':   await cmd_sotuvchilar(u, ctx)
+    elif action == 'qoldiq':        await cmd_qoldiq(u, ctx)
+    elif action == 'mening':        await cmd_mening(u, ctx)
+    elif action == 'yordam':        await cmd_yordam(u, ctx)
     elif action == 'reklama_menu':
         await u.message.reply_text(
             "\U0001F4E3 *Reklama yuborish*\n\nFormat: `/reklama Xabar matni`\n\n"
@@ -4399,7 +4593,7 @@ async def cmd_start_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
 
 async def cmd_stop_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if is_owner(u): return
+    if user_role(u): return
     sub_off(u.effective_user.id)
     await u.message.reply_text("Obuna bekor qilindi. Qaytish uchun /start bosing.")
 
@@ -4420,9 +4614,12 @@ async def handle_text_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
 
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if user_role(u) == 'sotuvchi':
+        return await cmd_start_sotuvchi(u, ctx)
+    if not can(u, 'boshqaruv'): return
     rate = get_exchange_rate()
     kb = ReplyKeyboardMarkup([
+        ["🛒 Sotuv",      "👷 Sotuvchilar"],
         ["📦 Astatka",    "💰 Bugun"],
         ["📈 Oylik",      "📅 Yillik"],
         ["🚚 Yo'lda",    "💳 Zavod qarzi"],
@@ -4444,7 +4641,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_astatka(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     prods = get_products()
     rate = get_exchange_rate()
     text = f"📦 *ASTATKA* — {now_t()}\n\n"
@@ -4497,7 +4694,7 @@ async def cmd_astatka(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_narxlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     prods = get_products()
     text = "💵 *NARX JADVALI*\n_(Zavod | Sebest | Sotuv | Marja)_\n\n"
     for cat in ['Lazer', 'CNC', 'Press', "Qog'oz"]:
@@ -4516,7 +4713,7 @@ async def cmd_narxlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_bugun(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     sales = get_sales(today())
     exps_cogs = get_expenses(today(), 'cogs_bank') + get_expenses(today(), 'cogs_delivery')
     exps_period = get_expenses(today(), 'period')
@@ -4547,7 +4744,7 @@ async def cmd_bugun(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_oy(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     # /oy 2026-07 — CommandHandler oyni ctx.args da beradi (avval e'tiborsiz qolib, doim joriy oy chiqardi)
     if not month and getattr(ctx, 'args', None): month = ctx.args[0].strip()
     if not month: month = this_month()
@@ -4590,7 +4787,7 @@ async def cmd_oy(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_yil(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     year = datetime.now().strftime('%Y')
     # Yan–Avg 2026: Excel'dagi yakuniy raqamlar (o'zgarmadi). Qolgan oylar — bazadagi sotuvlardan.
     # (Avval faqat shu 8 oy + joriy oy chiqardi: oktyabrda sentyabr tushib qolardi, o'rtacha esa doim /9 edi.)
@@ -4620,7 +4817,7 @@ async def cmd_yil(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_yolda(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     c.execute("SELECT * FROM transit WHERE status='yolda' ORDER BY id DESC")
     rows = c.fetchall(); conn.close()
@@ -4644,7 +4841,7 @@ async def cmd_yolda(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_zavod_qarz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     c.execute("""SELECT supplier, SUM(total_cost), SUM(deposit), SUM(remaining), COUNT(*)
                  FROM transit WHERE status='yolda' OR remaining>0
@@ -4667,7 +4864,7 @@ async def cmd_zavod_qarz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_analiz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     items = abc_xyz_analysis()
     total_rev = sum(i['rev'] for i in items) or 1
     text = "📊 *ABC TAHLIL*\n_(A=80%, B=15%, C=5% daromad)_\n\n"
@@ -4716,7 +4913,7 @@ async def cmd_analiz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_mijozlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     c.execute("SELECT * FROM customers ORDER BY total_purchases DESC LIMIT 15")
     rows = c.fetchall(); conn.close()
@@ -4742,7 +4939,7 @@ async def cmd_mijozlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_qarzlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     c.execute("SELECT date, person, amount, type FROM debts WHERE paid=0 ORDER BY id DESC")
     rows = c.fetchall()
@@ -4803,7 +5000,7 @@ def _tolov_javob(r, uzs_izoh=''):
     return t
 
 async def _tolov_buyruq(u, ctx, turi, cmd, misol):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     p = _tolov_args(ctx.args)
     if not p:
         ochiq = ochiq_qarzlar(turi)
@@ -4829,7 +5026,7 @@ async def cmd_zavod_tolov(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _tolov_buyruq(u, ctx, KREDITOR, 'zavod_tolov', 'Two Trees 300 otkazma')
 
 async def cmd_xarajatlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     exps = get_expenses(this_month())
     label = datetime.now().strftime('%B %Y')
     cogs = [e for e in exps if e[4] in ('cogs_bank','cogs_delivery')]
@@ -4854,7 +5051,7 @@ async def cmd_xarajatlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_kafolat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     today_str = today()
     c.execute("SELECT * FROM warranties WHERE status='active' ORDER BY end_date")
@@ -4879,7 +5076,7 @@ async def cmd_kafolat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_cashflow(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     cf = cash_flow_forecast()
     text = "💵 *CASH FLOW PROGNOZ (30 kun)*\n\n"
     text += f"📈 Kutilayotgan tushum: *{fmt(cf['expected_30day'])}*\n"
@@ -4895,7 +5092,7 @@ async def cmd_cashflow(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_trend(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     months, change = get_sales_trend()
     text = "📈 *SAVDO TRENDI*\n\n"
     for m in months:
@@ -4910,7 +5107,7 @@ async def cmd_trend(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_rate(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     rate = get_exchange_rate()
     prods = get_products()
     text = "💱 *VALYUTA KURSI*\n\n"
@@ -4921,7 +5118,7 @@ async def cmd_rate(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_maqsad(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     now = datetime.now()
     c.execute('SELECT * FROM targets WHERE year=? AND month=?', (now.year, now.month))
@@ -4952,7 +5149,7 @@ async def cmd_maqsad(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_olx(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     conn = db(); c = conn.cursor()
     c.execute("SELECT * FROM olx_listings ORDER BY last_updated")
     rows = c.fetchall(); conn.close()
@@ -4972,7 +5169,7 @@ async def cmd_olx(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_raqobat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Raqobat tahlili — bizning narx vs bozor"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     since = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
     conn = db(); c = conn.cursor()
     c.execute("SELECT product,competitor,their_price,date,note FROM competitors WHERE date>=? ORDER BY date DESC", (since,))
@@ -5020,7 +5217,7 @@ async def cmd_raqobat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text)
 
 async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     ops = get_last_ops(8)
     if not ops:
         await u.message.reply_text("↩️ Qaytarish uchun operatsiya yo'q.", parse_mode='Markdown')
@@ -5041,7 +5238,7 @@ async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
 async def cmd_katalog(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     args = ctx.args
     if not args:
         await u.message.reply_text("Foydalanish: /katalog TTS 20 Pro")
@@ -5071,7 +5268,9 @@ async def cmd_katalog(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
 async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if user_role(u) == 'sotuvchi':
+        return await cmd_yordam_sotuvchi(u, ctx)
+    if not can(u, 'boshqaruv'): return
     text = (
         "📋 *Buyruqlar:*\n"
         "/astatka /narxlar /bugun /oy /yil\n"
@@ -5080,6 +5279,9 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/qarz\\_tolov /zavod\\_tolov /qarz\\_yosh\n"
         "/trend /rate /maqsad /olx /undo\n"
         "/katalog [nom] /yangi_tovar\n\n"
+        "🛒 *Tugmali sotuv:* /sotuv yoki 🛒 Sotuv tugmasi\n"
+        "👷 *Xodimlar:* /xodim\\_qosh /xodimlar /xodim\\_ochir\n"
+        "📊 Sotuvchilar hisoboti: /sotuvchilar · ID bilish: /id\n\n"
         "*Erkin yozish:*\n\n"
         "💰 *Sotuv:*\n`TTS 20 Pro sotdim 470 ga`\n"
         "`Sotuv tts 20 pro + honeycomb 400 + pump 470$ ga`\n"
@@ -5105,7 +5307,7 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── YANGI TOVAR QOSHISH (ConversationHandler) ─────────────────────
 async def conv_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return ConversationHandler.END
+    if not can(u, 'boshqaruv'): return ConversationHandler.END
     if u.callback_query:
         await u.callback_query.answer()
     ctx.user_data.clear()
@@ -5234,11 +5436,825 @@ async def conv_cancel(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── CALLBACK HANDLER ──────────────────────────────────────────────
+# ── 🛒 TUGMALI SOTUV (POS) ────────────────────────────────────────
+# Holat: ctx.user_data['pos'] (har foydalanuvchiga alohida). Faqat tugmalar; yozish — qidiruv, son, narx.
+# Saqlash: pos_saqlash() — butun savat bitta tranzaksiyada. Tasdiq ikki marta bosilsa ham bir marta yoziladi.
+POS_TTL = 1800                     # 30 daqiqa harakatsiz qolsa savat eskiradi
+POS_SAHIFA = 8
+POS_SONLAR = (1, 2, 3, 5, 10)
+POS_CHEGIRMALAR = (3, 5, 10, 15, 20)
+POS_USULLAR = (('naqd', '💵 Naqd'), ('karta', '💳 Karta'), ('payme', '📱 Payme'),
+               ('click', '📱 Click'), ('otkazma', "🏦 O'tkazma"), ('nasiya', '📝 Nasiya'))
+POS_USUL_NOMI = dict(POS_USULLAR)
+SOTUVCHI_KB = [["🛒 Sotuv", "📦 Qoldiq"], ["📋 Bugungi sotuvlarim", "❓ Yordam"]]
+
+def _btn(t, d): return InlineKeyboardButton(t, callback_data=d)
+def _pos_bekor(): return [_btn("❌ Bekor qilish", "pos:x")]
+def _pos_savat_btn(pos):
+    return [_btn(f"🧺 Savat ({len(pos['items'])})", "pos:cart")] if pos.get('items') else []
+
+def _pos_yangi(ctx):
+    pos = {'id': secrets.token_hex(4), 'ts': time.time(), 'items': [], 'disc': None,
+           'cust': None, 'method': None, 'wait': None, 'found': [], 'cats': []}
+    ctx.user_data['pos'] = pos
+    return pos
+
+def _pos_ol(ctx):
+    """Joriy savat; muddati o'tgan bo'lsa o'chiriladi va None qaytadi."""
+    pos = ctx.user_data.get('pos')
+    if not pos: return None
+    if time.time() - pos.get('ts', 0) > POS_TTL:
+        ctx.user_data.pop('pos', None)
+        return None
+    pos['ts'] = time.time()
+    return pos
+
+def _pos_son(s):
+    """'450', '450$', '1 250,5' → float; so'm (>=5000) → $ ga o'tkaziladi. Xato → None."""
+    t = re.sub(r'[^\d.,]', '', str(s or '')).replace(',', '.')
+    if not t or t.count('.') > 1: return None
+    try: v = float(t)
+    except ValueError: return None
+    return _to_usd(v, 0, get_exchange_rate()) if v >= 5000 else v
+
+def _pos_mahsulot(pid):
+    return next((p for p in get_products() if p['id'] == pid), None)
+
+def _pos_mavjud(pos, pid, qty_db, bundan_tashqari=False):
+    """Astatka minus savatdagi (o'zgartirilayotgan qator hisobga olinmasin desa — bundan_tashqari)."""
+    band = 0 if bundan_tashqari else sum(i['qty'] for i in pos['items'] if i['pid'] == pid)
+    return (qty_db or 0) - band
+
+def _pos_qator(pos, pid):
+    return next((i for i in pos['items'] if i['pid'] == pid), None)
+
+def pos_hisob(pos):
+    """Savat hisobi: qatorlar (base, final, unit, disc%), oraliq, chegirma, jami, samarali chegirma %."""
+    its = pos['items']
+    base = [round(i['price'] * i['qty'], 2) for i in its]
+    sub = round(sum(base), 2)
+    royxat = round(sum(i['list'] * i['qty'] for i in its), 2)
+    dsc = pos.get('disc'); D = 0.0
+    if dsc and sub > 0:
+        D = round(sub * dsc['val'] / 100, 2) if dsc['type'] == 'pct' else round(min(dsc['val'], sub), 2)
+    jami = round(sub - D, 2)
+    finals = _taqsimla(jami, base) if its else []
+    lines = []
+    for i, b, f in zip(its, base, finals, strict=True):
+        unit = f / i['qty']
+        disc = round((1 - unit / i['list']) * 100, 1) if i['list'] > 0 else 0.0
+        lines.append(dict(i, base=b, final=f, unit=unit, disc=max(0.0, disc)))
+    eff = round((1 - jami / royxat) * 100, 2) if royxat > 0 else 0.0
+    return {'lines': lines, 'sub': sub, 'D': D, 'jami': jami, 'royxat': royxat, 'eff': eff}
+
+def pos_limit_xato(pos, x):
+    """Sotuvchi chegirma limitidan oshsa — xato matni, aks holda None (egasi/admin — cheklovsiz)."""
+    if not x or x['role'] != 'sotuvchi': return None
+    mx = float(x['max_discount'])
+    h = pos_hisob(pos)
+    for ln in h['lines']:
+        eng_past = ln['list'] * (1 - mx / 100)
+        if ln['list'] > 0 and ln['unit'] < eng_past - 0.005:
+            return f"Chegirma limiti {mx:g}%. {ln['name']} uchun eng past narx {_usd2(eng_past)}"
+    if h['eff'] > mx + 0.01:
+        return f"Chegirma limiti {mx:g}% (hozir {h['eff']:.1f}%)"
+    return None
+
+def pos_savat_matn(pos, rate):
+    h = pos_hisob(pos)
+    out = ["🧺 Savat:"]
+    if not h['lines']: out.append("(bo'sh)")
+    for n, ln in enumerate(h['lines'], 1):
+        out.append(f"{n}. {ln['name']} × {ln['qty']} = {_usd2(ln['base'])}")
+        if abs(ln['price'] - ln['list']) > 0.004:
+            out.append(f"   narx {_usd2(ln['price'])}/dona (ro'yxatda {_usd2(ln['list'])})")
+    out.append("──────────────")
+    if h['D'] > 0:
+        dsc = pos['disc']
+        foiz = f" ({dsc['val']:g}%)" if dsc['type'] == 'pct' else ""
+        out.append(f"Oraliq: {_usd2(h['sub'])}")
+        out.append(f"Chegirma: −{_usd2(h['D'])}{foiz}")
+    out.append(f"JAMI: {_usd2(h['jami'])} ≈ {h['jami'] * rate:,.0f} so'm")
+    cust = pos.get('cust')
+    out.append("👤 Mijoz: " + (f"{cust['name']}" + (f" ({cust['phone']})" if cust.get('phone') else "")
+                              if cust else "oddiy xaridor"))
+    if pos.get('method'):
+        out.append("💳 To'lov: " + POS_USUL_NOMI.get(pos['method'], pos['method']))
+    return "\n".join(out), h
+
+# ── Ekranlar: (matn, tugmalar) ──
+def pos_ekran_kategoriya(pos):
+    prods = get_products()
+    cats = sorted({(p['cat'] or 'Boshqa') for p in prods})
+    pos['cats'] = cats
+    rows, row = [], []
+    for i, cn in enumerate(cats):
+        n = sum(1 for p in prods if (p['cat'] or 'Boshqa') == cn)
+        row.append(_btn(f"{cn[:24]} ({n})", f"pos:k:{i}:0"))
+        if len(row) == 2: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([_btn("🔍 Qidirish", "pos:s"), _btn("📋 Hammasi", "pos:k:-1:0")])
+    if pos['items']: rows.append(_pos_savat_btn(pos))
+    rows.append(_pos_bekor())
+    return "🛒 Sotuv — kategoriyani tanlang (yoki 🔍 Qidirish)", rows
+
+def _pos_royxat(pos, prods, sarlavha, page, nav_prefix):
+    prods = sorted(prods, key=lambda p: (_pos_mavjud(pos, p['id'], p['qty']) <= 0, p['name']))
+    pages = max(1, math.ceil(len(prods) / POS_SAHIFA))
+    page = min(max(0, page), pages - 1)
+    rows = []
+    for p in prods[page * POS_SAHIFA:(page + 1) * POS_SAHIFA]:
+        q = _pos_mavjud(pos, p['id'], p['qty'])
+        belgi = "❌ " if q <= 0 else ""
+        rows.append([_btn(f"{belgi}{p['name'][:28]} · {max(q, 0)} ta · {_usd2(p['price'] or 0)}", f"pos:p:{p['id']}")])
+    if pages > 1:
+        nav = []
+        if page > 0: nav.append(_btn("⬅️", f"{nav_prefix}:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{pages}", "pos:noop"))
+        if page < pages - 1: nav.append(_btn("➡️", f"{nav_prefix}:{page + 1}"))
+        rows.append(nav)
+    rows.append([_btn("🔍 Qidirish", "pos:s"), _btn("⬅️ Kategoriyalar", "pos:cats")])
+    if pos['items']: rows.append(_pos_savat_btn(pos))
+    rows.append(_pos_bekor())
+    matn = f"🛒 {sarlavha} — mahsulotni tanlang" + ("\n❌ — astatkada yo'q" if any(
+        _pos_mavjud(pos, p['id'], p['qty']) <= 0 for p in prods) else "")
+    if not prods: matn = f"🛒 {sarlavha}: hech narsa topilmadi"
+    return matn, rows
+
+def pos_ekran_mahsulotlar(pos, ci, page):
+    prods = get_products()
+    cats = pos.get('cats') or sorted({(p['cat'] or 'Boshqa') for p in prods})
+    if 0 <= ci < len(cats):
+        sel = [p for p in prods if (p['cat'] or 'Boshqa') == cats[ci]]; nom = cats[ci]
+    else:
+        sel = prods; nom = "Hammasi"
+    return _pos_royxat(pos, sel, nom, page, f"pos:k:{ci}")
+
+def pos_qidir(q):
+    prods = get_products()
+    p, cands = match_product(q, prods=prods)
+    nomlar = [p['name']] if p else [c_['name'] for c_ in (cands or [])]
+    n = _nrm(q)
+    for x in prods:
+        if n and n in _nrm(x['name']) and x['name'] not in nomlar: nomlar.append(x['name'])
+    by = {x['name']: x for x in prods}
+    return [by[nm] for nm in nomlar if nm in by][:40]
+
+def pos_ekran_qidiruv(pos, page=0):
+    prods = [p for p in get_products() if p['id'] in set(pos.get('found') or [])]
+    return _pos_royxat(pos, prods, "Qidiruv natijasi", page, "pos:f")
+
+def pos_ekran_son(pos, p, rate):
+    q = _pos_mavjud(pos, p['id'], p['qty'])
+    bor = _pos_qator(pos, p['id'])
+    matn = (f"📦 {p['name']}\nNarx: {_usd2(p['price'] or 0)} ≈ {(p['price'] or 0) * rate:,.0f} so'm\n"
+            f"Sotsa bo'ladi: {max(q, 0)} ta" + (f" (savatda {bor['qty']} ta bor)" if bor else "") + "\n\nNechta?")
+    btns = [_btn(str(n), f"pos:q:{p['id']}:{n}") for n in POS_SONLAR if n <= q]
+    rows = [btns] if btns else []
+    rows.append([_btn("✍️ Boshqa son", f"pos:qc:{p['id']}")])
+    rows.append([_btn("⬅️ Orqaga", "pos:cats")] + _pos_savat_btn(pos))
+    rows.append(_pos_bekor())
+    return matn, rows
+
+def pos_ekran_savat(pos, rate, izoh=''):
+    if not pos['items']:
+        m, r = pos_ekran_kategoriya(pos)
+        return ((izoh + "\n\n") if izoh else "") + "🧺 Savat bo'sh.\n" + m, r
+    matn, _ = pos_savat_matn(pos, rate)
+    rows = [[_btn("➕ Yana tovar", "pos:cats"), _btn("✏️ Tahrirlash", "pos:ed")],
+            [_btn("💸 Chegirma", "pos:d"), _btn("👤 Mijoz", "pos:mj")],
+            [_btn("💳 To'lov", "pos:pay")],
+            _pos_bekor()]
+    return ((izoh + "\n\n") if izoh else "") + matn, rows
+
+def pos_ekran_tahrir(pos):
+    rows = [[_btn(f"{n}. {i['name'][:28]} × {i['qty']}", f"pos:e:{i['pid']}")] for n, i in enumerate(pos['items'], 1)]
+    rows.append([_btn("⬅️ Savat", "pos:cart")])
+    rows.append(_pos_bekor())
+    return "✏️ Qaysi qatorni o'zgartirasiz?", rows
+
+def pos_ekran_qator(pos, it, x):
+    matn = (f"✏️ {it['name']}\nSoni: {it['qty']} ta\nNarx: {_usd2(it['price'])}/dona"
+            f" (ro'yxatda {_usd2(it['list'])})\nQator: {_usd2(it['price'] * it['qty'])}")
+    if x and x['role'] == 'sotuvchi':
+        matn += f"\n\nSizning chegirma limitingiz: {x['max_discount']:g}%"
+    rows = [[_btn("➖ 1", f"pos:ei:{it['pid']}:-1"), _btn("➕ 1", f"pos:ei:{it['pid']}:1")],
+            [_btn("✍️ Soni", f"pos:eq:{it['pid']}"), _btn("✍️ Narx", f"pos:ep:{it['pid']}")],
+            [_btn("🗑 O'chirish", f"pos:er:{it['pid']}")],
+            [_btn("⬅️ Savat", "pos:cart")], _pos_bekor()]
+    return matn, rows
+
+def pos_ekran_chegirma(pos, x, rate):
+    matn, h = pos_savat_matn(pos, rate)
+    mx = float(x['max_discount']) if x and x['role'] == 'sotuvchi' else None
+    matn = "💸 Chegirma\n\n" + matn + (f"\n\nSizning limitingiz: {mx:g}%" if mx is not None else "")
+    btns = [_btn(f"{p}%", f"pos:dv:{p}") for p in POS_CHEGIRMALAR if mx is None or p <= mx + 1e-9]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([_btn("✍️ Foiz (%)", "pos:dp"), _btn("✍️ Summa ($)", "pos:du")])
+    if pos.get('disc'): rows.append([_btn("🚫 Chegirmani olib tashlash", "pos:d0")])
+    rows.append([_btn("⬅️ Savat", "pos:cart")])
+    rows.append(_pos_bekor())
+    return matn, rows
+
+def _pos_oxirgi_mijozlar(n=6):
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("SELECT c.id, c.name, c.phone FROM sales s JOIN customers c ON c.id=s.customer_id "
+                  "WHERE s.customer_id>0 GROUP BY c.id ORDER BY MAX(s.id) DESC LIMIT ?", (n,))
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    if not rows:
+        rows = [(m['id'], m['nom'], m['tel']) for m in mijoz_qidir('')[:n]]
+    return [{'id': r[0], 'name': r[1], 'phone': r[2] or ''} for r in rows]
+
+def pos_ekran_mijoz(pos, royxat=None, sarlavha=None):
+    royxat = _pos_oxirgi_mijozlar() if royxat is None else royxat
+    matn = ("📝 Nasiya uchun mijozni tanlang (majburiy)\n\n" if pos.get('method') == 'nasiya' and not pos.get('cust') else "")
+    matn += (sarlavha or "👤 Mijoz — oxirgi xaridorlar:") + ("" if royxat else "\n(topilmadi)")
+    rows = [[_btn(f"{m['name'][:30]}" + (f" · {m['phone'][-4:]}" if m.get('phone') else ""), f"pos:mc:{m['id']}")]
+            for m in royxat[:8]]
+    rows.append([_btn("🔍 Qidirish", "pos:ms"), _btn("➕ Yangi mijoz", "pos:mn")])
+    if pos.get('method') != 'nasiya':
+        rows.append([_btn("🚶 Mijozsiz (oddiy xaridor)", "pos:mw")])
+    rows.append([_btn("⬅️ Savat", "pos:cart")])
+    rows.append(_pos_bekor())
+    return matn, rows
+
+def pos_ekran_tolov(pos, rate):
+    matn, _ = pos_savat_matn(pos, rate)
+    btns = [_btn(nom, f"pos:m:{k}") for k, nom in POS_USULLAR]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([_btn("⬅️ Savat", "pos:cart")])
+    rows.append(_pos_bekor())
+    return "💳 To'lov usulini tanlang\n\n" + matn, rows
+
+def pos_ekran_tasdiq(pos, rate):
+    matn, _ = pos_savat_matn(pos, rate)
+    if pos.get('method') == 'nasiya':
+        matn += "\n\n📝 Nasiya: kassaga tushmaydi, mijoz qarzi (debitorlik) yoziladi."
+    rows = [[_btn("✅ Tasdiqlash", f"pos:ok:{pos['id']}")],
+            [_btn("⬅️ Savat", "pos:cart"), _btn("💳 Usul", "pos:pay")],
+            _pos_bekor()]
+    return "✅ Tekshiring va tasdiqlang\n\n" + matn, rows
+
+def pos_chek_matn(res, h, pos, x, rate):
+    s0 = res['sales'][0]['sale_id']
+    out = [f"🧾 CHEK №S-{s0}", now_t(), f"Sotuvchi: {x['name']}"]
+    cust = pos.get('cust')
+    if cust: out.append(f"Mijoz: {cust['name']}" + (f" ({cust['phone']})" if cust.get('phone') else ""))
+    out.append("──────────────")
+    for n, (ln, sv) in enumerate(zip(h['lines'], res['sales'], strict=True), 1):
+        out.append(f"{n}. {ln['name']} × {ln['qty']} = {_usd2(sv['summa'])}")
+        out.append(f"   {_usd2(ln['unit'])}/dona" + (f", −{ln['disc']:g}%" if ln['disc'] >= 0.1 else ""))
+    out.append("──────────────")
+    if h['D'] > 0:
+        out.append(f"Oraliq: {_usd2(h['sub'])}")
+        out.append(f"Chegirma: −{_usd2(h['D'])}")
+    out.append(f"JAMI: {_usd2(res['jami'])} ≈ {res['jami'] * rate:,.0f} so'm")
+    out.append("To'lov: " + POS_USUL_NOMI.get(pos['method'], pos['method']))
+    if pos['method'] == 'nasiya':
+        out.append(f"📝 Mijoz qarzi (debitorlik): {_usd2(res['jami'])}")
+    out.append("Rahmat! 🙏")
+    return "\n".join(out)
+
+async def _pos_chiqar(q, matn, rows):
+    """Callback xabarini tahrirlaydi (bo'lmasa yangi xabar)."""
+    mk = InlineKeyboardMarkup(rows) if rows else None
+    try:
+        await q.edit_message_text(matn[:4000], reply_markup=mk)
+    except BadRequest as e:
+        if 'not modified' in str(e).lower(): return
+        await q.message.reply_text(matn[:4000], reply_markup=mk)
+
+async def pos_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/sotuv va 🛒 Sotuv tugmasi"""
+    if not can(u, 'pos'): return
+    pos = _pos_ol(ctx)
+    if pos and pos['items']:
+        pos['wait'] = None
+        m, r = pos_ekran_savat(pos, get_exchange_rate(), "↪️ Oldingi savat davom etmoqda")
+    else:
+        pos = _pos_yangi(ctx)
+        m, r = pos_ekran_kategoriya(pos)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+def _pos_qosh(pos, p, n):
+    it = _pos_qator(pos, p['id'])
+    if it: it['qty'] += n
+    else: pos['items'].append({'pid': p['id'], 'name': p['name'], 'qty': n,
+                               'list': float(p['price'] or 0), 'price': float(p['price'] or 0)})
+
+async def _pos_tasdiq(u, ctx, cart_id):
+    q = u.callback_query
+    done = ctx.user_data.setdefault('pos_done', [])
+    if cart_id in done:
+        await q.answer("✅ Bu savat allaqachon saqlangan", show_alert=True); return
+    pos = _pos_ol(ctx)
+    if not pos or pos.get('id') != cart_id:
+        await q.answer("Savat topilmadi yoki eskirgan. 🛒 Sotuv'dan qayta boshlang.", show_alert=True); return
+    if pos.get('saving'):
+        await q.answer("⏳ Saqlanmoqda..."); return
+    x = xodim(u)
+    xato = None
+    if not pos['items']: xato = "Savat bo'sh"
+    elif not pos.get('method'): xato = "Avval to'lov usulini tanlang"
+    elif pos['method'] == 'nasiya' and not pos.get('cust'): xato = "Nasiya uchun mijoz tanlang"
+    elif any(i['price'] <= 0 for i in pos['items']): xato = "Narxi 0 bo'lgan qator bor — ✏️ Tahrirlash orqali narx kiriting"
+    else: xato = pos_limit_xato(pos, x)
+    if xato:
+        await q.answer(xato[:190], show_alert=True); return
+    h = pos_hisob(pos)
+    qatorlar = [{'pid': ln['pid'], 'name': ln['name'], 'qty': ln['qty'], 'unit': ln['unit'], 'disc': ln['disc']}
+                for ln in h['lines']]
+    cust = pos.get('cust') or {}
+    pos['saving'] = True                         # await'dan OLDIN — ikkinchi bosish kutib turmaydi
+    await q.answer("⏳ Saqlanmoqda...")
+    try:
+        res = await asyncio.to_thread(pos_saqlash, qatorlar, cust.get('name', ''), cust.get('id', 0),
+                                      pos['method'], x['id'], x['name'], cust.get('type') or 'B2C')
+    except Exception as e:
+        pos['saving'] = False
+        log.exception("pos_saqlash")
+        await _pos_chiqar(q, f"⚠️ Saqlashda xato: {str(e)[:150]}\nHech narsa yozilmadi.",
+                          [[_btn("⬅️ Savat", "pos:cart")], _pos_bekor()])
+        return
+    pos['saving'] = False
+    if not res.get('ok'):
+        m, r = pos_ekran_savat(pos, get_exchange_rate(), "⚠️ " + res.get('error', 'Saqlanmadi'))
+        await _pos_chiqar(q, m, r); return
+    done.append(cart_id); del done[:-30]
+    ctx.user_data.pop('pos', None)
+    rate = get_exchange_rate()
+    chek = pos_chek_matn(res, h, pos, x, rate)
+    arxiv = ctx.user_data.setdefault('pos_chek', {})
+    arxiv[cart_id] = {'mijoz': cust.get('name', ''),
+                      'qatorlar': [(ln['name'], ln['qty'], round(ln['unit'], 2)) for ln in h['lines']]}
+    for k in list(arxiv)[:-5]: arxiv.pop(k, None)
+    await _pos_chiqar(q, chek, [[_btn("🧾 Hisob-faktura", f"pos:inv:{cart_id}")],
+                                [_btn("🛒 Yangi sotuv", "pos:start")]])
+
+async def _pos_faktura(u, ctx, cart_id):
+    q = u.callback_query
+    d = (ctx.user_data.get('pos_chek') or {}).get(cart_id)
+    if not d:
+        await q.answer("Chek ma'lumoti topilmadi (bot qayta ishga tushgan bo'lishi mumkin)", show_alert=True); return
+    await q.answer("⏳ Hujjat tayyorlanmoqda...")
+    try:
+        base = f"/tmp/doc_{datetime.now().strftime('%Y%m%d%H%M%S')}_{cart_id}.pdf"
+        p, raqam, jami, is_pdf = await asyncio.to_thread(build_hujjat, base, 'faktura', d['mijoz'], d['qatorlar'])
+        with open(p, 'rb') as fh:
+            await ctx.bot.send_document(chat_id=u.effective_chat.id, document=fh,
+                                        filename=f"{raqam}.{'pdf' if is_pdf else 'html'}",
+                                        caption=f"📄 {raqam} · {_usd2(jami)}")
+        try: os.remove(p)
+        except Exception: pass
+    except Exception as e:
+        log.exception("pos faktura")
+        await q.message.reply_text(f"⚠️ Hujjat xatosi: {str(e)[:200]}")
+
+async def pos_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """'pos:' tugmalari (on_callback'dan OLDIN ro'yxatga olinadi)"""
+    q = u.callback_query
+    if not can(u, 'pos'):
+        await q.answer(); return
+    parts = (q.data or '').split(':')
+    act = parts[1] if len(parts) > 1 else ''
+    arg = parts[2:]
+    if act == 'ok': return await _pos_tasdiq(u, ctx, arg[0] if arg else '')
+    if act == 'inv': return await _pos_faktura(u, ctx, arg[0] if arg else '')
+    if act == 'noop':
+        await q.answer(); return
+    x = xodim(u)
+    rate = get_exchange_rate()
+    if act == 'start':
+        pos = _pos_ol(ctx) or _pos_yangi(ctx)
+        await q.answer()
+        m, r = pos_ekran_savat(pos, rate) if pos['items'] else pos_ekran_kategoriya(pos)
+        return await _pos_chiqar(q, m, r)
+    pos = _pos_ol(ctx)
+    if pos is None:
+        await q.answer()
+        return await _pos_chiqar(q, "⏰ Savat muddati o'tgan yoki yopilgan. Hech narsa yozilmadi.",
+                                 [[_btn("🛒 Yangi sotuv", "pos:start")]])
+    pos['wait'] = None
+
+    def _int(i, default=0):
+        try: return int(arg[i])
+        except (IndexError, ValueError): return default
+
+    m = r = None
+    alert = None
+    if act == 'x':
+        ctx.user_data.pop('pos', None)
+        await q.answer("Bekor qilindi")
+        return await _pos_chiqar(q, "❌ Sotuv bekor qilindi. Hech narsa yozilmadi.", None)
+    elif act == 'cats':
+        m, r = pos_ekran_kategoriya(pos)
+    elif act == 'k':
+        m, r = pos_ekran_mahsulotlar(pos, _int(0, -1), _int(1))
+    elif act == 'f':
+        m, r = pos_ekran_qidiruv(pos, _int(0))
+    elif act == 's':
+        pos['wait'] = 'search'
+        m, r = "🔍 Mahsulot nomini yozing (masalan: tts 20):", [[_btn("⬅️ Kategoriyalar", "pos:cats")], _pos_bekor()]
+    elif act == 'p':
+        p = _pos_mahsulot(_int(0))
+        if not p: alert = "Mahsulot topilmadi"
+        elif _pos_mavjud(pos, p['id'], p['qty']) <= 0: alert = f"❌ {p['name']} — astatkada yo'q (savatdagisi hisobga olindi)"
+        elif (p['price'] or 0) <= 0 and x['role'] == 'sotuvchi': alert = "Bu mahsulotga narx qo'yilmagan — egasiga ayting"
+        else: m, r = pos_ekran_son(pos, p, rate)
+    elif act == 'q':
+        p = _pos_mahsulot(_int(0)); n = _int(1)
+        if not p or n <= 0: alert = "Xato tanlov"
+        elif n > _pos_mavjud(pos, p['id'], p['qty']): alert = f"Astatka yetmaydi: {max(0, _pos_mavjud(pos, p['id'], p['qty']))} ta bor"
+        else:
+            _pos_qosh(pos, p, n)
+            m, r = pos_ekran_savat(pos, rate, f"✅ {p['name']} × {n} qo'shildi")
+    elif act == 'qc':
+        p = _pos_mahsulot(_int(0))
+        if not p: alert = "Mahsulot topilmadi"
+        else:
+            pos['wait'] = f"qty:{p['id']}"
+            m, r = (f"✍️ {p['name']} — nechta? (sotsa bo'ladi: {max(0, _pos_mavjud(pos, p['id'], p['qty']))} ta)\nSonni yozing:",
+                    [[_btn("⬅️ Orqaga", f"pos:p:{p['id']}")], _pos_bekor()])
+    elif act == 'cart':
+        m, r = pos_ekran_savat(pos, rate)
+    elif act == 'ed':
+        m, r = pos_ekran_tahrir(pos) if pos['items'] else pos_ekran_savat(pos, rate)
+    elif act in ('e', 'ei', 'eq', 'ep', 'er'):
+        it = _pos_qator(pos, _int(0))
+        if not it:
+            alert = "Bu qator savatda yo'q"; m, r = pos_ekran_savat(pos, rate)
+        elif act == 'e':
+            m, r = pos_ekran_qator(pos, it, x)
+        elif act == 'ei':
+            yangi = it['qty'] + _int(1)
+            p = _pos_mahsulot(it['pid'])
+            if yangi <= 0: alert = "Kamida 1 ta. O'chirish uchun 🗑 bosing"
+            elif not p or yangi > (p['qty'] or 0): alert = f"Astatka yetmaydi: {(p or {}).get('qty', 0)} ta bor"
+            else: it['qty'] = yangi
+            m, r = pos_ekran_qator(pos, it, x)
+        elif act == 'eq':
+            pos['wait'] = f"eq:{it['pid']}"
+            m, r = f"✍️ {it['name']} — yangi sonni yozing:", [[_btn("⬅️ Orqaga", f"pos:e:{it['pid']}")], _pos_bekor()]
+        elif act == 'ep':
+            pos['wait'] = f"ep:{it['pid']}"
+            lim = ""
+            if x['role'] == 'sotuvchi':
+                lim = f"\nEng past: {_usd2(it['list'] * (1 - x['max_discount'] / 100))} (limit {x['max_discount']:g}%)"
+            m, r = (f"✍️ {it['name']} — dona narxini yozing ($; so'mda yozsangiz o'zi o'giradi):{lim}",
+                    [[_btn("⬅️ Orqaga", f"pos:e:{it['pid']}")], _pos_bekor()])
+        elif act == 'er':
+            pos['items'].remove(it)
+            m, r = pos_ekran_savat(pos, rate, f"🗑 {it['name']} olib tashlandi")
+    elif act == 'd':
+        m, r = pos_ekran_chegirma(pos, x, rate)
+    elif act == 'dv':
+        eski = pos.get('disc')
+        pos['disc'] = {'type': 'pct', 'val': float(_int(0))}
+        xato = pos_limit_xato(pos, x)
+        if xato: pos['disc'] = eski; alert = xato
+        m, r = pos_ekran_savat(pos, rate) if not xato else pos_ekran_chegirma(pos, x, rate)
+    elif act in ('dp', 'du'):
+        pos['wait'] = act
+        m, r = ("✍️ Chegirma foizini yozing (masalan: 7):" if act == 'dp' else "✍️ Chegirma summasini yozing ($, masalan: 25):",
+                [[_btn("⬅️ Orqaga", "pos:d")], _pos_bekor()])
+    elif act == 'd0':
+        pos['disc'] = None
+        m, r = pos_ekran_savat(pos, rate, "Chegirma olib tashlandi")
+    elif act == 'mj':
+        m, r = pos_ekran_mijoz(pos)
+    elif act == 'ms':
+        pos['wait'] = 'ms'
+        m, r = "🔍 Mijoz ismi yoki telefonini yozing:", [[_btn("⬅️ Orqaga", "pos:mj")], _pos_bekor()]
+    elif act == 'mn':
+        if not can(u, 'customer_add'): alert = "Ruxsat yo'q"
+        else:
+            pos['wait'] = 'mn'
+            m, r = ("➕ Yangi mijoz: ism va telefonni yozing\nMasalan: Alisher Karimov +998901234567",
+                    [[_btn("⬅️ Orqaga", "pos:mj")], _pos_bekor()])
+    elif act == 'mc':
+        cm = next((c_ for c_ in mijoz_qidir('') if c_['id'] == _int(0)), None)
+        if not cm: alert = "Mijoz topilmadi"
+        else:
+            pos['cust'] = {'id': cm['id'], 'name': cm['nom'], 'phone': cm['tel'] or '', 'type': cm['tur'] or 'B2C'}
+            m, r = (pos_ekran_tasdiq(pos, rate) if pos.get('method') else
+                    pos_ekran_savat(pos, rate, f"👤 Mijoz: {cm['nom']}"))
+    elif act == 'mw':
+        pos['cust'] = None
+        if pos.get('method') == 'nasiya': pos['method'] = None
+        m, r = pos_ekran_savat(pos, rate, "🚶 Oddiy xaridor (mijozsiz)")
+    elif act == 'pay':
+        if not pos['items']: m, r = pos_ekran_savat(pos, rate)
+        else: m, r = pos_ekran_tolov(pos, rate)
+    elif act == 'm':
+        usul = arg[0] if arg else ''
+        if usul not in POS_USUL_NOMI: alert = "Noma'lum usul"
+        else:
+            pos['method'] = usul
+            if usul == 'nasiya' and not pos.get('cust'):
+                m, r = pos_ekran_mijoz(pos)
+            else:
+                m, r = pos_ekran_tasdiq(pos, rate)
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None:
+        await _pos_chiqar(q, m, r)
+
+async def pos_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """POS yozma kiritishni kutayotgan bo'lsa — matnni qabul qiladi. True = matn ishlatildi."""
+    pos0 = ctx.user_data.get('pos')
+    if not pos0 or not pos0.get('wait') or not can(u, 'pos'): return False
+    pos = _pos_ol(ctx)
+    if pos is None:
+        await u.message.reply_text("⏰ Savat muddati o'tgan. Hech narsa yozilmadi. Qayta: 🛒 Sotuv"); return True
+    w = pos['wait']; pos['wait'] = None
+    msg = (u.message.text or '').strip()
+    x = xodim(u); rate = get_exchange_rate()
+    m = r = None
+
+    def qayta(xato):
+        pos['wait'] = w                          # kutish davom etadi
+        return f"⚠️ {xato}\nQaytadan yozing yoki tugmani bosing.", [_pos_bekor()]
+
+    if w == 'search':
+        topildi = pos_qidir(msg)
+        pos['found'] = [p['id'] for p in topildi]
+        m, r = pos_ekran_qidiruv(pos)
+        if not topildi:
+            pos['wait'] = 'search'
+            m = f"🔍 '{msg[:40]}' topilmadi. Boshqacha yozing:"
+    elif w.startswith('qty:') or w.startswith('eq:'):
+        pid = int(w.split(':')[1]); p = _pos_mahsulot(pid)
+        try: n = int(re.sub(r'\D', '', msg) or 0)
+        except ValueError: n = 0
+        it = _pos_qator(pos, pid)
+        mavjud = _pos_mavjud(pos, pid, p['qty'] if p else 0, bundan_tashqari=w.startswith('eq:'))
+        if not p: m, r = pos_ekran_savat(pos, rate, "Mahsulot topilmadi")
+        elif n <= 0: m, r = qayta("Musbat butun son yozing")
+        elif n > mavjud: m, r = qayta(f"Astatka yetmaydi: {max(0, mavjud)} ta bor")
+        elif w.startswith('qty:'):
+            _pos_qosh(pos, p, n); m, r = pos_ekran_savat(pos, rate, f"✅ {p['name']} × {n} qo'shildi")
+        elif it:
+            it['qty'] = n; m, r = pos_ekran_savat(pos, rate, f"✏️ {p['name']}: {n} ta")
+        else: m, r = pos_ekran_savat(pos, rate)
+    elif w.startswith('ep:'):
+        it = _pos_qator(pos, int(w.split(':')[1])); v = _pos_son(msg)
+        if not it: m, r = pos_ekran_savat(pos, rate)
+        elif not v or v <= 0: m, r = qayta("Narxni raqam bilan yozing (masalan: 450)")
+        else:
+            eski = it['price']; it['price'] = round(v, 2)
+            xato = pos_limit_xato(pos, x)
+            if xato: it['price'] = eski; m, r = qayta(xato)
+            else: m, r = pos_ekran_savat(pos, rate, f"✏️ {it['name']}: {_usd2(it['price'])}/dona")
+    elif w in ('dp', 'du'):
+        if w == 'du':
+            v = _pos_son(msg)
+        else:
+            t = re.sub(r'[^\d.]', '', msg.replace(',', '.'))
+            try: v = float(t) if t else None
+            except ValueError: v = None
+        if v is None or v < 0 or (w == 'dp' and v > 100): m, r = qayta("To'g'ri qiymat yozing")
+        else:
+            eski = pos.get('disc')
+            pos['disc'] = {'type': 'pct' if w == 'dp' else 'usd', 'val': round(v, 2)} if v > 0 else None
+            xato = pos_limit_xato(pos, x)
+            if xato: pos['disc'] = eski; m, r = qayta(xato)
+            else: m, r = pos_ekran_savat(pos, rate, "💸 Chegirma qo'yildi" if v > 0 else "Chegirma olib tashlandi")
+    elif w == 'ms':
+        topildi = [{'id': c_['id'], 'name': c_['nom'], 'phone': c_['tel'] or ''} for c_ in mijoz_qidir(msg)]
+        m, r = pos_ekran_mijoz(pos, topildi, f"🔍 '{msg[:30]}' bo'yicha:")
+    elif w == 'mn':
+        tel_m = re.search(r'(\+?\d[\d\s\-()]{6,}\d)', msg)
+        tel = re.sub(r'[^\d+]', '', tel_m.group(1)) if tel_m else ''
+        ism = (msg[:tel_m.start()] + msg[tel_m.end():]).strip(' ,;-') if tel_m else msg.strip()
+        if len(ism) < 2: m, r = qayta("Ism yozilmadi. Masalan: Alisher +998901234567")
+        else:
+            holat, cid = add_customer(ism, tel)
+            if not cid: m, r = qayta("Mijozni saqlab bo'lmadi")
+            else:
+                pos['cust'] = {'id': cid, 'name': ism, 'phone': tel, 'type': 'B2C'}
+                izoh = ("➕ Yangi mijoz qo'shildi: " if holat == 'qoshildi' else "👤 Mavjud mijoz tanlandi: ") + ism
+                m, r = (pos_ekran_tasdiq(pos, rate) if pos.get('method') else pos_ekran_savat(pos, rate, izoh))
+    else:
+        return False
+    await u.message.reply_text(m[:4000], reply_markup=InlineKeyboardMarkup(r) if r else None)
+    return True
+
+# ── XODIMLAR VA SOTUVCHI BO'LIMI ──────────────────────────────────
+def _sotuvchi_kb():
+    return ReplyKeyboardMarkup(SOTUVCHI_KB, resize_keyboard=True, is_persistent=True)
+
+async def cmd_start_sotuvchi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    x = xodim(u)
+    if not x or x['role'] != 'sotuvchi': return
+    await u.message.reply_text(
+        f"👋 Salom, {x['name']}! Siz sotuvchisiz.\n\n"
+        "🛒 Sotuv — tugmalar orqali sotish\n📦 Qoldiq — tovarlar va narxlar\n"
+        "📋 Bugungi sotuvlarim — bugun nima sotdingiz\n❓ Yordam",
+        reply_markup=_sotuvchi_kb())
+
+async def cmd_yordam_sotuvchi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    x = xodim(u)
+    if not x: return
+    await u.message.reply_text(
+        "❓ Qanday sotiladi:\n"
+        "1) 🛒 Sotuv ni bosing\n2) Kategoriya → tovarni tanlang (❌ — tugagan)\n"
+        "3) Sonini bosing (1/2/3/5/10 yoki ✍️ Boshqa son)\n"
+        "4) Kerak bo'lsa ➕ Yana tovar\n"
+        f"5) 💸 Chegirma (sizning limitingiz {x['max_discount']:g}%)\n"
+        "6) 👤 Mijoz — tanlang, yangi qo'shing yoki 🚶 mijozsiz\n"
+        "7) 💳 To'lov — usulni tanlang (📝 Nasiya faqat mijoz bilan)\n"
+        "8) ✅ Tasdiqlash — chek chiqadi\n\n"
+        "Har qadamda ❌ Bekor qilish bor. 30 daqiqa tegmasangiz savat o'chadi.\n"
+        "Buyruqlar: /sotuv /qoldiq /mening /id",
+        reply_markup=_sotuvchi_kb() if x['role'] == 'sotuvchi' else None)
+
+async def cmd_qoldiq(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tannarxsiz qoldiq ro'yxati (sotuvchi ham ko'radi)"""
+    if not can(u, 'stock_view'): return
+    prods = get_products()
+    guruh = defaultdict(list)
+    for p in prods: guruh[p['cat'] or 'Boshqa'].append(p)
+    qism = ["📦 Qoldiq (soni · narx):"]
+    for cat in sorted(guruh):
+        qism.append(f"\n▪️ {cat}")
+        for p in guruh[cat]:
+            q = p['qty'] or 0
+            belgi = "🔴" if q <= 0 else ("🟡" if q <= 2 else "🟢")
+            qism.append(f"{belgi} {p['name']} — {q} ta · {_usd2(p['price'] or 0)}")
+    matn, bolak = "", []
+    for line in qism:
+        if len(matn) + len(line) > 3800: bolak.append(matn); matn = ""
+        matn += line + "\n"
+    bolak.append(matn)
+    for b in bolak:
+        if b.strip(): await u.message.reply_text(b)
+
+async def cmd_mening(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Bugungi o'z sotuvlarim (foydasiz)"""
+    if not can(u, 'own_sales'): return
+    x = xodim(u)
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT time, product, qty, revenue, customer FROM sales WHERE date=? AND seller_id=? AND reversed=0 "
+              "ORDER BY id", (today(), x['id']))
+    rows = c.fetchall(); conn.close()
+    if not rows:
+        await u.message.reply_text("📋 Bugun hali sotuv yo'q."); return
+    out = [f"📋 Bugungi sotuvlarim ({today()}):"]
+    for t, pr, qty, rev, cu in rows:
+        out.append(f"{t} · {pr} × {qty} = {_usd2(rev)}" + (f" · {cu}" if cu else ""))
+    jami = round(sum(r[3] for r in rows), 2)
+    out.append(f"──────────────\nJami: {len(rows)} ta qator · {_usd2(jami)} ≈ {jami * get_exchange_rate():,.0f} so'm")
+    await u.message.reply_text("\n".join(out)[:4000])
+
+async def sotuvchi_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
+    """Sotuvchi yozgan matn: faqat o'z menyusi. AI agentga yuborilmaydi."""
+    fn = {"🛒 Sotuv": pos_start, "📦 Qoldiq": cmd_qoldiq, "📦 Astatka": cmd_qoldiq,
+          "📋 Bugungi sotuvlarim": cmd_mening, "❓ Yordam": cmd_yordam_sotuvchi}.get(msg)
+    if fn:
+        await fn(u, ctx); return
+    await u.message.reply_text("Sotish uchun 🛒 Sotuv tugmasini bosing.\n📦 Qoldiq · 📋 Bugungi sotuvlarim · ❓ Yordam",
+                               reply_markup=_sotuvchi_kb())
+
+async def cmd_id(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Har kim: o'z Telegram ID sini bilib oladi (egasi uni /xodim_qosh bilan qo'shadi)"""
+    us = u.effective_user
+    await u.message.reply_text(f"🆔 Sizning Telegram ID: {us.id}\nBu raqamni do'kon egasiga yuboring.")
+
+def _rol_ol(s):
+    s = (s or '').strip().lower()
+    return {'admin': 'admin', 'sotuvchi': 'sotuvchi', 'seller': 'sotuvchi', 'kassir': 'sotuvchi'}.get(s)
+
+async def cmd_xodim_qosh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/xodim_qosh <telegram_id> <ism> <rol> [limit%]"""
+    if not can(u, 'roles'): return
+    a = list(ctx.args or [])
+    namuna = ("Format: /xodim_qosh <telegram_id> <ism> <rol> [chegirma%]\n"
+              "Rol: sotuvchi yoki admin\nMisol: /xodim_qosh 123456789 Ali sotuvchi 5\n\n"
+              "ID ni bilish: xodim botga /id yozsin.")
+    limit = None
+    if a and re.fullmatch(r'\d+(\.\d+)?%?', a[-1]) and len(a) >= 4:
+        limit = min(100.0, float(a.pop().rstrip('%')))
+    if len(a) < 3 or not a[0].isdigit() or not _rol_ol(a[-1]):
+        await u.message.reply_text(namuna); return
+    tid, rol, ism = int(a[0]), _rol_ol(a[-1]), ' '.join(a[1:-1]).strip()
+    if tid == OWNER_ID:
+        await u.message.reply_text("Bu — egasining ID si. Egasi doim to'liq huquqli."); return
+    holat = xodim_saqla(tid, ism, rol, limit)
+    x = xodim(tid)
+    holat_s = "qo'shildi" if holat == 'qoshildi' else "yangilandi"
+    await u.message.reply_text(
+        f"✅ {ism} {holat_s}: {ROL_NOMI[rol]}"
+        + (f", chegirma limiti {x['max_discount']:g}%" if rol == 'sotuvchi' and x else "")
+        + "\nU botda /start bossin. Ro'yxat: /xodimlar")
+    try:
+        await ctx.bot.send_message(tid, f"👋 Siz ThermoCrafts botiga {ROL_NOMI[rol]} sifatida qo'shildingiz. /start bosing.")
+    except Exception:
+        pass                                     # xodim hali botni ochmagan bo'lsa — xabar bormaydi
+
+async def cmd_xodim_ochir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/xodim_ochir <telegram_id> — nofaol qiladi (tarix saqlanadi)"""
+    if not can(u, 'roles'): return
+    a = ctx.args or []
+    if not a or not a[0].isdigit():
+        await u.message.reply_text("Format: /xodim_ochir <telegram_id>\nRo'yxat: /xodimlar"); return
+    ok = xodim_ozgartir(int(a[0]), active=0)
+    await u.message.reply_text("🚫 Xodim o'chirildi (nofaol). Sotuv tarixi saqlanadi.\nQayta yoqish: /xodimlar"
+                               if ok else "Bunday xodim yo'q. Ro'yxat: /xodimlar")
+
+def _xodimlar_ekran():
+    xs = xodimlar_royxati()
+    if not xs:
+        return ("👷 Xodimlar yo'q.\nQo'shish: /xodim_qosh <telegram_id> <ism> <rol>\n"
+                "Xodim ID sini botga /id yozib bilib oladi."), None
+    out = ["👷 Xodimlar:"]
+    rows = []
+    for x in xs:
+        holat = "✅" if x['active'] else "🚫"
+        lim = f" · limit {x['max_discount']:g}%" if x['role'] == 'sotuvchi' else ""
+        out.append(f"{holat} {x['name']} ({x['id']}) — {ROL_NOMI.get(x['role'], x['role'])}{lim}")
+        rows.append([_btn(f"{holat} {x['name'][:20]}", f"xod:u:{x['id']}")])
+    out.append("\nO'zgartirish uchun ismni bosing.")
+    return "\n".join(out), rows
+
+def _xodim_ekran(tid):
+    x = next((y for y in xodimlar_royxati() if y['id'] == tid), None)
+    if not x: return "Xodim topilmadi", [[_btn("⬅️ Ro'yxat", "xod:list")]]
+    boshqa = 'admin' if x['role'] == 'sotuvchi' else 'sotuvchi'
+    matn = (f"👷 {x['name']} ({x['id']})\nRol: {ROL_NOMI.get(x['role'], x['role'])}\n"
+            f"Holat: {'faol' if x['active'] else 'nofaol'}\n"
+            + (f"Chegirma limiti: {x['max_discount']:g}%\n" if x['role'] == 'sotuvchi' else "")
+            + f"Qo'shilgan: {x['created'] or '-'}")
+    rows = [[_btn(f"🔁 Rol → {boshqa}", f"xod:r:{tid}")]]
+    if x['role'] == 'sotuvchi':
+        rows.append([_btn(f"💸 Limit: {x['max_discount']:g}% → keyingi", f"xod:l:{tid}")])
+    rows.append([_btn("🚫 O'chirish (nofaol)" if x['active'] else "✅ Faollashtirish", f"xod:a:{tid}")])
+    rows.append([_btn("⬅️ Ro'yxat", "xod:list")])
+    return matn, rows
+
+XODIM_LIMITLAR = (0, 5, 10, 15, 20, 30)
+
+async def cmd_xodimlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'roles'): return
+    m, r = _xodimlar_ekran()
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r) if r else None)
+
+async def xodim_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """'xod:' tugmalari — faqat egasi"""
+    q = u.callback_query
+    if not can(u, 'roles'):
+        await q.answer("Faqat egasi uchun", show_alert=True); return
+    parts = (q.data or '').split(':')
+    act = parts[1] if len(parts) > 1 else ''
+    try: tid = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError: tid = 0
+    x = next((y for y in xodimlar_royxati() if y['id'] == tid), None) if tid else None
+    izoh = None
+    if act == 'r' and x:
+        xodim_ozgartir(tid, role=('admin' if x['role'] == 'sotuvchi' else 'sotuvchi')); izoh = "Rol o'zgardi"
+    elif act == 'a' and x:
+        xodim_ozgartir(tid, active=0 if x['active'] else 1); izoh = "Holat o'zgardi"
+    elif act == 'l' and x:
+        joriy = x['max_discount']
+        keyingi = next((v for v in XODIM_LIMITLAR if v > joriy + 1e-9), XODIM_LIMITLAR[0])
+        xodim_ozgartir(tid, max_discount_pct=float(keyingi)); izoh = f"Limit: {keyingi}%"
+    await q.answer(izoh)
+    m, r = _xodimlar_ekran() if act == 'list' or not tid else _xodim_ekran(tid)
+    try:
+        await q.edit_message_text(m, reply_markup=InlineKeyboardMarkup(r) if r else None)
+    except BadRequest as e:
+        if 'not modified' not in str(e).lower(): raise
+
+async def cmd_sotuvchilar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Sotuvchilar kesimida: bugun va shu oy (soni, tushum, foyda) — egasi/admin"""
+    if not can(u, 'boshqaruv'): return
+    nomlar = {x['id']: x['name'] for x in xodimlar_royxati()}
+    nomlar[OWNER_ID] = 'Egasi'
+    conn = db(); c = conn.cursor()
+    out = ["👷 Sotuvchilar bo'yicha sotuv"]
+    for sarl, shart, val in (("📅 Bugun", "date=?", today()), ("📆 Shu oy", "date LIKE ?", this_month() + '%')):
+        c.execute(f"SELECT COALESCE(seller_id,0), MAX(seller_name), COUNT(*), COALESCE(SUM(revenue),0), "
+                  f"COALESCE(SUM(profit),0) FROM sales WHERE reversed=0 AND {shart} "
+                  "GROUP BY COALESCE(seller_id,0) ORDER BY 4 DESC", (val,))
+        rows = c.fetchall()
+        out.append(f"\n{sarl}:")
+        if not rows: out.append("  sotuv yo'q")
+        for sid, snom, n, rev, prof in rows:
+            nom = nomlar.get(sid) or snom or ("Egasi (AI/matn)" if not sid else str(sid))
+            out.append(f"  {nom}: {n} ta · {_usd2(rev)} · foyda {_usd2(prof)}")
+    conn.close()
+    await u.message.reply_text("\n".join(out)[:4000])
+
+
 async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     # Faqat egasi: aks holda kanal/forward qilingan xabardagi tugma orqali begona odam
     # hisobot ko'rishi, sotuvni bekor qilishi yoki tovarni "keldi" qilishi mumkin edi
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     data = q.data or ''
     msg = q.message
 
@@ -5303,8 +6319,16 @@ _ARRIVE_NOT_FOUND = "⚠️ Astatkada bu nomli mahsulot topilmadi — astatka o'
 
 # ── TEXT MESSAGE HANDLER ──────────────────────────────────────────
 async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    rol = user_role(u)
+    if not rol: return
     msg = u.message.text
+    if msg in MENU_MAP:
+        if ctx.user_data.get('pos'): ctx.user_data['pos']['wait'] = None   # menyu bosildi — POS kutishi bekor
+    elif await pos_matn(u, ctx):
+        return
+    if rol == 'sotuvchi':
+        await sotuvchi_matn(u, ctx, msg); return
+    if not can(u, 'boshqaruv'): return
     prods = get_products()
 
     # Foto qo'shish rejimi (menyu tugmasi bosilsa rejimdan chiqadi)
@@ -5602,7 +6626,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # Foto qabul qilish (astatka qo'shish vaqtida)
 async def handle_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     pid = ctx.user_data.get('photo_product_id')
     if pid and u.message.photo:
         file_id = u.message.photo[-1].file_id
@@ -5611,7 +6635,7 @@ async def handle_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"✅ Rasm {count} qo'shildi. Davom eting yoki /tayyor")
 
 async def handle_photo_done(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     pid = ctx.user_data.pop('photo_product_id', None)
     if pid:
         count = len(get_product_photos(pid))
@@ -5628,7 +6652,7 @@ async def handle_photo_done(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_oy_tafsil(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
     """Oylik batafsil mahsulot tahlili"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     if not month:
         args = ctx.args if ctx.args else []
         month = args[0] if args else this_month()
@@ -5665,7 +6689,7 @@ async def cmd_oy_tafsil(u: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
 
 # ── KASSA BUYRUQLARI ──────────────────────────────────────────────
 async def cmd_kassa(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     balance = get_cash_balance()
     month_hist = get_cash_history(this_month())
     today_hist = get_cash_history(today())
@@ -5696,7 +6720,7 @@ async def cmd_kassa(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_nelikvid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     items = get_nelikvid(60)
     if not items:
         await u.message.reply_text("✅ *Nelikvid yo'q!*\n\nBarcha tovarlar 2 oy ichida sotilgan.", parse_mode='Markdown')
@@ -5715,7 +6739,7 @@ async def cmd_nelikvid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_eslatmalar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     text = "🔔 *ESLATMALAR*\n\n"
     has_alert = False
 
@@ -5772,7 +6796,7 @@ async def cmd_eslatmalar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reklama(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Obunachilarga xabar yuborish"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     n = sub_count()
     if not ctx.args:
         me = await ctx.bot.get_me()
@@ -5818,7 +6842,7 @@ async def cmd_reklama(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_obunachilar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Obunachilar ro'yxati"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     subs = sub_list()
     me = await ctx.bot.get_me()
     if not subs:
@@ -5837,7 +6861,7 @@ async def cmd_obunachilar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reklama_preview(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reklama ko'rinishini oldindan ko'rish"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     if not ctx.args:
         await u.message.reply_text("Format: `/reklama_preview Xabar matni`", parse_mode='Markdown')
         return
@@ -5856,7 +6880,7 @@ async def cmd_reklama_preview(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── RASM/VIDEO BILAN KANAL POST ──────────────────────────────────
 async def handle_photo_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     ch = get_channel_id()
     if not ch:
         await u.message.reply_text("CHANNEL_ID sozlanmagan!")
@@ -5874,7 +6898,7 @@ async def handle_photo_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"Xato: {e}")
 
 async def handle_video_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     ch = get_channel_id()
     if not ch:
         await u.message.reply_text("CHANNEL_ID sozlanmagan!")
@@ -6281,7 +7305,7 @@ def db_autorestore():
         _BK['migrate'] = True        # birinchi zaxira db-backup branch'ini yaratadi
 
 async def cmd_backup(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     force = bool(ctx.args) and ctx.args[0].lower() in ('ha', 'yes')
     if _BK['blocked'] and not force:
         await u.message.reply_text(
@@ -6295,7 +7319,7 @@ async def cmd_backup(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(("✅ " if ok else "❌ ") + msg)
 
 async def cmd_restore(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u): return
+    if not can(u, 'system'): return
     args = ctx.args or []
     if not args or args[0].lower() not in ('ha', 'yes'):
         await u.message.reply_text(
@@ -6395,7 +7419,7 @@ async def _deploy_bot_code(msg, data, source):
 
 async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/update <raw_url> — kodni havoladan olib yangilaydi"""
-    if not is_owner(u): return
+    if not can(u, 'system'): return
     if not ctx.args:
         await u.message.reply_text("Bot yangilash: .py faylni shu chatga yuboring, yoki /update <raw_url>"); return
     await u.message.reply_text("⏳ Kod yuklab olinmoqda...")
@@ -6411,7 +7435,7 @@ async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── FAYL ORQALI AUTO-UPDATE ───────────────────────────────────────
 async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """.xlsx — Excel import (astatka/sotuv/kassa); .py — bot o'zini yangilaydi"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     doc = u.message.document
     fname = ((doc.file_name if doc else '') or '').lower()
     if fname.endswith(('.xlsx', '.xlsm')):
@@ -6419,6 +7443,8 @@ async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if fname.endswith(('.xls', '.csv', '.ods', '.numbers')):
         await u.message.reply_text("📥 Excel faylni .xlsx formatida saqlab yuboring (Fayl → Saqlash → Excel .xlsx).")
         return
+    if fname.endswith('.py') and not can(u, 'system'):
+        await u.message.reply_text("Bot kodini yangilash faqat egasiga ruxsat etilgan."); return
     if not doc or not fname.endswith('.py'):
         await u.message.reply_text("Qabul qilinadigan fayllar:\n• .xlsx — Excel jadval (astatka, sotuv, xarajat, kassa import)\n"
                                    "• .py — bot kodini yangilash")
@@ -7047,7 +8073,7 @@ async def handle_excel(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def xl_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str):
     q = u.callback_query
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     try: _, action, token = data.split('_', 2)
     except ValueError: return
     st = ctx.user_data.get('xl_import')
@@ -7113,7 +8139,7 @@ async def post_to_channel(ctx: ContextTypes.DEFAULT_TYPE, text: str):
 
 async def cmd_post_kanal(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Kanalga tovarlar e'lonini yuborish"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     ch = get_channel_id()
     if not ch:
         await u.message.reply_text("❌ CHANNEL_ID Railway da sozlanmagan!\n\nVariables ga qo'shing:\nCHANNEL_ID = @ThermoCrafts")
@@ -7154,7 +8180,7 @@ async def cmd_post_kanal(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_post_maxsus(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Maxsus aksiya yoki e'lon postlash"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     if not ctx.args:
         await u.message.reply_text(
             "Format: /post_maxsus <matn>\n\n"
@@ -7171,7 +8197,7 @@ async def cmd_post_maxsus(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_post_taklif(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Kunlik set takliflarini postlash"""
-    if not is_owner(u): return
+    if not can(u, 'boshqaruv'): return
     prods = get_products()
     rate = get_exchange_rate()
 
@@ -7199,7 +8225,7 @@ async def cmd_post_taklif(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stock_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Astatka ma'lumotlarini Excel dan yangilash"""
-    if not is_owner(u): return
+    if not can(u, 'system'): return
     if not ctx.args or ctx.args[0].lower() != 'ha':
         await u.message.reply_text(
             "⚠️ Bu buyruq 21 ta mahsulotning soni/sebest/narxini 01.09.2026 holatiga QAYTA YOZADI "
@@ -7266,6 +8292,8 @@ async def on_error(u: object, ctx: ContextTypes.DEFAULT_TYPE):
                 and u.effective_user.id == OWNER_ID):
             await u.effective_message.reply_text(
                 f"\u26a0\ufe0f Xato yuz berdi:\n{str(ctx.error)[:250]}")
+        elif isinstance(u, Update) and u.effective_message and user_role(u):
+            await u.effective_message.reply_text("\u26a0\ufe0f Xato yuz berdi. Qaytadan urinib ko'ring.")
     except Exception:
         pass
 
@@ -7295,6 +8323,18 @@ def _install_safe_reply():
     Message.reply_text = safe_reply_text
 
 # ── MAIN ──────────────────────────────────────────────────────────
+class RolFiltr(filters.MessageFilter):
+    """Xabar yuboruvchining roli bo'yicha filtr (rol bazadan o'qiladi — o'zgarish darhol ishlaydi).
+    perm=None — istalgan faol xodim yoki egasi; perm berilsa — can(uid, perm)."""
+    def __init__(self, perm=None):
+        super().__init__(name=f"RolFiltr({perm or 'xodim'})")
+        self.perm = perm
+    def filter(self, message):
+        uid = getattr(message.from_user, 'id', None) if message.from_user else None
+        if uid is None: return False
+        return (user_role(uid) is not None) if self.perm is None else can(uid, self.perm)
+
+
 def main():
     if not BOT_TOKEN: raise ValueError("BOT_TOKEN yo'q!")
     if not ANTHROPIC_KEY: raise ValueError("ANTHROPIC_KEY yo'q!")
@@ -7315,7 +8355,8 @@ def main():
     app = (Application.builder().token(BOT_TOKEN)
            .post_init(_post_init).post_shutdown(_post_shutdown).build())
 
-    OWNER = filters.User(user_id=OWNER_ID)
+    STAFF = RolFiltr()                    # egasi + faol xodimlar (rol bazadan, har safar)
+    BOSHQ = RolFiltr('boshqaruv')         # egasi + admin
     # Tahrirlangan xabar / kanal postlarini eng oldin to'xtatamiz (group=-1)
     app.add_handler(TypeHandler(Update, _faqat_yangi_xabar), group=-1)
     # Suhbat ichida menyu tugmasi bosilsa — u nom/narx sifatida yozilmasin, fallback'ga o'tsin
@@ -7325,10 +8366,10 @@ def main():
     # Yangi tovar qo'shish (ConversationHandler)
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('yangi_tovar', conv_start, filters=filters.User(user_id=OWNER_ID)),
+            CommandHandler('yangi_tovar', conv_start, filters=BOSHQ),
             CallbackQueryHandler(conv_start, pattern='^new_product$'),
             # "➕ Yangi tovar" menyu tugmasi: avval suhbatdan tashqarida ochilib, nom yozilganda AI'ga ketardi
-            MessageHandler(filters.Text(["➕ Yangi tovar"]) & OWNER, conv_start),
+            MessageHandler(filters.Text(["➕ Yangi tovar"]) & BOSHQ, conv_start),
         ],
         states={
             S_NAME: [MessageHandler(CONV_TEXT, conv_name)],
@@ -7358,9 +8399,17 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler('start', cmd_start, filters=OWNER))
-    app.add_handler(CommandHandler('start', cmd_start_public, filters=~OWNER))
-    app.add_handler(CommandHandler('stop', cmd_stop_public, filters=~OWNER))
+    app.add_handler(CommandHandler('start', cmd_start, filters=STAFF))
+    app.add_handler(CommandHandler('start', cmd_start_public, filters=~STAFF))
+    app.add_handler(CommandHandler('stop', cmd_stop_public, filters=~STAFF))
+    app.add_handler(CommandHandler('sotuv', pos_start))
+    app.add_handler(CommandHandler('qoldiq', cmd_qoldiq))
+    app.add_handler(CommandHandler('mening', cmd_mening))
+    app.add_handler(CommandHandler('id', cmd_id))
+    app.add_handler(CommandHandler('xodim_qosh', cmd_xodim_qosh))
+    app.add_handler(CommandHandler('xodimlar', cmd_xodimlar))
+    app.add_handler(CommandHandler('xodim_ochir', cmd_xodim_ochir))
+    app.add_handler(CommandHandler('sotuvchilar', cmd_sotuvchilar))
     app.add_handler(CommandHandler('help', cmd_yordam))
     app.add_handler(CommandHandler('yordam', cmd_yordam))
     app.add_handler(CommandHandler('astatka', cmd_astatka))
@@ -7424,10 +8473,12 @@ def main():
     app.add_handler(CommandHandler('post', cmd_post_kanal))
     app.add_handler(CommandHandler('post_maxsus', cmd_post_maxsus))
     app.add_handler(CommandHandler('post_taklif', cmd_post_taklif))
+    app.add_handler(CallbackQueryHandler(pos_callback, pattern=r'^pos:'))
+    app.add_handler(CallbackQueryHandler(xodim_callback, pattern=r'^xod:'))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & OWNER, handle_text))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~OWNER, handle_text_public))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & STAFF, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~STAFF, handle_text_public))
 
     _install_safe_reply()
     app.add_error_handler(on_error)
