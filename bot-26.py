@@ -250,6 +250,8 @@ def init_db():
         type TEXT, note TEXT, paid INTEGER DEFAULT 0
     )''')
 
+    _qarz_turlarini_birxillash(c)   # eski 'berildi'/'olindi' → debitorlik/kreditorlik (idempotent)
+
     # Operatsiyalar logi (undo uchun)
     c.execute('''CREATE TABLE IF NOT EXISTS op_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -617,6 +619,9 @@ def reverse_sale(sale_id):
             c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
                       (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'), 'chiqim', revenue, 'qaytarish',
                        f'{product} bekor (#{sale_id})', 'naqd'))
+        else:
+            # Kassaga tushmagan = nasiya sotuv: mijozning debitorligi ham kamayadi/yopiladi
+            _nasiya_qaytar(c, sale_id, row)
         try:
             c.execute('SELECT COALESCE(customer_id,0) FROM sales WHERE id=?', (sale_id,))
             cid = (c.fetchone() or [0])[0] or 0
@@ -690,11 +695,14 @@ def arrive_transit(tid):
     conn.commit(); conn.close()
     return {'product': product, 'qty': qty, 'real_cost': real_cost, 'found': bool(pid_row)}
 
-def pay_transit_deposit(tid, amount):
-    conn = db(); c = conn.cursor()
-    c.execute('UPDATE transit SET deposit=deposit+?, remaining=MAX(0,remaining-?) WHERE id=?',
-              (amount, amount, tid))
-    conn.commit(); conn.close()
+def pay_transit_deposit(tid, amount, c=None):
+    """c berilsa — chaqiruvchining tranzaksiyasi ichida (commit qilmaydi), aks holda o'zi ochib yopadi."""
+    sql = 'UPDATE transit SET deposit=deposit+?, remaining=MAX(0,remaining-?) WHERE id=?'
+    if c is not None:
+        c.execute(sql, (amount, amount, tid)); return c.rowcount
+    conn = db(); cc = conn.cursor()
+    cc.execute(sql, (amount, amount, tid)); n = cc.rowcount
+    conn.commit(); conn.close(); return n
 
 def add_customer(name, phone='', ctype='', notes=''):
     """Mijoz qo'shadi. Ism bir xil bo'lsa yangi ma'lumot bilan to'ldiradi.
@@ -730,12 +738,304 @@ def delete_customer(name):
     c.execute("DELETE FROM customers WHERE lower(trim(name))=lower(?)", ((name or '').strip(),))
     n = c.rowcount; conn.commit(); conn.close(); return n
 
+# ── QARZ MODELI: faqat IKKI tur ───────────────────────────────────
+#   DEBITORLIK  — mijoz BIZGA qarz (bizdan qarz / nasiya)     → kutilayotgan KIRIM
+#   KREDITORLIK — BIZ zavod/yetkazuvchiga qarzmiz (zavoddan qarz) → kutilayotgan CHIQIM
+# Avval bir xil qiymat kodning turli joyida teskari ma'noda ishlatilardi: eski matn rejimi 'olindi'ni
+# "biz berdik" (debitor) deb, AI agent/balans/nasiya esa 'berildi'ni debitor deb hisoblardi.
+# Endi bazaga faqat 'debitorlik'/'kreditorlik' yoziladi; eski qiymatlar init_db da bir marta
+# shu turlarga o'tkaziladi (asl qiymat debts.type_old ustunida saqlanadi).
+DEBITOR, KREDITOR = 'debitorlik', 'kreditorlik'
+_DEBITOR_ALIAS = ('debitorlik', 'debitor', 'receivable', 'berildi', 'bizga')
+_KREDITOR_ALIAS = ('kreditorlik', 'kreditor', 'payable', 'olindi', 'bizdan')
+# SQL uchun doimiy ro'yxat (foydalanuvchi matni emas). Eski qiymatlar ham o'qiladi —
+# migratsiyagacha bo'lgan zaxira tiklansa ham hisob to'g'ri chiqsin.
+DEBITOR_SQL = "(" + ",".join(f"'{a}'" for a in _DEBITOR_ALIAS) + ")"
+KREDITOR_SQL = "(" + ",".join(f"'{a}'" for a in _KREDITOR_ALIAS) + ")"
+
+def debt_turi(v):
+    """Har qanday (eski/yangi) qarz turini 'debitorlik' | 'kreditorlik' | None ga keltiradi."""
+    s = str(v or '').strip().lower()
+    if s in _DEBITOR_ALIAS: return DEBITOR
+    if s in _KREDITOR_ALIAS: return KREDITOR
+    return None
+
+# ── Mijozni o'chirish: egasining tasdig'i bilan ──────────────────
+_DEL_PENDING = {}            # token -> {'name', 'ts'}
+_DEL_TTL = 600               # 10 daqiqa
+
+def _mijoz_topish_aniq(name):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, name FROM customers WHERE lower(trim(name))=lower(?)", ((name or '').strip(),))
+    rows = c.fetchall(); conn.close(); return rows
+
+async def _mijoz_ochirish_sorovi(name, ctx):
+    """AI agent delete_customer so'raganda: o'chirmaydi, egasiga Ha/Yo'q tugmalarini yuboradi."""
+    name = (name or '').strip()
+    rows = _mijoz_topish_aniq(name) if name else []
+    if not rows:
+        return {"ok": False, "error": f"Mijoz topilmadi (aniq ism kerak): {name!r}"}
+    if ctx is None or not getattr(ctx, 'bot', None):
+        return {"ok": False, "error": "Tasdiqlash tugmalarini yuborib bo'lmadi — o'chirilmadi."}
+    now = time.time()
+    for k in [k for k, v in _DEL_PENDING.items() if now - v['ts'] > _DEL_TTL]:
+        _DEL_PENDING.pop(k, None)
+    tok = secrets.token_hex(4)
+    _DEL_PENDING[tok] = {'name': rows[0][1], 'ts': now}
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*), COALESCE(SUM(revenue),0) FROM sales WHERE reversed=0 AND COALESCE(customer_id,0)=?", (rows[0][0],))
+    ns, sm = c.fetchone(); conn.close()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Ha, o'chir", callback_data=f"delcust_yes_{tok}"),
+                                InlineKeyboardButton("❌ Yo'q", callback_data=f"delcust_no_{tok}")]])
+    await ctx.bot.send_message(
+        chat_id=OWNER_ID,
+        text=(f"🗑 Mijozni o'chirishni tasdiqlaysizmi?\n\n👤 {rows[0][1]}\n"
+              f"Sotuvlar: {ns} ta · {fmt(sm)}\n\n(Sotuv va qarz yozuvlari o'chmaydi, faqat mijoz kartasi.)"),
+        reply_markup=kb)
+    return {"ok": False, "pending_confirmation": True,
+            "message": "O'CHIRILMADI hali: egasiga 'Ha, o'chir / Yo'q' tugmalari yuborildi. Tugma bosilgandan keyin bajariladi."}
+
+async def _mijoz_ochirish_callback(q, data):
+    """delcust_yes_<token> / delcust_no_<token> (faqat egasi — on_callback da tekshiriladi)."""
+    try: _, javob, tok = data.split('_', 2)
+    except ValueError: return
+    p = _DEL_PENDING.pop(tok, None)
+    if not p or time.time() - p['ts'] > _DEL_TTL:
+        await q.edit_message_text("⏰ Tasdiq muddati o'tgan yoki allaqachon bajarilgan. Mijoz o'chirilmadi.")
+        return
+    if javob != 'yes':
+        await q.edit_message_text(f"❎ Bekor qilindi. {p['name']} o'chirilmadi.")
+        return
+    n = await asyncio.to_thread(delete_customer, p['name'])
+    await q.edit_message_text(f"🗑 {p['name']} o'chirildi." if n else f"❌ {p['name']} topilmadi (allaqachon o'chirilgan bo'lishi mumkin).")
+
 def add_debt(person, amount, dtype, note=''):
+    """dtype: 'debitorlik' (mijoz bizga qarz) yoki 'kreditorlik' (biz qarzmiz). Qaytaradi: debt id."""
+    turi = debt_turi(dtype)
+    if not turi:
+        raise ValueError(f"Qarz turi noma'lum: {dtype!r} — 'debitorlik' yoki 'kreditorlik' bo'lishi kerak")
     now = datetime.now()
     conn = db(); c = conn.cursor()
     c.execute('INSERT INTO debts (date,person,amount,type,note) VALUES (?,?,?,?,?)',
-              (now.strftime('%Y-%m-%d'), person, amount, dtype, note))
+              (now.strftime('%Y-%m-%d'), person, round(float(amount or 0), 2), turi, note))
+    did = c.lastrowid
     conn.commit(); conn.close()
+    return did
+
+def _qarz_turlarini_birxillash(c):
+    """Eski qarz turlarini 2 turga o'tkazadi. Idempotent (har ishga tushishda xavfsiz), hech narsa o'chirilmaydi:
+    asl qiymat type_old ustuniga bir marta yoziladi. Xarita: berildi→debitorlik, olindi→kreditorlik,
+    'nasiya:' izohli yozuvlar → doim debitorlik."""
+    try:
+        c.execute("ALTER TABLE debts ADD COLUMN type_old TEXT")
+    except sqlite3.OperationalError:
+        pass                                   # ustun allaqachon bor
+    for canon, aliases in ((DEBITOR, _DEBITOR_ALIAS), (KREDITOR, _KREDITOR_ALIAS)):
+        eski = [a for a in aliases if a != canon]
+        q = ",".join("?" * len(eski))
+        c.execute(f"UPDATE debts SET type_old=type WHERE type_old IS NULL AND lower(trim(type)) IN ({q})", eski)
+        c.execute(f"UPDATE debts SET type=? WHERE lower(trim(type)) IN ({q})", [canon] + eski)
+    c.execute("UPDATE debts SET type_old=type WHERE type_old IS NULL AND note LIKE 'nasiya:%' AND type IS NOT ?", (DEBITOR,))
+    c.execute("UPDATE debts SET type=? WHERE note LIKE 'nasiya:%' AND type IS NOT ?", (DEBITOR, DEBITOR))
+    c.execute("SELECT type, COUNT(*) FROM debts WHERE type IS NULL OR type NOT IN (?,?) GROUP BY type", (DEBITOR, KREDITOR))
+    for t, n in c.fetchall():
+        log.warning("debts: %s ta yozuvning turi noma'lum (%r) — /qarzlar da alohida ko'rsatiladi", n, t)
+
+def _nasiya_qaytar(c, sale_id, row):
+    """reverse_sale ichida, o'sha tranzaksiyada: nasiya sotuvga mos debitorlikni kamaytiradi yoki yopadi.
+    Avval '#s<id>' belgisi bo'yicha; eski yozuvlarda — mijoz + sana + 'nasiya: <mahsulot> x<son>' izohi bo'yicha."""
+    summa = round(row[6] or 0, 2)
+    if summa <= 0: return 0
+    c.execute(f"SELECT id, amount, note FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL} AND note LIKE ? "
+              "ORDER BY id DESC", (f'%#s{sale_id}%',))
+    tag = re.compile(rf"#s{int(sale_id)}(?!\d)")
+    hit = next((r for r in c.fetchall() if tag.search(r[2] or '')), None)
+    if not hit and (row[9] or '').strip():
+        c.execute(f"SELECT id, amount, note FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL} "
+                  "AND person=? AND date=? AND note LIKE ? AND note NOT LIKE '%#s%' ORDER BY id DESC LIMIT 1",
+                  (row[9], row[1], f'nasiya:%{row[3]} x{row[4]}%'))
+        hit = c.fetchone()
+    if not hit: return 0
+    did, amt, note = hit[0], round(hit[1] or 0, 2), hit[2] or ''
+    qoldiq = round(amt - summa, 2)
+    if qoldiq <= 0.01:
+        c.execute("UPDATE debts SET paid=1, note=? WHERE id=?", (f"{note} | yopildi: sotuv #s{sale_id} bekor", did))
+        return amt
+    c.execute("UPDATE debts SET amount=?, note=? WHERE id=?",
+              (qoldiq, f"{note} | -{summa:.2f}: sotuv #s{sale_id} bekor", did))
+    return summa
+
+# ── QARZ TO'LOVI ──────────────────────────────────────────────────
+TOLOV_USULLARI = ('naqd', 'karta', 'payme', 'click', 'otkazma')
+_USUL_ALIAS = {'naqd': 'naqd', 'cash': 'naqd', 'karta': 'karta', 'plastik': 'karta', 'card': 'karta',
+               'humo': 'karta', 'uzcard': 'karta', 'payme': 'payme', 'click': 'click',
+               'otkazma': 'otkazma', "o'tkazma": 'otkazma', 'bank': 'otkazma'}
+
+def tolov_usuli(v):
+    s = str(v or '').strip().lower()
+    for ch in ('ʻ', '’', '‘', '`', 'ʼ'): s = s.replace(ch, "'")
+    return _USUL_ALIAS.get(s)
+
+def _usd2(v): return f"${v:,.2f}"
+
+def _nom_tanla(q, nomlar):
+    """Ism bo'yicha tanlash: aniq → boshi ('Ali' ↔ 'Ali Valiyev') → ichida → o'xshash.
+    Qaytaradi: (tanlangan_nom | None, nomzodlar). Bir nechtasi mos kelsa — taxmin qilmaydi."""
+    n = norm_ism(q)
+    uniq = {}
+    for nm in nomlar:
+        k = norm_ism(nm)
+        if k: uniq.setdefault(k, nm)
+    if not n: return None, list(uniq.values())
+    if n in uniq: return uniq[n], []
+    for mos in (lambda k: k.startswith(n + ' ') or n.startswith(k + ' '),
+                lambda k: (len(n) >= 3 and n in k) or (len(k) >= 3 and k in n)):
+        hits = [k for k in uniq if mos(k)]
+        if len(hits) == 1: return uniq[hits[0]], []
+        if hits: return None, [uniq[k] for k in hits]
+    close = difflib.get_close_matches(n, list(uniq), n=3, cutoff=0.8)
+    if len(close) == 1: return uniq[close[0]], []
+    return None, [uniq[k] for k in close]
+
+def ochiq_qarzlar(turi):
+    """{ism: jami} — ochiq debitorlik yoki kreditorlik (kreditorlikka zavod qoldig'i ham kiradi)."""
+    sql = DEBITOR_SQL if turi == DEBITOR else KREDITOR_SQL
+    conn = db(); c = conn.cursor()
+    c.execute(f"SELECT person, COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND amount>0 AND type IN {sql} GROUP BY person")
+    out = defaultdict(float)
+    for p, s in c.fetchall(): out[p or '?'] += s
+    if turi == KREDITOR:
+        c.execute("SELECT supplier, COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0 GROUP BY supplier")
+        for p, s in c.fetchall(): out[p or '?'] += s
+    conn.close()
+    return {k: round(v, 2) for k, v in out.items()}
+
+def pay_debt(kind, person, amount, method='naqd', note=''):
+    """Qarz to'lovi BITTA tranzaksiyada.
+    debitorlik — mijoz bizga to'ladi: kassaga KIRIM, mijozning ochiq debitorligi eng eskisidan (FIFO) kamayadi.
+    kreditorlik — biz to'ladik: kassadan CHIQIM, zavod qoldig'i (transit.remaining) va boshqa kreditorlik FIFO kamayadi.
+    Ortiqcha summa qabul qilinmaydi (qarz hech qachon manfiy bo'lmaydi). op_log ga 'debt_payment' yoziladi (/undo)."""
+    turi = debt_turi(kind)
+    if not turi:
+        return {'ok': False, 'error': "Tur 'debitorlik' (mijoz to'ladi) yoki 'kreditorlik' (biz to'ladik) bo'lishi kerak"}
+    usul = tolov_usuli(method or 'naqd')
+    if not usul:
+        return {'ok': False, 'error': f"To'lov usuli noma'lum: {method}. Mumkin: {', '.join(TOLOV_USULLARI)}"}
+    try: amount = round(float(amount), 2)
+    except (TypeError, ValueError): amount = 0.0
+    if amount <= 0:
+        return {'ok': False, 'error': "Summa 0 dan katta bo'lishi kerak"}
+    sana = today()
+    if is_closed(sana):
+        return {'ok': False, 'error': f"{sana[:7]} davri yopilgan — to'lov yozib bo'lmaydi. Ochish: /och {sana[:7]}"}
+    sql = DEBITOR_SQL if turi == DEBITOR else KREDITOR_SQL
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute(f"SELECT id, date, person, amount, COALESCE(customer_id,0) FROM debts "
+                  f"WHERE paid=0 AND amount>0 AND type IN {sql}")
+        debts = c.fetchall()
+        tr = []
+        if turi == KREDITOR:
+            c.execute("SELECT id, date, supplier, remaining FROM transit WHERE remaining>0")
+            tr = c.fetchall()
+        nomlar = [d[2] for d in debts] + [t[2] for t in tr]
+        tanlangan, nomzod = _nom_tanla(person, nomlar)
+        if not tanlangan:
+            conn.close()
+            if nomzod:
+                return {'ok': False, 'error': f"'{person}' aniq emas — qaysi biri?", 'variantlar': nomzod}
+            return {'ok': False, 'error': f"'{person}' bo'yicha ochiq {turi} topilmadi",
+                    'variantlar': sorted({n for n in nomlar if n})[:10]}
+        tn = norm_ism(tanlangan)
+        cids = {d[4] for d in debts if norm_ism(d[2]) == tn and d[4]}
+        items = [('debt', d[0], d[1] or '', round(d[3] or 0, 2)) for d in debts
+                 if norm_ism(d[2]) == tn or (d[4] and d[4] in cids)]
+        items += [('transit', t[0], t[1] or '', round(t[3] or 0, 2)) for t in tr if norm_ism(t[2]) == tn]
+        items.sort(key=lambda i: (i[2], 0 if i[0] == 'transit' else 1, i[1]))     # FIFO: eng eskisi birinchi
+        jami = round(sum(i[3] for i in items), 2)
+        if amount > jami + 0.005:
+            conn.close()
+            return {'ok': False, 'qarz': jami,
+                    'error': f"Ortiqcha to'lov: {tanlangan} bo'yicha ochiq {turi} faqat {_usd2(jami)}. "
+                             f"{_usd2(amount)} qabul qilinmadi — summani tekshiring."}
+        amount = min(amount, jami)
+        now = datetime.now(); d_, t_ = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+        c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)', (d_, t_, 'debt_payment', '{}'))
+        op_id = c.lastrowid
+        left = amount; done = []
+        for src, iid, _sana, qoldiq in items:
+            if left <= 0.004: break
+            part = round(min(left, qoldiq), 2)
+            yopildi = part >= qoldiq - 0.005
+            if src == 'debt':
+                # qoldiq kamayadi; 0 bo'lsa yopiladi (qaytarishda aynan shu summa qo'shiladi — tartibdan qat'i nazar to'g'ri)
+                c.execute("UPDATE debts SET amount=ROUND(MAX(0, amount-?),2), paid=CASE WHEN amount-?<=0.005 THEN 1 ELSE 0 END "
+                          "WHERE id=? AND paid=0", (part, part, iid))
+                n = c.rowcount
+            else:
+                n = pay_transit_deposit(iid, part, c)
+            if n != 1:
+                raise RuntimeError(f"qarz yozuvi o'zgarib qoldi ({src} #{iid})")
+            done.append({'src': src, 'id': iid, 'part': part, 'yopildi': yopildi})
+            left = round(left - part, 2)
+        # Kassa: zavod qismi 'zavod_qarz' (Excel import shu toifani hisobga oladi), qolgani alohida toifa
+        cash_type = 'kirim' if turi == DEBITOR else 'chiqim'
+        bo_lak = defaultdict(float)
+        for it in done:
+            cat = 'qarz_qaytdi' if turi == DEBITOR else ('zavod_qarz' if it['src'] == 'transit' else 'qarz_tolov')
+            bo_lak[cat] += it['part']
+        cash_ids = []
+        for cat, s in bo_lak.items():
+            izoh = (f"{tanlangan} qarz to'lovi (#p{op_id})" if turi == DEBITOR else f"{tanlangan} qarziga to'lov (#p{op_id})")
+            if note: izoh += f" — {note}"
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d_, t_, cash_type, round(s, 2), cat, izoh, usul))
+            cash_ids.append(c.lastrowid)
+        data = {'kind': turi, 'person': tanlangan, 'amount': amount, 'method': usul,
+                'cash_ids': cash_ids, 'items': done, 'date': d_}
+        c.execute('UPDATE op_log SET data_json=? WHERE id=?', (json.dumps(data, ensure_ascii=False), op_id))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    return {'ok': True, 'op_id': op_id, 'kind': turi, 'person': tanlangan, 'paid': amount, 'method': usul,
+            'qoldiq': max(0.0, round(jami - amount, 2)),
+            'yopildi': sum(1 for i in done if i['yopildi']), 'qisman': sum(1 for i in done if not i['yopildi']),
+            'items': done, 'kassa': round(get_cash_balance(), 2)}
+
+def reverse_debt_payment(op_id):
+    """Qarz to'lovini BITTA tranzaksiyada bekor qiladi: qarz qoldig'i qaytadi, kassaga teskari yozuv, op_log reversed=1."""
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("SELECT date, data_json FROM op_log WHERE id=? AND op_type='debt_payment' AND reversed=0", (op_id,))
+        r = c.fetchone()
+        if not r:
+            conn.close(); return False, "Topilmadi yoki allaqachon qaytarilgan"
+        for s in (r[0], today()):
+            if is_closed(s):
+                conn.close(); return False, f"{s[:7]} davri yopilgan — to'lovni qaytarib bo'lmaydi (/och {s[:7]})"
+        d = json.loads(r[1] or '{}')
+        c.execute("UPDATE op_log SET reversed=1 WHERE id=? AND reversed=0", (op_id,))
+        if c.rowcount != 1:
+            conn.rollback(); conn.close(); return False, "Topilmadi yoki allaqachon qaytarilgan"
+        for it in d.get('items', []):
+            if it['src'] == 'debt':
+                c.execute("UPDATE debts SET amount=ROUND(amount+?,2), paid=0 WHERE id=?", (it['part'], it['id']))
+            else:
+                c.execute("UPDATE transit SET deposit=deposit-?, remaining=remaining+? WHERE id=?",
+                          (it['part'], it['part'], it['id']))
+        now = datetime.now()
+        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                  (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'),
+                   'chiqim' if d.get('kind') == DEBITOR else 'kirim', d.get('amount', 0), 'qaytarish',
+                   f"qarz to'lovi bekor: {d.get('person', '')} (#p{op_id})", d.get('method') or 'naqd'))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    return True, "qaytarildi"
 
 def set_target(year, month, revenue, profit):
     conn = db(); c = conn.cursor()
@@ -964,15 +1264,16 @@ def cash_flow_forecast():
         monthly_revs.append(c.fetchone()[0])
     avg_monthly = sum(monthly_revs) / 3 if monthly_revs else 0
 
-    # Yo'ldagi tovar xarajatlari
-    c.execute("SELECT SUM(remaining) FROM transit WHERE status='yolda'")
+    # KREDITORLIK — zavod: to'lanmagan qoldiq (yo'lda yoki kelgan bo'lsa ham; balans bilan bir xil ta'rif)
+    c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
     transit_remaining = c.fetchone()[0] or 0
 
-    # Qarzlar
-    c.execute("SELECT SUM(amount) FROM debts WHERE type='berildi' AND paid=0")
-    debt_out = c.fetchone()[0] or 0
-    c.execute("SELECT SUM(amount) FROM debts WHERE type='olindi' AND paid=0")
+    # Qarzlar: DEBITORLIK = kutilayotgan kirim (+), KREDITORLIK = kutilayotgan chiqim (−)
+    # (avval eski matn rejimi ma'nosida teskari olinardi: mijoz qarzi chiqim bo'lib ketardi)
+    c.execute(f"SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL}")
     debt_in = c.fetchone()[0] or 0
+    c.execute(f"SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {KREDITOR_SQL}")
+    debt_out = c.fetchone()[0] or 0
 
     conn.close()
     return {
@@ -981,6 +1282,8 @@ def cash_flow_forecast():
         'transit_to_pay': transit_remaining,
         'debts_to_receive': debt_in,
         'debts_to_pay': debt_out,
+        'debitorlik': debt_in,
+        'kreditorlik': round(transit_remaining + debt_out, 2),
         'net_forecast': avg_monthly + debt_in - transit_remaining - debt_out
     }
 
@@ -1027,8 +1330,9 @@ Bank tolov: {{"action":"expense","amount":45,"category":"bank","type":"cogs_bank
 Dostavka: {{"action":"expense","amount":110,"category":"dostavka","type":"cogs_delivery","note":""}}
 Mijoz qosh: {{"action":"add_customer","name":"ism","phone":"","ctype":"B2C"}}
 Mijozlar: {{"action":"customers"}}
-Qarz berdi: {{"action":"debt","person":"ism","amount":100,"type":"olindi"}}
-Qarz oldim: {{"action":"debt","person":"ism","amount":100,"type":"berildi"}}
+Mijoz bizga qarz: {{"action":"debt","person":"ism","amount":100,"type":"debitorlik"}}
+Biz qarzmiz: {{"action":"debt","person":"ism","amount":100,"type":"kreditorlik"}}
+Qarz to'landi: {{"action":"debt_pay","kind":"debitorlik","person":"ism","amount":100,"method":"naqd"}}
 Qarzlar: {{"action":"debts"}}
 ABC XYZ: {{"action":"analiz"}}
 Maqsad: {{"action":"set_target","revenue":3000,"profit":800}}
@@ -1058,8 +1362,11 @@ QOIDALAR:
 - "bank tolov" = expense (type=cogs_bank)
 - "dostavka/yolkira" = expense (type=cogs_delivery)
 - "zakaz berdim/yo'lga tushdi" = transit_add
-- "qarz oldi" = debt (type=olindi — biz berdik)
-- "qarz berdim" = debt (type=berildi — bizdan oldi)
+- QARZ faqat 2 tur. type="debitorlik" = u BIZGA qarz ("Alibek 200 qarz oldi", "Alibekka qarz berdim", nasiya).
+  type="kreditorlik" = BIZ unga qarzmiz ("Alibekdan qarz oldim", "Alibek bizga qarz berdi", zavodga qarz)
+- QARZ TO'LOVI = debt_pay: "Alibek qarzini qaytardi/to'ladi 100" → kind="debitorlik"; "Alibekka qarzimizni to'ladim" → kind="kreditorlik".
+  Zavodga to'lov: zakaz raqami (#3) aytilsa — transit_pay, raqamsiz ("Two Trees ga 300 to'ladim") — debt_pay kind="kreditorlik".
+  method: naqd/karta/payme/click/otkazma (aytilmasa naqd)
 - product maydonida MAVJUD ro'yxatdan nom yozing"""
 
     try:
@@ -1094,6 +1401,8 @@ def _undo_op(op_id: int):
     conn.close()          # o'qish ulanishi yopiladi — quyidagi yozuvlar boshqa ulanishda bo'ladi
     if not op:
         return False, "Topilmadi yoki allaqachon qaytarilgan"
+    if op[3] == 'debt_payment':
+        return reverse_debt_payment(op_id)       # o'zi atomik: qarz + kassa + op_log bitta tranzaksiyada
     d = json.loads(op[4]); ok = False
     if op[3] == 'sale':
         ok = reverse_sale(d.get('sale_id', 0))
@@ -1162,7 +1471,7 @@ AI_TOOLS = [
          "date": {"type": "string", "description": "YYYY-MM-DD. Bo'sh = bugun. O'tgan kun xarajatini yozish uchun"},
          "note": {"type": "string", "default": ""}}}},
     {"name": "record_cash",
-     "description": "Kassaga kirim yoki chiqim (sotuv/xarajatdan tashqari: qarz qaytdi, shaxsiy oldi va h.k.)",
+     "description": "Kassaga kirim yoki chiqim (sotuv/xarajat/qarz to'lovidan tashqari: shaxsiy oldi, kassa to'g'irlash va h.k.). Mijoz qarzini qaytarsa — pay_debt.",
      "input_schema": {"type": "object", "required": ["amount_usd", "direction"], "properties": {
          "amount_usd": {"type": "number"},
          "direction": {"type": "string", "enum": ["kirim", "chiqim"]},
@@ -1190,20 +1499,31 @@ AI_TOOLS = [
      "description": "Oxirgi operatsiyalar (bekor qilish uchun id lar bilan).",
      "input_schema": {"type": "object", "properties": {"n": {"type": "integer", "default": 8}}}},
     {"name": "undo_operation",
-     "description": "Operatsiyani bekor qiladi (sotuv yoki xarajat). get_last_operations dan id oling.",
+     "description": "Operatsiyani bekor qiladi (sotuv, xarajat yoki qarz to'lovi). get_last_operations dan id oling.",
      "input_schema": {"type": "object", "required": ["op_id"], "properties": {"op_id": {"type": "integer"}}}},
     {"name": "get_debts",
-     "description": "Debitor/kreditorlik: kim bizga qarz, biz kimga qarz. Zavod qarzi ham.",
+     "description": "Qarzlar 2 tur: debitorlik (mijozlar bizga qarz) va kreditorlik (biz zavod/yetkazuvchiga qarzmiz, zavod qarzi ham shu).",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "add_debt",
-     "description": "Qarz yozish. type: 'berildi' = biz berdik (u bizga qarz), 'olindi' = biz oldik (biz qarz).",
+     "description": "Qarz yozish. type: 'debitorlik' = u BIZGA qarz (mijoz qarzi), 'kreditorlik' = BIZ unga qarzmiz. Nasiya sotuv uchun bu emas — record_sale on_credit=true. Zavodga zakaz qarzi transit orqali yuritiladi.",
      "input_schema": {"type": "object", "required": ["person", "amount_usd", "type"], "properties": {
          "person": {"type": "string"}, "amount_usd": {"type": "number"},
-         "type": {"type": "string", "enum": ["berildi", "olindi"]},
+         "type": {"type": "string", "enum": ["debitorlik", "kreditorlik"]},
          "note": {"type": "string", "default": ""}}}},
     {"name": "get_transit",
      "description": "Yo'ldagi tovarlar va zavod qarzi (id lar bilan).",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "pay_debt",
+     "description": "Qarz TO'LOVI. kind='debitorlik' — mijoz bizga qarzini to'ladi/qaytardi: kassaga kirim, mijoz qarzi eng eskisidan "
+                    "kamayadi/yopiladi (record_cash EMAS). kind='kreditorlik' — biz zavod/yetkazuvchiga qarzimizni to'ladik: kassadan chiqim, "
+                    "zavod qoldig'i va boshqa kreditorlik eng eskisidan kamayadi. Qarzdan ortiq summa qabul qilinmaydi. /undo bilan qaytadi.",
+     "input_schema": {"type": "object", "required": ["kind", "person"], "properties": {
+         "kind": {"type": "string", "enum": ["debitorlik", "kreditorlik"]},
+         "person": {"type": "string", "description": "Mijoz yoki zavod/yetkazuvchi nomi (taxminiy bo'lsa ham bo'ladi)"},
+         "amount_usd": {"type": "number", "description": "To'langan summa dollarda"},
+         "amount_uzs": {"type": "number", "description": "So'mda aytilgan bo'lsa"},
+         "method": {"type": "string", "enum": ["naqd", "karta", "payme", "click", "otkazma"], "default": "naqd"},
+         "note": {"type": "string", "default": ""}}}},
     {"name": "pay_factory_debt",
      "description": "Zavod qarzini to'laydi: qarz kamayadi va kassadan chiqim yoziladi. transit_id bermasa — supplier bo'yicha eng eski qarzdan boshlab yopadi. amount_usd bermasa — o'sha yetkazuvchiga bo'lgan butun qarz yopiladi.",
      "input_schema": {"type": "object", "properties": {
@@ -1306,7 +1626,8 @@ AI_TOOLS = [
      "description": "Mijozlar ro'yxati.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "delete_customer",
-     "description": "Mijozni o'chiradi (ism bo'yicha aniq moslik).",
+     "description": "Mijozni o'chirish SO'ROVI (ism bo'yicha aniq moslik). Darhol o'chirmaydi: egasiga 'Ha, o'chir / Yo'q' "
+                    "tugmalari yuboriladi, o'chirish faqat egasi 'Ha' ni bosganda bajariladi. Egasiga tugmani bosishini ayting.",
      "input_schema": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}},
     {"name": "add_customer",
      "description": "Mijoz qo'shadi. Shu ismli mijoz bor bo'lsa ma'lumotini yangilaydi (telefon, tur, izoh).",
@@ -1331,7 +1652,7 @@ AI_TOOLS = [
 # ── Asboblarni bajarish ──────────────────────────────────────────
 async def execute_tool(name, inp, ctx=None):
     # ── Yopilgan davrga yozishni taqiqlash ──
-    YOZUV = {"record_sale", "record_sale_multi", "record_expense", "record_cash", "add_debt",
+    YOZUV = {"record_sale", "record_sale_multi", "record_expense", "record_cash", "add_debt", "pay_debt",
              "pay_factory_debt", "undo_operation", "add_stock"}
     if name in YOZUV:
         _s = inp.get("date") or today()
@@ -1377,7 +1698,7 @@ async def execute_tool(name, inp, ctx=None):
             total = round(price * qty, 2)
             profit = round((price - prod['cost']) * qty, 2)
             if on_credit:
-                add_debt(cust, total, "berildi", f"nasiya: {prod['name']} x{qty}")
+                add_debt(cust, total, DEBITOR, f"nasiya: {prod['name']} x{qty} (#s{sale_id})")
                 cash_note = "nasiya — kassaga tushmadi, debitor yozildi"
             else:
                 cash_note = "kassaga kirim yozildi"
@@ -1448,7 +1769,8 @@ async def execute_tool(name, inp, ctx=None):
                              "summa": round(s, 2), "foyda": round(s - r["p"]["cost"] * r["qty"], 2)})
             jami = round(sum(d["summa"] for d in done), 2)
             if on_credit:
-                add_debt(cust, jami, "berildi", "nasiya: " + ", ".join(f"{d['product']} x{d['qty']}" for d in done))
+                add_debt(cust, jami, DEBITOR, "nasiya: " + ", ".join(f"{d['product']} x{d['qty']}" for d in done)
+                         + " (" + ",".join(f"#s{d['sale_id']}" for d in done) + ")")
             after = {p['id']: p['qty'] for p in get_products()}
             for d, r in zip(done, rows): d["astatkada_qoldi"] = after.get(r["p"]["id"])
             return _j({"ok": True, "sotuvlar": done, "jami": jami,
@@ -1530,15 +1852,23 @@ async def execute_tool(name, inp, ctx=None):
             debts = c.fetchall()
             c.execute("SELECT supplier,product,remaining,status FROM transit WHERE remaining>0")
             fac = c.fetchall(); conn.close()
-            return _j({"receivable_they_owe_us": [{"date": d[0], "person": d[1], "amount": d[2], "note": d[4]} for d in debts if d[3] == 'berildi'],
-                       "payable_we_owe": [{"date": d[0], "person": d[1], "amount": d[2], "note": d[4]} for d in debts if d[3] == 'olindi'],
-                       "factory_debt": [{"supplier": f[0], "item": f[1], "remaining": f[2]} for f in fac]})
+            deb = [{"date": d[0], "person": d[1], "amount": d[2], "note": d[4]} for d in debts if debt_turi(d[3]) == DEBITOR]
+            kre = [{"date": d[0], "person": d[1], "amount": d[2], "note": d[4]} for d in debts if debt_turi(d[3]) == KREDITOR]
+            zav = [{"supplier": f[0], "item": f[1], "remaining": f[2]} for f in fac]
+            return _j({"debitorlik_mijozlar_bizga_qarz": deb,
+                       "kreditorlik_biz_qarzmiz": kre,
+                       "kreditorlik_zavod": zav,
+                       "jami_debitorlik": round(sum(x["amount"] or 0 for x in deb), 2),
+                       "jami_kreditorlik": round(sum(x["amount"] or 0 for x in kre) + sum(x["remaining"] or 0 for x in zav), 2)})
 
         if name == "add_debt":
             amt = float(inp.get("amount_usd", 0))
             if amt >= 5000: amt = round(amt / get_exchange_rate(), 2)
-            add_debt(inp.get("person", ""), amt, inp.get("type", "berildi"), inp.get("note", ""))
-            return _j({"ok": True})
+            turi = debt_turi(inp.get("type") or DEBITOR)
+            if not turi:
+                return _j({"error": "type faqat 'debitorlik' yoki 'kreditorlik' bo'lishi mumkin"})
+            did = add_debt(inp.get("person", ""), amt, turi, inp.get("note", ""))
+            return _j({"ok": True, "id": did, "type": turi})
 
         if name == "get_transit":
             conn = db(); c = conn.cursor()
@@ -1546,6 +1876,11 @@ async def execute_tool(name, inp, ctx=None):
             rows = c.fetchall(); conn.close()
             return _j([{"id": r[0], "date": r[1], "supplier": r[2], "product": r[3], "qty": r[4],
                         "unit_cost": r[5], "total": r[6], "deposit": r[7], "remaining": r[8], "status": r[9]} for r in rows])
+
+        if name == "pay_debt":
+            amt = _to_usd(inp.get("amount_usd"), inp.get("amount_uzs"))
+            return _j(await asyncio.to_thread(pay_debt, inp.get("kind"), inp.get("person", ""), amt,
+                                              inp.get("method") or "naqd", inp.get("note") or ""))
 
         if name == "pay_factory_debt":
             sup = (inp.get("supplier") or "").strip()
@@ -1800,8 +2135,8 @@ async def execute_tool(name, inp, ctx=None):
                        "jami_mijoz": len(find_customers())})
 
         if name == "delete_customer":
-            n = delete_customer(inp.get("name", ""))
-            return _j({"ok": n > 0, "deleted": n})
+            # AI o'zi o'chira olmaydi — egasiga tasdiqlash tugmalari yuboriladi
+            return _j(await _mijoz_ochirish_sorovi(inp.get("name", ""), ctx))
 
         if name == "get_rate":
             return _j({"usd_uzs": get_exchange_rate(), "source": "cbu.uz"})
@@ -2031,8 +2366,11 @@ ISH QOIDALARI:
 13. RAQOBAT: egasi raqobatchi narxini aytsa — record_competitor_price bilan darhol yozing. "bozorda qancha?", "raqobatchilar qancha sotyapti?" desa — avval get_competitor_analysis; ma'lumot yo'q yoki eskirgan bo'lsa web_search bilan OLX/birbir dan qidiring, topganingizni record_competitor_price bilan saqlang, keyin xulosa ayting. Narx bo'yicha maslahat berganda marjani (narx - sebest) hisobga oling — sebestdan past taklif qilmang.
 11. PUL CHIQIMI UCHUN QAYSI ASBOB (muhim, chalkashtirmang):
     - record_expense — HAQIQIY XARAJAT: reklama, OLX, transport, ijara, bank komissiyasi, AI xizmati, yo'lkira. Bu kassadan ham chiqadi, xarajat hisobotida ham ko'rinadi. Chiqim bo'lsa DOIM shuni ishlating.
-    - pay_factory_debt — zavodga qarz to'lash. Bu xarajat EMAS (qarz kamayadi), shuning uchun xarajat hisobotiga tushmaydi.
-    - record_cash — faqat xarajat ham, qarz to'lovi ham bo'lmagan harakat uchun: shaxsiy pul olish, mijoz qarzini qaytarishi, kassa to'g'irlash.
+    - pay_debt kind=kreditorlik — zavodga/yetkazuvchiga qarz to'lash. Bu xarajat EMAS (qarz kamayadi), xarajat hisobotiga tushmaydi.
+      (pay_factory_debt — faqat aniq transit_id kerak bo'lsa yoki pul ilgari to'langan bo'lib from_cash=false kerak bo'lsa.)
+    - pay_debt kind=debitorlik — MIJOZ QARZINI QAYTARDI/TO'LADI. record_cash EMAS (aks holda qarz ochiq qoladi).
+    - record_cash — faqat xarajat ham, qarz to'lovi ham bo'lmagan harakat uchun: shaxsiy pul olish, kassa to'g'irlash.
+    - QARZ faqat 2 tur: DEBITORLIK — mijozlar bizga qarz (nasiya, add_debt type=debitorlik); KREDITORLIK — biz zavod/yetkazuvchiga qarzmiz (zavod qarzi transit orqali, boshqasi add_debt type=kreditorlik).
     Shubha bo'lsa record_expense tanlang. record_cash bilan chiqim yozsangiz, u xarajat hisobotida KO'RINMAYDI.
 12. Eski yozuvni to'g'irlashda (pul allaqachon kassadan chiqqan, faqat xarajat jurnalida yo'q) — record_expense ni from_cash=false bilan chaqiring va date bering. Aks holda kassa ikki marta kamayadi.
 """
@@ -2273,95 +2611,6 @@ async def _post_shutdown(app):
         log.exception("yakuniy zaxira")
 
 
-async def cmd_sync_sentyabr(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Sentyabr 2026 ni Excel jadvali bilan aniq sinxronlaydi"""
-    if not is_owner(u): return
-    args = ctx.args or []
-    if not args or args[0].lower() not in ('ha', 'yes'):
-        await u.message.reply_text(
-            "\u26a0\ufe0f Bu SENTYABR 2026 ma'lumotlarini Excel jadvali bilan almashtiradi:\n"
-            "\u2022 astatka (soni + sebest)\n\u2022 sentyabr sotuvlari\n\u2022 sentyabr xarajatlari\n"
-            "\u2022 kassa harakati\n\u2022 Two Trees qarzi yopiladi\n\n"
-            "Yanvar-avgust tarixi tegilmaydi.\n\nTasdiqlash: /sync_sentyabr ha")
-        return
-
-    # ── Excel jadvalidan (22.09.2026) ────────────────────────────
-    STOCK = [
-        (1, 2, 126), (2, 3, 166), (3, 3, 309), (4, 2, 87),  (5, 4, 107),
-        (6, 1, 91),  (7, 1, 91),  (8, 1, 65),  (9, 1, 65),  (10, 2, 23),
-        (11, 1, 23), (12, 2, 21), (13, 2, 41), (14, 1, 300),(15, 2, 160),
-        (16, 2, 100),(17, 1, 88), (18, 1, 89), (19, 1, 85), (20, 2, 53),
-        (21, 1, 15),
-    ]
-    ZERO = [22, 23, 24, 25, 26, 27, 28, 29, 30]
-    SALES = [
-        ('2026-09-15', 'TTS 55 Pro',      1, 126.0, 190.0, 64.0),
-        ('2026-09-20', '15 in 1 (SB400)', 1, 299.8, 330.0, 30.2),
-    ]
-    EXPENSES = [
-        ('2026-09-05', 110.0, 'yetkazuvchi', 'period', 'Abusaxiy'),
-        ('2026-09-08',  50.0, 'transport',   'period', "Yo'lkira"),
-        ('2026-09-10',  30.0, 'reklama',     'period', 'OLX'),
-        ('2026-09-18',  32.0, 'bank',        'cogs_bank', 'Bank komissiyasi'),
-        ('2026-09-21',  75.0, 'ai_xizmat',   'period', 'AI xizmatlari'),
-    ]
-    OTHER_CASH = [
-        ('2026-09-12', 805.0, 'zavod_qarz', 'Two Trees qarziga to\'lov'),
-        ('2026-09-14',  38.0, 'shaxsiy',    "O'zim uchun"),
-        ('2026-09-19',  17.0, 'shaxsiy',    "O'zim uchun"),
-    ]
-    START_CASH = 1080.0
-
-    conn = db(); c = conn.cursor()
-    # 1) Astatka
-    for pid, qty, cost in STOCK:
-        c.execute('UPDATE products SET qty=?, cost=? WHERE id=?', (qty, cost, pid))
-    for pid in ZERO:
-        c.execute('UPDATE products SET qty=0 WHERE id=?', (pid,))
-    # 2) Sentyabr yozuvlarini tozalash
-    c.execute("DELETE FROM sales    WHERE date LIKE '2026-09%'")
-    c.execute("DELETE FROM expenses WHERE date LIKE '2026-09%'")
-    c.execute("DELETE FROM cash_box WHERE date LIKE '2026-09%'")
-    # 3) Sotuvlar
-    for d, name, qty, cost, rev, prof in SALES:
-        c.execute("""INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type)
-                     VALUES (?,?,?,?,?,?,?,0,'','B2C')""", (d, '12:00', name, qty, cost, rev, prof))
-    # 4) Xarajatlar
-    for d, amt, cat, etype, note in EXPENSES:
-        c.execute('INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)',
-                  (d, amt, cat, etype, note))
-    # 5) Kassa
-    c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
-              ('2026-09-01', '00:00', 'kirim', START_CASH, 'boshlangich', 'Sentyabr boshlangich qoldiq', 'naqd'))
-    for d, name, qty, cost, rev, prof in SALES:
-        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
-                  (d, '12:00', 'kirim', rev, 'sotuv', f'{name} x{qty}', 'naqd'))
-    for d, amt, cat, etype, note in EXPENSES:
-        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
-                  (d, '12:00', 'chiqim', amt, cat, note, 'naqd'))
-    for d, amt, cat, note in OTHER_CASH:
-        c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
-                  (d, '12:00', 'chiqim', amt, cat, note, 'naqd'))
-    # 6) Two Trees qarzi yopildi
-    c.execute("UPDATE transit SET deposit=total_cost, remaining=0, status='tolangan' WHERE supplier LIKE '%Two Trees%' AND remaining>0")
-    conn.commit(); conn.close()
-
-    prods = get_products()
-    tovar = sum(p['qty'] * p['cost'] for p in prods)
-    bal   = get_cash_balance()
-    rev   = sum(s[4] for s in SALES); cost = sum(s[3] for s in SALES)
-    exp   = sum(e[1] for e in EXPENSES)
-    await u.message.reply_text(
-        f"\u2705 Sentyabr 2026 sinxronlandi\n\n"
-        f"\U0001F4E6 Tovar qoldig'i: {fmt(tovar)}\n"
-        f"\U0001F4B5 Kassa: {fmt(bal)}\n"
-        f"\U0001F4C8 Sotuv: {fmt(rev)} / tannarx {fmt(cost)} / foyda {fmt(rev-cost)}\n"
-        f"\U0001F4B8 Xarajat: {fmt(exp)}\n"
-        f"\U0001F3ED Two Trees qarzi: yopildi\n\n"
-        f"Tekshiring: Astatka, Kassa, /oy_tafsil 2026-09")
-    ok, msg = await asyncio.to_thread(db_backup_to_github, 'sentyabr sync')
-    await u.message.reply_text(("\U0001F4BE " if ok else "\u26a0\ufe0f ") + msg)
-
 _DASH_TPL = r"""<!DOCTYPE html>
 <html lang="uz"><head>
 <meta charset="utf-8">
@@ -2579,9 +2828,9 @@ def balans(sanagacha=None):
     c.execute("SELECT COALESCE(SUM(CASE WHEN type='kirim' THEN amount ELSE -amount END),0) "
               "FROM cash_box WHERE date<=?", (sana,))
     naqd = c.fetchone()[0] or 0
-    c.execute("SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type='berildi' AND date<=?", (sana,))
+    c.execute(f"SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL} AND date<=?", (sana,))
     debitor = c.fetchone()[0] or 0
-    c.execute("SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type='olindi' AND date<=?", (sana,))
+    c.execute(f"SELECT COALESCE(SUM(amount),0) FROM debts WHERE paid=0 AND type IN {KREDITOR_SQL} AND date<=?", (sana,))
     kreditor = c.fetchone()[0] or 0
     c.execute("SELECT COALESCE(SUM(remaining),0) FROM transit WHERE remaining>0")
     zavod = c.fetchone()[0] or 0
@@ -2632,8 +2881,8 @@ def qarz_yoshi():
                            'izoh': r[izoh] if izoh is not None else ''})
         return out
 
-    bizga = guruh([d for d in debts if d[4] == 'berildi'], 2, 3, 1, 5)
-    bizdan = guruh([d for d in debts if d[4] == 'olindi'], 2, 3, 1, 5)
+    bizga = guruh([d for d in debts if debt_turi(d[4]) == DEBITOR], 2, 3, 1, 5)     # debitorlik
+    bizdan = guruh([d for d in debts if debt_turi(d[4]) == KREDITOR], 2, 3, 1, 5)   # kreditorlik (zavoddan tashqari)
     zavod = guruh(tr, 2, 4, 1, 3)
     def jami(g): return sum(x['summa'] for b in g.values() for x in b)
     return {'bizga_qarzdor': bizga, 'biz_qarzdormiz': bizdan, 'zavod': zavod,
@@ -2905,7 +3154,7 @@ def mijoz_karta(kim):
     sot = [{'sana': x[0], 'mahsulot': x[1], 'dona': x[2], 'summa': x[3], 'foyda': x[4]}
            for x in c.fetchall()]
     c.execute("SELECT id,date,amount,type,note FROM debts WHERE customer_id=? AND paid=0 ORDER BY date", (cid,))
-    qarz = [{'id': x[0], 'sana': x[1], 'summa': x[2], 'turi': x[3], 'izoh': x[4]} for x in c.fetchall()]
+    qarz = [{'id': x[0], 'sana': x[1], 'summa': x[2], 'turi': debt_turi(x[3]) or x[3], 'izoh': x[4]} for x in c.fetchall()]
     c.execute("SELECT sana,turi,matn FROM customer_log WHERE customer_id=? ORDER BY id DESC LIMIT 6", (cid,))
     log = [{'sana': x[0], 'turi': x[1], 'matn': x[2]} for x in c.fetchall()]
     c.execute("SELECT product,last_date,cycle_days FROM reorder WHERE customer_id=? AND active=1", (cid,))
@@ -2933,8 +3182,8 @@ def mijoz_karta(kim):
             chid = mos[0][0]; obuna = bool(mos[0][2])
     conn.close()
 
-    bizga = sum(q['summa'] for q in qarz if q['turi'] == 'berildi')
-    bizdan = sum(q['summa'] for q in qarz if q['turi'] == 'olindi')
+    bizga = sum(q['summa'] for q in qarz if q['turi'] == DEBITOR)
+    bizdan = sum(q['summa'] for q in qarz if q['turi'] == KREDITOR)
     kunlar = None
     if len(sot) >= 2:
         try:
@@ -3471,12 +3720,12 @@ async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t += "AKTIV\n"
     t += f"  Kassa              {fmt(bl['naqd'])}\n"
     t += f"  Tovar (sebest)     {fmt(bl['tovar'])}\n"
-    if bl['debitor']: t += f"  Debitorlik         {fmt(bl['debitor'])}\n"
+    if bl['debitor']: t += f"  Debitorlik         {fmt(bl['debitor'])}  (mijozlar bizga qarz)\n"
     if bl['yolda']:   t += f"  Yo'ldagi avans     {fmt(bl['yolda'])}\n"
     t += f"  Jami aktiv         {fmt(bl['aktiv'])}\n\n"
     t += "PASSIV\n"
-    if bl['zavod_qarzi']: t += f"  Zavod qarzi        {fmt(bl['zavod_qarzi'])}\n"
-    if bl['kreditor']:    t += f"  Boshqa qarzlar     {fmt(bl['kreditor'])}\n"
+    if bl['zavod_qarzi']: t += f"  Kreditorlik—zavod  {fmt(bl['zavod_qarzi'])}  (biz zavodga qarzmiz)\n"
+    if bl['kreditor']:    t += f"  Kreditorlik—boshqa {fmt(bl['kreditor'])}\n"
     t += f"  Jami passiv        {fmt(bl['passiv'])}\n\n"
     t += f"\U0001F4B0 SOF KAPITAL        {fmt(bl['kapital'])}\n\n"
 
@@ -3505,14 +3754,14 @@ async def cmd_qarz_yosh(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 s += f"     • {x['kim']} — {fmt(x['summa'])} ({x['kun']} kun)\n"
         return s + "\n"
     t = "\U0001F4CB QARZDORLIK YOSHI\n\n"
-    t += blok(q['bizga_qarzdor'], "Bizga qarzdor", "\U0001F4E5")
-    t += blok(q['biz_qarzdormiz'], "Biz qarzdormiz", "\U0001F4E4")
-    t += blok(q['zavod'], "Zavod qarzi", "\U0001F3ED")
+    t += blok(q['bizga_qarzdor'], "Debitorlik — mijozlar bizga qarz", "\U0001F4E5")
+    t += blok(q['zavod'], "Kreditorlik — biz zavodga qarzmiz", "\U0001F3ED")
+    t += blok(q['biz_qarzdormiz'], "Kreditorlik — boshqa (biz qarzmiz)", "\U0001F4E4")
     if q['jami_debitor'] == 0 and q['jami_kreditor'] == 0:
         t += "Ochiq qarz yo'q — hammasi toza."
     else:
         t += "────────────────\n"
-        t += f"Debitor {fmt(q['jami_debitor'])} · Kreditor {fmt(q['jami_kreditor'])}\n"
+        t += f"Debitorlik {fmt(q['jami_debitor'])} · Kreditorlik {fmt(q['jami_kreditor'])}\n"
         t += f"Sof: {fmt(q['jami_debitor'] - q['jami_kreditor'])}"
     await u.message.reply_text(t)
 
@@ -3728,9 +3977,9 @@ async def cmd_mijoz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t += "\n"
 
     if k['bizga_qarzdor']:
-        t += f"\U0001F534 *Bizga qarzi: {fmt(k['bizga_qarzdor'])}*\n"
+        t += f"\U0001F534 *Debitorlik (bizga qarzi): {fmt(k['bizga_qarzdor'])}*\n"
     if k['biz_qarzdormiz']:
-        t += f"\U0001F535 Biz qarzdormiz: {fmt(k['biz_qarzdormiz'])}\n"
+        t += f"\U0001F535 Kreditorlik (biz qarzmiz): {fmt(k['biz_qarzdormiz'])}\n"
     if k['bizga_qarzdor'] or k['biz_qarzdormiz']: t += "\n"
 
     kelgan = [x for x in k['qayta_buyurtma'] if x['muddati_keldi']]
@@ -3782,7 +4031,7 @@ async def cmd_mijozlar_yangi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     qarzlar = {}
     conn = db(); c = conn.cursor()
     c.execute("SELECT customer_id, SUM(amount) FROM debts "
-              "WHERE paid=0 AND type='berildi' AND COALESCE(customer_id,0)>0 GROUP BY customer_id")
+              f"WHERE paid=0 AND type IN {DEBITOR_SQL} AND COALESCE(customer_id,0)>0 GROUP BY customer_id")
     for cid, s in c.fetchall(): qarzlar[cid] = s
     conn.close()
 
@@ -4414,6 +4663,7 @@ async def cmd_zavod_qarz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += f"  💸 Qolgan qarz: *{fmt(r[3])}*\n\n"
         total_remaining += r[3]
     text += f"💸 *JAMI ZAVOD QARZI: {fmt(total_remaining)}*"
+    text += "\n\nTo'lash: /zavod\\_tolov Two Trees 300 \\[usul]"
     await u.message.reply_text(text, parse_mode='Markdown')
 
 async def cmd_analiz(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4494,25 +4744,89 @@ async def cmd_mijozlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_qarzlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
     conn = db(); c = conn.cursor()
-    c.execute("SELECT * FROM debts WHERE paid=0 ORDER BY id DESC")
-    rows = c.fetchall(); conn.close()
-    if not rows:
-        await u.message.reply_text("💳 *Qarzlar*\n\nQarz yo'q ✅", parse_mode='Markdown')
+    c.execute("SELECT date, person, amount, type FROM debts WHERE paid=0 ORDER BY id DESC")
+    rows = c.fetchall()
+    c.execute("SELECT supplier, SUM(remaining) FROM transit WHERE remaining>0 GROUP BY supplier ORDER BY SUM(remaining) DESC")
+    zavod = c.fetchall(); conn.close()
+    # Avval: r[3] (summa) ism o'rnida, fmt(r[2]) (ism) summa o'rnida → qarz bo'lsa buyruq xato berardi
+    deb = [r for r in rows if debt_turi(r[3]) == DEBITOR]
+    kre = [r for r in rows if debt_turi(r[3]) == KREDITOR]
+    nomalum = [r for r in rows if debt_turi(r[3]) is None]
+    if not (deb or kre or zavod or nomalum):
+        await u.message.reply_text("💳 Qarzlar\n\nQarz yo'q ✅")
         return
-    text = "💳 *QARZLAR*\n\n"
-    olindi = [r for r in rows if r[4]=='olindi']
-    berildi = [r for r in rows if r[4]=='berildi']
-    if olindi:
-        text += "*💸 Biz berganimiz (bizda qarz):*\n"
-        for r in olindi:
-            text += f"• {r[3]}: *{fmt(r[2])}* — {r[1]}\n"
-        text += f"Jami: *{fmt(sum(r[2] for r in olindi))}*\n\n"
-    if berildi:
-        text += "*💰 Bizdan olganlar:*\n"
-        for r in berildi:
-            text += f"• {r[3]}: *{fmt(r[2])}* — {r[1]}\n"
-        text += f"Jami: *{fmt(sum(r[2] for r in berildi))}*\n"
-    await u.message.reply_text(text, parse_mode='Markdown')
+    j_deb = sum(r[2] or 0 for r in deb)
+    j_kre = sum(r[2] or 0 for r in kre) + sum(z[1] or 0 for z in zavod)
+    text = "💳 QARZLAR\n\n"
+    text += "📥 DEBITORLIK — mijozlar bizga qarz:\n"
+    text += "".join(f"• {r[1]}: {fmt(r[2] or 0)} — {r[0]}\n" for r in deb) or "• yo'q\n"
+    text += f"Jami debitorlik: {fmt(j_deb)}\n\n"
+    text += "📤 KREDITORLIK — biz zavodga qarzmiz:\n"
+    text += "".join(f"🏭 {z[0]}: {fmt(z[1] or 0)}\n" for z in zavod)
+    text += "".join(f"• {r[1]}: {fmt(r[2] or 0)} — {r[0]}\n" for r in kre)
+    if not (zavod or kre): text += "• yo'q\n"
+    text += f"Jami kreditorlik: {fmt(j_kre)}\n"
+    if nomalum:
+        text += "\n❓ Turi noma'lum yozuvlar (hisobga qo'shilmadi):\n"
+        text += "".join(f"• {r[1]}: {fmt(r[2] or 0)} — {r[0]} ({r[3]})\n" for r in nomalum)
+    text += f"\n⚖️ Sof (debitorlik − kreditorlik): {fmt(j_deb - j_kre)}"
+    text += "\n\nTo'lov: /qarz_tolov <mijoz> <summa> [usul] · /zavod_tolov <zavod> <summa> [usul]"
+    await u.message.reply_text(text)
+
+def _tolov_args(args):
+    """'<ism...> <summa> [usul]' → (ism, summa, usul) | None. '1,200' = 1200, '12,5' = 12.5"""
+    a = [s for s in (args or []) if s.strip()]
+    usul = 'naqd'
+    if a and tolov_usuli(a[-1]): usul = tolov_usuli(a.pop())
+    if len(a) < 2: return None
+    s = a[-1].replace('$', '').strip()
+    s = s.replace(',', '') if re.fullmatch(r'\d{1,3}(,\d{3})+(\.\d+)?', s) else s.replace(',', '.')
+    try: summa = float(s)
+    except ValueError: return None
+    return ' '.join(a[:-1]).strip(), summa, usul
+
+def _tolov_javob(r, uzs_izoh=''):
+    if not r.get('ok'):
+        t = "❌ " + r.get('error', "To'lov yozilmadi")
+        if r.get('variantlar'): t += "\n\nVariantlar:\n" + "\n".join(f"• {v}" for v in r['variantlar'])
+        return t
+    deb = r['kind'] == DEBITOR
+    t = ("✅ To'lov yozildi — Debitorlik (mijoz bizga to'ladi)\n" if deb
+         else "✅ To'lov yozildi — Kreditorlik (biz to'ladik)\n")
+    t += f"{'👤' if deb else '🏭'} {r['person']}: {_usd2(r['paid'])} ({r['method']}){uzs_izoh}\n"
+    t += f"📄 Yopildi: {r['yopildi']} ta" + (f" · qisman: {r['qisman']} ta" if r['qisman'] else "") + "\n"
+    if r['qoldiq'] > 0:
+        t += (f"📥 Qolgan qarzi: {_usd2(r['qoldiq'])}\n" if deb else f"📤 Qolgan qarzimiz: {_usd2(r['qoldiq'])}\n")
+    else:
+        t += "✅ Qarz to'liq yopildi\n"
+    t += f"💰 Kassa qoldig'i: {_usd2(r['kassa'])}\n↩️ Bekor qilish: /undo (#{r['op_id']})"
+    return t
+
+async def _tolov_buyruq(u, ctx, turi, cmd, misol):
+    if not is_owner(u): return
+    p = _tolov_args(ctx.args)
+    if not p:
+        ochiq = ochiq_qarzlar(turi)
+        t = (f"Foydalanish: /{cmd} <ism> <summa> [usul]\nMasalan: /{cmd} {misol}\n"
+             f"Usullar: {', '.join(TOLOV_USULLARI)} (aytilmasa naqd). 5000 dan katta summa so'm deb olinadi.\n\n")
+        t += ("📥 Ochiq debitorlik (mijozlar bizga qarz):\n" if turi == DEBITOR else "📤 Ochiq kreditorlik (biz qarzmiz):\n")
+        t += "\n".join(f"• {k}: {_usd2(v)}" for k, v in sorted(ochiq.items(), key=lambda x: -x[1])) or "• yo'q"
+        await u.message.reply_text(t); return
+    ism, summa, usul = p
+    uzs = ''
+    if summa >= 5000:                          # bot qoidasi: 5000 dan katta "dollar" — so'm
+        rate = get_exchange_rate(); usd = round(summa / rate, 2)
+        uzs = f"\n💱 {summa:,.0f} so'm → {_usd2(usd)} (kurs {rate:,.0f})"; summa = usd
+    r = await asyncio.to_thread(pay_debt, turi, ism, summa, usul)
+    await u.message.reply_text(_tolov_javob(r, uzs))
+
+async def cmd_qarz_tolov(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/qarz_tolov <mijoz> <summa> [usul] — mijoz bizga qarzini to'ladi (debitorlik kamayadi, kassaga kirim)"""
+    await _tolov_buyruq(u, ctx, DEBITOR, 'qarz_tolov', 'Alibek 150 karta')
+
+async def cmd_zavod_tolov(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/zavod_tolov <zavod> <summa> [usul] — biz zavodga/yetkazuvchiga to'ladik (kreditorlik kamayadi, kassadan chiqim)"""
+    await _tolov_buyruq(u, ctx, KREDITOR, 'zavod_tolov', 'Two Trees 300 otkazma')
 
 async def cmd_xarajatlar(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u): return
@@ -4569,9 +4883,10 @@ async def cmd_cashflow(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cf = cash_flow_forecast()
     text = "💵 *CASH FLOW PROGNOZ (30 kun)*\n\n"
     text += f"📈 Kutilayotgan tushum: *{fmt(cf['expected_30day'])}*\n"
-    text += f"💳 Yo'ldagi tovar to'lovi: −{fmt(cf['transit_to_pay'])}\n"
-    text += f"💰 Qarz qaytishi: +{fmt(cf['debts_to_receive'])}\n"
-    text += f"💸 Qarz to'lash: −{fmt(cf['debts_to_pay'])}\n"
+    text += f"🏭 Kreditorlik — biz zavodga qarzmiz: −{fmt(cf['transit_to_pay'])}\n"
+    text += f"📥 Debitorlik (mijozlar bizga qarz): +{fmt(cf['debts_to_receive'])}\n"
+    if cf['debts_to_pay']:
+        text += f"📤 Kreditorlik — boshqa (biz qarzmiz): −{fmt(cf['debts_to_pay'])}\n"
     text += "──────────────────────\n"
     net = cf['net_forecast']
     emoji = "✅" if net > 0 else "❌"
@@ -4718,6 +5033,7 @@ async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if op[3] == 'sale': label += f"{data.get('product','')} {fmt(data.get('price',0)*data.get('qty',1))}"
         elif op[3] == 'expense': label += f"{data.get('note','')} {fmt(data.get('amount',0))}"
         elif op[3] == 'transit': label += f"{data.get('product','')} {fmt(data.get('total',0))}"
+        elif op[3] == 'debt_payment': label += f"{data.get('kind','')} {data.get('person','')} {fmt(data.get('amount',0))}"
         else: label += str(data)[:30]
         text += f"{label}\n"
         kb.append([InlineKeyboardButton(f"↩️ #{op[0]} qayt", callback_data=f"undo_{op[0]}")])
@@ -4761,6 +5077,7 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/astatka /narxlar /bugun /oy /yil\n"
         "/yolda /zavod_qarz /analiz /xarajatlar\n"
         "/mijozlar /qarzlar /kafolat /cashflow\n"
+        "/qarz\\_tolov /zavod\\_tolov /qarz\\_yosh\n"
         "/trend /rate /maqsad /olx /undo\n"
         "/katalog [nom] /yangi_tovar\n\n"
         "*Erkin yozish:*\n\n"
@@ -4774,7 +5091,10 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💸 *Xarajat:*\n`Bank to'lovi 45 dollar`\n"
         "`Abusaxiy dostavka 110 dollar`\n`OLX reklama 33 dollar`\n\n"
         "👥 *Mijoz:*\n`Jahongir B2B mijoz qo'sh 998901234567`\n\n"
-        "💳 *Qarz:*\n`Alibek 200 dollar qarz oldi`\n\n"
+        "💳 *Qarz:*\n`Alibek 200 dollar qarz oldi`\n"
+        "`/qarz_tolov Alibek 150 karta` — mijoz qarzini to'ladi\n"
+        "`/zavod_tolov Two Trees 300` — zavodga to'ladik\n"
+        "`Alibek qarzidan 100 dollar qaytardi`\n\n"
         "🎯 *Maqsad:*\n`Bu oy 3000 dollar maqsad 800 foyda`\n\n"
         "📊 *Tahlil:*\n`ABC XYZ tahlil` | `Trend` | `Cash flow`\n"
         "`TTS 20 Pro katalog` | `apexmach TTS 20 490 raqobatchi`\n"
@@ -4956,7 +5276,7 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif why.startswith('Topilmadi'):
             await msg.reply_text("❌ Topilmadi yoki allaqachon qaytarilgan")
         else:
-            await msg.reply_text("❌ Qaytarib bo'lmadi!")
+            await msg.reply_text("❌ Qaytarib bo'lmadi!" + ("" if why == "qaytarib bo'lmadi" else f"\n{why}"))
     elif data.startswith('add_photo_'):
         pid = int(data.split('_')[2])
         ctx.user_data['photo_product_id'] = pid
@@ -4974,6 +5294,8 @@ async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❌ Topilmadi yoki allaqachon kelgan!")
     elif data.startswith('xlimp_'):
         await xl_callback(u, ctx, data)
+    elif data.startswith('delcust_'):
+        await _mijoz_ochirish_callback(q, data)
     elif data.startswith('cat_') or data.startswith('sup_') or data.startswith('photos_'):
         pass  # ConversationHandler handles these
 
@@ -5174,15 +5496,23 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == 'debt':
         person = parsed.get('person', '')
         amount = float(parsed.get('amount', 0))
-        dtype = parsed.get('type', 'olindi')
+        # noma'lum bo'lsa — debitorlik (avvalgi standart ham "biz berdik" edi)
+        dtype = debt_turi(parsed.get('type')) or DEBITOR
         note = parsed.get('note', '')
         if person and amount > 0:
             add_debt(person, amount, dtype, note)
-            emoji = "💸" if dtype=='olindi' else "💰"
-            txt = "oldi (biz berdik)" if dtype=='olindi' else "berdi (bizda bor)"
+            emoji = "📥" if dtype == DEBITOR else "📤"
+            txt = "— Debitorlik (bizga qarz)" if dtype == DEBITOR else "— Kreditorlik (biz qarzmiz)"
             await u.message.reply_text(
                 f"{emoji} *Qarz qayd!*\n👤 {person}: {fmt(amount)} {txt}",
                 parse_mode='Markdown')
+
+    elif action == 'debt_pay':
+        try: summa = _to_usd(parsed.get('amount', 0))
+        except Exception: summa = 0
+        turi = debt_turi(parsed.get('kind')) or DEBITOR
+        r = await asyncio.to_thread(pay_debt, turi, parsed.get('person', ''), summa, parsed.get('method') or 'naqd')
+        await u.message.reply_text(_tolov_javob(r))
 
     elif action == 'set_target':
         revenue = float(parsed.get('revenue', 0))
@@ -7043,6 +7373,8 @@ def main():
     app.add_handler(CommandHandler('analiz', cmd_analiz))
     app.add_handler(CommandHandler('mijozlar', cmd_mijozlar_yangi))
     app.add_handler(CommandHandler('qarzlar', cmd_qarzlar))
+    app.add_handler(CommandHandler('qarz_tolov', cmd_qarz_tolov))
+    app.add_handler(CommandHandler('zavod_tolov', cmd_zavod_tolov))
     app.add_handler(CommandHandler('xarajatlar', cmd_xarajatlar))
     app.add_handler(CommandHandler('kafolat', cmd_kafolat))
     app.add_handler(CommandHandler('cashflow', cmd_cashflow))
@@ -7076,7 +7408,6 @@ def main():
     app.add_handler(CommandHandler('rasxodnik', cmd_rasxodnik))
     app.add_handler(CommandHandler('dalolatnoma', cmd_dalolatnoma))
     app.add_handler(CommandHandler('ulash', cmd_ulash))
-    app.add_handler(CommandHandler('sync_sentyabr', cmd_sync_sentyabr))
     app.add_handler(CommandHandler('backup', cmd_backup))
     app.add_handler(CommandHandler('restore', cmd_restore))
     app.add_handler(CommandHandler('stock_reset', cmd_stock_reset))
