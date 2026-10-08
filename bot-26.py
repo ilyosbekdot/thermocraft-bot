@@ -414,6 +414,7 @@ def init_db():
     init_stock_tables()          # ombor jurnali + boshlang'ich qoldiq (idempotent)
     init_po_tables()             # zavod buyurtmalari (8-bosqich, idempotent)
     init_marketing_tables()      # marketing: postlar, so'rovlar, sozlamalar, sayt keshi (9-bosqich, idempotent)
+    init_b10_tables()            # zaxira, qaytarish, smena, serial/kafolat, shtrix-kod (10-bosqich, idempotent)
     log.info("DB tayyor!")
 
 
@@ -557,7 +558,7 @@ def add_photo(product_id, file_id):
     conn.commit(); conn.close()
 
 def _sotuv_tx(c, now, pid, pname, qty, price, cost, discount=0, customer='', ctype='B2C',
-              cash=True, method='naqd', seller_id=0, seller_name=''):
+              cash=True, method='naqd', seller_id=0, seller_name='', serials=None):
     """Bitta sotuv qatori — CHAQIRUVCHINING tranzaksiyasi ichida (commit/rollback chaqiruvchida).
     Astatka yetmasa None qaytaradi (hech narsa yozilmaydi). Aks holda (sale_id, revenue, profit)."""
     revenue = round(price * qty, 2)              # pul — sentgacha (313.3333*3 = 939.9999 bo'lib qolmasin)
@@ -573,8 +574,16 @@ def _sotuv_tx(c, now, pid, pname, qty, price, cost, discount=0, customer='', cty
     # Kafolat
     c.execute('SELECT COALESCE(warranty_days,0) FROM products WHERE id=?', (pid,))
     w = c.fetchone(); wdays = (w[0] or 0) if w else 0
-    if wdays > 0:
-        end = (now + timedelta(days=wdays)).strftime('%Y-%m-%d')
+    end = (now + timedelta(days=wdays)).strftime('%Y-%m-%d') if wdays > 0 else ''
+    if serials:                                  # 10-bosqich: har serialga alohida kafolat; band serial → _SerialXato
+        c.execute("SELECT id, serial FROM serials WHERE id IN (%s)" % ",".join("?" * len(serials)), [int(x) for x in serials])
+        _snom = dict(c.fetchall())
+        _sotuv_seriallar(c, sale_id, pid, serials, d, customer, end, (seller_id, seller_name))
+        if wdays > 0:
+            for _sr in serials:
+                c.execute('INSERT INTO warranties (sale_id,product,customer,start_date,end_date,serial) VALUES (?,?,?,?,?,?)',
+                          (sale_id, pname, customer, d, end, _snom.get(int(_sr), '')))
+    elif wdays > 0:
         c.execute('INSERT INTO warranties (sale_id,product,customer,start_date,end_date) VALUES (?,?,?,?,?)',
                   (sale_id, pname, customer, d, end))
     # Kassa — shu tranzaksiya ichida (sotuv bor-u kassa yo'q holati bo'lmasin)
@@ -649,11 +658,12 @@ def pos_saqlash(qatorlar, mijoz='', cid=0, method='naqd', seller_id=0, seller_na
             if not row: raise _AstatkaYetmadi(q.get('name') or str(q['pid']))
             r = _sotuv_tx(c, now, q['pid'], row[0], qty, float(q['unit']), row[1] or 0, round(float(q.get('disc') or 0), 1),
                           mijoz, ctype, cash=not nasiya, method=(method if not nasiya else 'naqd'),
-                          seller_id=seller_id, seller_name=seller_name)
+                          seller_id=seller_id, seller_name=seller_name, serials=(q.get('serials') or None))
             if r is None: raise _AstatkaYetmadi(row[0])
             sid, rev, prof = r
             if cid:
                 c.execute('UPDATE sales SET customer_id=? WHERE id=?', (cid, sid))
+                if q.get('serials'): c.execute('UPDATE serials SET customer_id=? WHERE sale_id=?', (cid, sid))
             # Bekor qilish (undo) ro'yxati uchun — o'sha tranzaksiyada
             c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)',
                       (d, t, 'sale', json.dumps({'sale_id': sid, 'product': row[0], 'qty': qty,
@@ -674,6 +684,9 @@ def pos_saqlash(qatorlar, mijoz='', cid=0, method='naqd', seller_id=0, seller_na
     except _AstatkaYetmadi as e:
         conn.rollback(); conn.close()
         return {'ok': False, 'error': f"Astatka yetmadi: {e}. Savat saqlanmadi — hech narsa yozilmadi."}
+    except _SerialXato as e:
+        conn.rollback(); conn.close()
+        return {'ok': False, 'error': f"Serial {e} band yoki topilmadi. Savat saqlanmadi — serialni qayta tanlang."}
     except Exception:
         conn.rollback(); conn.close()
         raise
@@ -697,6 +710,12 @@ def reverse_sale(sale_id):
         c.execute('SELECT * FROM sales WHERE id=? AND reversed=0', (sale_id,))
         row = c.fetchone()
         if not row: conn.close(); return False
+        try:                                     # 10-bosqich: qisman qaytarilgan sotuv yoki qaytarish qatori → 📥 Qaytarish / undo
+            c.execute("SELECT COALESCE(return_of,0) FROM sales WHERE id=?", (sale_id,)); _ro = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM sales WHERE return_of=? AND reversed=0", (sale_id,)); _rn = c.fetchone()[0]
+        except sqlite3.OperationalError:
+            _ro = _rn = 0
+        if _ro or _rn: conn.close(); return False
         product, qty, revenue = row[3], row[4], row[6]
         c.execute('UPDATE sales SET reversed=1 WHERE id=? AND reversed=0', (sale_id,))
         if c.rowcount == 0:
@@ -708,6 +727,11 @@ def reverse_sale(sale_id):
         if pr:
             stock_move(c, pr[0], qty, 'qaytish', reason='sotuv bekor', ref=f's{sale_id}', unit_cost=row[5], allow_negative=True)
         c.execute("UPDATE warranties SET status='cancelled' WHERE sale_id=?", (sale_id,))
+        try:
+            c.execute("UPDATE serials SET status='omborda', sale_id=0, sold_date='', customer='', customer_id=0, warranty_end='' "
+                      "WHERE sale_id=? AND status='sotilgan'", (sale_id,))
+        except sqlite3.OperationalError:
+            pass
         c.execute("SELECT COUNT(*) FROM cash_box WHERE type='kirim' AND note LIKE ?", (f'%(#{sale_id})',))
         if c.fetchone()[0] > 0:
             now = datetime.now()
@@ -1676,9 +1700,10 @@ def now_t(): return datetime.now().strftime('%d.%m.%Y %H:%M')
 ROLLAR = ('admin', 'sotuvchi')
 ROL_NOMI = {'owner': 'egasi', 'admin': 'admin', 'sotuvchi': 'sotuvchi'}
 # Sotuvchi faqat shularni qila oladi (tannarx/foyda, hisobot, o'chirish, kassa, sozlama — yo'q)
-_SOTUVCHI_RUXSAT = frozenset({'pos', 'stock_view', 'customer_add', 'own_sales'})
+_SOTUVCHI_RUXSAT = frozenset({'pos', 'stock_view', 'customer_add', 'own_sales',
+                              'qaytarish_sorov', 'smena'})       # 10-bosqich: qaytarish so'rovi, smena ochish/yopish
 # Faqat egasi: xodimlarni boshqarish va tizim (kod yangilash, bazani tiklash, astatkani nollash)
-_FAQAT_EGA = frozenset({'roles', 'system'})
+_FAQAT_EGA = frozenset({'roles', 'system', 'zaxira'})         # 'zaxira' — 💾 Zaxira bo'limi (10-bosqich)
 try:
     SOTUVCHI_MAX_CHEGIRMA = max(0.0, float(os.getenv('SELLER_MAX_DISCOUNT', '5') or 5))  # ixtiyoriy, majburiy emas
 except ValueError:
@@ -1920,7 +1945,9 @@ def _undo_op(op_id: int):
     if op[3] == 'debt_payment':
         return reverse_debt_payment(op_id)
     if op[3] == 'stock':
-        return ombor_undo(op_id)                 # kirim / chiqim / inventarizatsiya — atomik       # o'zi atomik: qarz + kassa + op_log bitta tranzaksiyada
+        return ombor_undo(op_id)
+    if op[3] == 'return':
+        return reverse_return(op_id)             # 📥 qaytarish — atomik                 # kirim / chiqim / inventarizatsiya — atomik       # o'zi atomik: qarz + kassa + op_log bitta tranzaksiyada
     d = json.loads(op[4]); ok = False
     if op[3] == 'sale':
         ok = reverse_sale(d.get('sale_id', 0))
@@ -2962,6 +2989,7 @@ async def cmd_xotira(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Rasm → AI (vision) ───────────────────────────────────────────
 async def handle_photo_ai(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Rasm: caption'da 'kanal'/'post' bo'lsa — kanalga; aks holda AI tahlil qiladi"""
+    if await skan_rasm(u, ctx): return                     # 10-bosqich: POS/Ombor/Serial skaner rejimi
     if not can(u, 'boshqaruv'): return
     cap = (u.message.caption or "").strip()
     if any(w in cap.lower() for w in ("kanal", "post", "e'lon", "elon")):
@@ -3062,6 +3090,13 @@ async def _scheduler(app):
                 _t = asyncio.create_task(kontent_kunlik(app.bot)); _FON.add(_t); _t.add_done_callback(_FON.discard)
         except Exception:
             log.exception("kunlik kontent")
+        # Kunlik zaxira (10-bosqich): belgilangan vaqtdan keyin, kuniga bir marta (restart bo'lsa ham shu kuni qiladi)
+        try:
+            if app is not None and ('z' + key[:10]) not in sent and zaxira_vaqti_keldimi():
+                sent.add('z' + key[:10]); soz_yoz('zaxira_ishladi', key[:10])
+                _t = asyncio.create_task(zaxira_kunlik(app.bot)); _FON.add(_t); _t.add_done_callback(_FON.discard)
+        except Exception:
+            log.exception("kunlik zaxira")
         # Eski kunlarni tozalash (avval sent.clear() — xuddi shu daqiqada xulosa ikkinchi marta ketishi mumkin edi)
         if len(sent) > 50: sent = {k for k in sent if k[1:] == key[:10]}
         # Kunlik kursni oldindan (alohida oqimda) olib qo'yamiz — handlerlar keshdan oladi, tarmoqni kutmaydi
@@ -3332,9 +3367,10 @@ def pl_hisobot(davr):
     """davr: 'YYYY-MM' yoki 'YYYY'"""
     conn = db(); c = conn.cursor()
     f = davr + '%'
-    c.execute("SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(unit_cost*qty),0), COUNT(*), COALESCE(SUM(qty),0) "
+    c.execute("SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(unit_cost*qty),0), COALESCE(SUM(CASE WHEN qty>0 THEN 1 ELSE 0 END),0), "
+              "COALESCE(SUM(qty),0), COALESCE(SUM(CASE WHEN qty<0 THEN -revenue ELSE 0 END),0) "
               "FROM sales WHERE date LIKE ? AND reversed=0", (f,))
-    tushum, cogs, adet, dona = c.fetchone()
+    tushum, cogs, adet, dona, qaytgan = c.fetchone()
     c.execute("SELECT expense_type, category, COALESCE(SUM(amount),0) FROM expenses "
               "WHERE date LIKE ? AND reversed=0 GROUP BY expense_type, category", (f,))
     rows = c.fetchall(); conn.close()
@@ -3349,7 +3385,7 @@ def pl_hisobot(davr):
     sof = yalpi - t_davr
     return {'davr': davr, 'tushum': tushum, 'cogs': cogs, 'togri_xarajat': t_togri,
             'togri_tafsil': togri, 'yalpi_foyda': yalpi, 'davr_xarajat': t_davr,
-            'davr_tafsil': davr_x, 'sof_foyda': sof, 'sotuv_soni': adet, 'dona': dona,
+            'davr_tafsil': davr_x, 'sof_foyda': sof, 'sotuv_soni': adet, 'dona': dona, 'qaytarish': round(qaytgan or 0, 2),
             'marja_pct': round(yalpi / tushum * 100, 1) if tushum else 0,
             'sof_pct': round(sof / tushum * 100, 1) if tushum else 0}
 
@@ -4250,7 +4286,7 @@ async def cmd_moliya(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             t += f"  {k:<16} -{fmt(v)}\n"
         t += f"  {'jami':<16} -{fmt(pl['davr_xarajat'])}\n\n"
     t += f"✅ SOF FOYDA          {fmt(pl['sof_foyda'])}  ({pl['sof_pct']}%)\n"
-    t += f"   {pl['sotuv_soni']} ta sotuv · {pl['dona']} dona\n\n"
+    t += f"   {pl['sotuv_soni']} ta sotuv · {pl['dona']} dona\n" + (f"   ↩️ qaytarish: −{fmt(pl['qaytarish'])}\n" if pl.get('qaytarish') else "") + "\n"
 
     t += "── BALANS ──\n"
     t += "AKTIV\n"
@@ -4865,10 +4901,16 @@ MENU_MAP = {
     "⚙️ Boshqa": "boshqa",
     "📢 Marketing": "marketing",
     "⬅️ Asosiy menyu": "asosiy",
+    # 10-bosqich
+    "📥 Qaytarish": "qaytarish",
+    "🧾 Smena": "smena",
+    "💾 Zaxira": "zaxira",
+    "🔢 Serial": "serial",
 }
 
 # Egasi/admin asosiy menyusi (5–8-bosqich). Eski to'liq menyu — "⚙️ Boshqa" ichida, barcha eski tugmalar ishlaydi.
-ASOSIY_KB = [["🛒 Sotuv", "📦 Ombor"], ["👥 Mijozlar", "📊 Hisobotlar"], ["🏭 Zavod", "👷 Sotuvchilar"], ["📢 Marketing", "⚙️ Boshqa"]]
+ASOSIY_KB = [["🛒 Sotuv", "📦 Ombor"], ["👥 Mijozlar", "📊 Hisobotlar"], ["🏭 Zavod", "👷 Sotuvchilar"],
+             ["📥 Qaytarish", "🧾 Smena"], ["📢 Marketing", "⚙️ Boshqa"]]
 # Olib tashlangan (yangi ekran to'liq qoplaydi): 📦 Astatka → 📦 Ombor; 💰 Bugun / 📈 Oylik / 📅 Yillik → 📊 Hisobotlar;
 # 💳 Zavod qarzi → 🏭 Zavod → Zavodlar balansi; 💳 Qarzlar → 👥 Mijozlar → Qarzdorlar/Kreditorlar;
 # 💵 Cash Flow → 📊 Hisobotlar → 💰 Kassa; 👥 Mijozlar (takror). Buyruqlari (/astatka, /bugun, /oy ...) qoladi.
@@ -4884,6 +4926,7 @@ ESKI_KB = [
     ["📡 Kanallar",   "📣 Reklama"],
     ["🔍 Raqobat",    "📢 OLX"],
     ["➕ Yangi tovar", "↩️ Qayt etish"],
+    ["💾 Zaxira",     "🔢 Serial"],
     ["⬅️ Asosiy menyu"],
 ]
 
@@ -4932,6 +4975,10 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'hisobotlar':    await cmd_hisobotlar(u, ctx)
     elif action == 'zavod_ui':      await cmd_zavod_ui(u, ctx)
     elif action == 'marketing':     await cmd_marketing(u, ctx)
+    elif action == 'qaytarish':     await cmd_qaytarish(u, ctx)
+    elif action == 'smena':         await cmd_smena(u, ctx)
+    elif action == 'zaxira':        await cmd_zaxira(u, ctx)
+    elif action == 'serial':        await cmd_serial(u, ctx)
     elif action == 'boshqa':
         if can(u, 'boshqaruv'):
             await u.message.reply_text("⚙️ Boshqa bo'limlar. Qaytish: ⬅️ Asosiy menyu",
@@ -5621,6 +5668,7 @@ async def cmd_undo_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif op[3] == 'expense': label += f"{data.get('note','')} {fmt(data.get('amount',0))}"
         elif op[3] == 'transit': label += f"{data.get('product','')} {fmt(data.get('total',0))}"
         elif op[3] == 'debt_payment': label += f"{data.get('kind','')} {data.get('person','')} {fmt(data.get('amount',0))}"
+        elif op[3] == 'return': label += f"qaytarish R-{data.get('rid','')} {data.get('product','')[:40]} {fmt(data.get('jami',0))}"
         elif op[3] == 'stock': label += (f"ombor {data.get('kind','')} {data.get('product','')} {data.get('qty','')}"
                                          if data.get('kind') != 'inventar' else f"inventarizatsiya {len(data.get('qatorlar', []))} ta")
         else: label += str(data)[:30]
@@ -5676,6 +5724,8 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👥 *Mijozlar:* 👥 Mijozlar tugmasi · qarzdorlar: /qarzdorlar\n"
         "📊 *Hisobotlar:* /hisobotlar · 🏭 *Zavod buyurtmalari:* /zavod\n"
         "📢 *Marketing:* /marketing — video/rasm yuboring → tovar → ko'rinish → kanal/Instagram\n"
+        "📥 *Qaytarish:* /qaytarish · 🧾 *Smena (kassa yopish):* /smena\n"
+        "🔢 *Serial/kafolat:* /serial · 🏷 *Yorliqlar (shtrix-kod/QR):* /yorliq · 💾 *Zaxira:* /zaxira\n"
         "⚙️ Boshqa — eski to'liq menyu\n"
         "👷 *Xodimlar:* /xodim\\_qosh /xodimlar /xodim\\_ochir\n"
         "📊 Sotuvchilar hisoboti: /sotuvchilar · ID bilish: /id\n\n"
@@ -5843,7 +5893,8 @@ POS_CHEGIRMALAR = (3, 5, 10, 15, 20)
 POS_USULLAR = (('naqd', '💵 Naqd'), ('karta', '💳 Karta'), ('payme', '📱 Payme'),
                ('click', '📱 Click'), ('otkazma', "🏦 O'tkazma"), ('nasiya', '📝 Nasiya'))
 POS_USUL_NOMI = dict(POS_USULLAR)
-SOTUVCHI_KB = [["🛒 Sotuv", "📦 Qoldiq"], ["📦 Ombor", "👥 Mijozlar"], ["📋 Bugungi sotuvlarim", "❓ Yordam"]]
+SOTUVCHI_KB = [["🛒 Sotuv", "📦 Qoldiq"], ["📦 Ombor", "👥 Mijozlar"], ["📥 Qaytarish", "🧾 Smena"],
+               ["📋 Bugungi sotuvlarim", "❓ Yordam"]]
 
 def _btn(t, d): return InlineKeyboardButton(t, callback_data=d)
 def _pos_bekor(): return [_btn("❌ Bekor qilish", "pos:x")]
@@ -5923,6 +5974,7 @@ def pos_savat_matn(pos, rate):
     if not h['lines']: out.append("(bo'sh)")
     for n, ln in enumerate(h['lines'], 1):
         out.append(f"{n}. {ln['name']} × {ln['qty']} = {_usd2(ln['base'])}")
+        if ln.get('sn'): out.append("   SN: " + ", ".join(ln['sn']))
         if abs(ln['price'] - ln['list']) > 0.004:
             out.append(f"   narx {_usd2(ln['price'])}/dona (ro'yxatda {_usd2(ln['list'])})")
     out.append("──────────────")
@@ -6105,6 +6157,7 @@ def pos_chek_matn(res, h, pos, x, rate):
     for n, (ln, sv) in enumerate(zip(h['lines'], res['sales'], strict=True), 1):
         out.append(f"{n}. {ln['name']} × {ln['qty']} = {_usd2(sv['summa'])}")
         out.append(f"   {_usd2(ln['unit'])}/dona" + (f", −{ln['disc']:g}%" if ln['disc'] >= 0.1 else ""))
+        if ln.get('sn'): out.append("   SN: " + ", ".join(ln['sn']))
     out.append("──────────────")
     if h['D'] > 0:
         out.append(f"Oraliq: {_usd2(h['sub'])}")
@@ -6159,12 +6212,12 @@ async def _pos_tasdiq(u, ctx, cart_id):
     elif not pos.get('method'): xato = "Avval to'lov usulini tanlang"
     elif pos['method'] == 'nasiya' and not pos.get('cust'): xato = "Nasiya uchun mijoz tanlang"
     elif any(i['price'] <= 0 for i in pos['items']): xato = "Narxi 0 bo'lgan qator bor — ✏️ Tahrirlash orqali narx kiriting"
-    else: xato = pos_limit_xato(pos, x)
+    else: xato = _pos_sn_xato(pos) or pos_limit_xato(pos, x)
     if xato:
         await q.answer(xato[:190], show_alert=True); return
     h = pos_hisob(pos)
-    qatorlar = [{'pid': ln['pid'], 'name': ln['name'], 'qty': ln['qty'], 'unit': ln['unit'], 'disc': ln['disc']}
-                for ln in h['lines']]
+    qatorlar = [{'pid': ln['pid'], 'name': ln['name'], 'qty': ln['qty'], 'unit': ln['unit'], 'disc': ln['disc'],
+                 'serials': list(ln.get('serials') or [])} for ln in h['lines']]
     cust = pos.get('cust') or {}
     pos['saving'] = True                         # await'dan OLDIN — ikkinchi bosish kutib turmaydi
     await q.answer("⏳ Saqlanmoqda...")
@@ -6243,6 +6296,8 @@ async def pos_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     m = r = None
     alert = None
+    if act in ('sn', 'snw') or (act in ('q', 'qc', 'eq', 'ei') and _pos_sn_hook(pos, act, arg)):
+        return await pos_sn_callback(u, ctx, pos, act, arg)      # 10-bosqich: serialli tovar
     if act == 'x':
         ctx.user_data.pop('pos', None)
         await q.answer("Bekor qilindi")
@@ -6255,12 +6310,14 @@ async def pos_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         m, r = pos_ekran_qidiruv(pos, _int(0))
     elif act == 's':
         pos['wait'] = 'search'
-        m, r = "🔍 Mahsulot nomini yozing (masalan: tts 20):", [[_btn("⬅️ Kategoriyalar", "pos:cats")], _pos_bekor()]
+        m, r = ("🔍 Mahsulot nomini yozing (masalan: tts 20).\nShtrix-kod yoki serial ham bo'ladi — yozing yoki 📷 rasmini yuboring.",
+                [[_btn("⬅️ Kategoriyalar", "pos:cats")], _pos_bekor()])
     elif act == 'p':
         p = _pos_mahsulot(_int(0))
         if not p: alert = "Mahsulot topilmadi"
         elif _pos_mavjud(pos, p['id'], p['qty']) <= 0: alert = f"❌ {p['name']} — astatkada yo'q (savatdagisi hisobga olindi)"
         elif (p['price'] or 0) <= 0 and x['role'] == 'sotuvchi': alert = "Bu mahsulotga narx qo'yilmagan — egasiga ayting"
+        elif _serialli(p['id']): m, r = pos_ekran_serial(pos, p)
         else: m, r = pos_ekran_son(pos, p, rate)
     elif act == 'q':
         p = _pos_mahsulot(_int(0)); n = _int(1)
@@ -6377,6 +6434,8 @@ async def pos_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pos['wait'] = w                          # kutish davom etadi
         return f"⚠️ {xato}\nQaytadan yozing yoki tugmani bosing.", [_pos_bekor()]
 
+    if w.startswith('sn:') or (w == 'search' and kod_top(msg)):
+        return await pos_kod_matn(u, ctx, pos, msg, w)          # 10-bosqich: serial / shtrix-kod
     if w == 'search':
         topildi = pos_qidir(msg)
         pos['found'] = [p['id'] for p in topildi]
@@ -6469,7 +6528,10 @@ async def cmd_yordam_sotuvchi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "8) ✅ Tasdiqlash — chek chiqadi\n\n"
         "Har qadamda ❌ Bekor qilish bor. 30 daqiqa tegmasangiz savat o'chadi.\n"
         "📦 Ombor — qoldiqni ko'rish · 👥 Mijozlar — yangi mijoz qo'shish\n"
-        "Buyruqlar: /sotuv /qoldiq /ombor /mening /id",
+        "📥 Qaytarish — mijoz tovar qaytarsa so'rov yuborasiz (egasi tasdiqlaydi)\n"
+        "🧾 Smena — kun boshida oching, kun oxirida kassadagi pulni sanab yoping\n"
+        "🔢 Serialli tovar — 🛒 Sotuvda serial raqamni tanlang yoki skanerlang (📷 rasm ham bo'ladi)\n"
+        "Buyruqlar: /sotuv /qoldiq /ombor /mening /id /qaytarish /smena /serial",
         reply_markup=_sotuvchi_kb() if x['role'] == 'sotuvchi' else None)
 
 async def cmd_qoldiq(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6514,7 +6576,8 @@ async def sotuvchi_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     """Sotuvchi yozgan matn: faqat o'z menyusi. AI agentga yuborilmaydi."""
     fn = {"🛒 Sotuv": pos_start, "📦 Qoldiq": cmd_qoldiq, "📦 Astatka": cmd_qoldiq,
           "📋 Bugungi sotuvlarim": cmd_mening, "❓ Yordam": cmd_yordam_sotuvchi,
-          "📦 Ombor": cmd_ombor, "👥 Mijozlar": cmd_mijozlar_ui}.get(msg)
+          "📦 Ombor": cmd_ombor, "👥 Mijozlar": cmd_mijozlar_ui,
+          "📥 Qaytarish": cmd_qaytarish, "🧾 Smena": cmd_smena, "🔢 Serial": cmd_serial}.get(msg)
     if fn:
         await fn(u, ctx); return
     await u.message.reply_text("Sotish uchun 🛒 Sotuv tugmasini bosing.\n📦 Qoldiq · 📋 Bugungi sotuvlarim · ❓ Yordam",
@@ -6689,8 +6752,9 @@ def _omb_menu(u):
         rows.append([_btn("📥 Kirim", "omb:kirim"), _btn("📤 Chiqim", "omb:chiqim")])
         rows.append([_btn("🧮 Inventarizatsiya", "omb:inv"), _btn("💰 Ombor qiymati", "omb:val")])
         rows.append([_btn("📜 Oxirgi harakatlar", "omb:log:0")])
+    rows.append([_btn("🔢 Serial / kafolat", "sn:menu")] + ([_btn("🏷 Yorliqlar", "kod:menu")] if can(u, 'ombor') else []))
     rows.append(_x_btn('omb'))
-    return "📦 Ombor — bo'limni tanlang", rows
+    return "📦 Ombor — bo'limni tanlang\n🔍 Qidirishda shtrix-kod yoki serial yozsangiz (📷 rasm ham) — to'g'ridan-to'g'ri topadi", rows
 
 _OMB_REJIM = {'card': "📦 Tovar kartasi", 'kirim': "📥 Kirim — tovarni tanlang", 'chiqim': "📤 Chiqim — tovarni tanlang",
               'zav': "🏭 Buyurtmaga tovar tanlang"}
@@ -6774,6 +6838,7 @@ def _omb_karta(u, pid, page=0):
         if page > 0: nv.append(_btn("⬅️ Yangiroq", f"omb:h:{pid}:{page - 1}"))
         if page < pages - 1: nv.append(_btn("Eskiroq ➡️", f"omb:h:{pid}:{page + 1}"))
         if nv: rows.append(nv)
+    _omb_karta_b10(u, pid, out, rows)            # 10-bosqich: serial / shtrix-kod
     rows.append([_btn("⬅️ Ro'yxat", "omb:cats")] + _x_btn('omb'))
     return "\n".join(out), rows
 
@@ -7008,7 +7073,7 @@ async def omb_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop('omb', None)
             m = (f"✅ Kirim saqlandi: {res['product']} +{st['qty']} ta → {res['balance']} ta\n"
                  f"Yangi tannarx: {_usd2(res['new_cost'])} · Summa: {_usd2(res['summa'])}\n(Bekor qilish: /undo)")
-            r = [[_btn("📦 Ombor", "omb:menu")]]
+            r = sn_kirim_btn([(st['pid'], st['qty'], res['product'])]) + [[_btn("📦 Ombor", "omb:menu")]]
         else:
             ctx.user_data['ui_done'].remove(tok); m, r = "⚠️ " + res['error'], [[_btn("⬅️ Ombor", "omb:menu")]]
     elif act == 'cq':
@@ -7099,6 +7164,8 @@ async def omb_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = r = None
     def qayta(x):
         st['wait'] = w; return f"⚠️ {x}\nQaytadan yozing.", [_x_btn('omb')]
+    if w == 'search' and kod_top(msg):          # shtrix-kod / serial → to'g'ridan-to'g'ri karta
+        return await kod_natija(u, ctx, msg, 'omb')
     if w == 'search':
         topildi = pos_qidir(msg); st['found'] = [p['id'] for p in topildi]
         m, r = _omb_qidiruv_ekran(st)
@@ -7774,10 +7841,12 @@ def _sana_parse(s):
 
 def _his_asos(c, d1, d2):
     """P&L asosi — pl_hisobot bilan bir xil qoida (oraliq uchun)."""
-    c.execute("SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(unit_cost*qty),0), COUNT(*), COALESCE(SUM(qty),0), "
-              "COALESCE(SUM(CASE WHEN discount>0 AND discount<100 THEN revenue*discount/(100-discount) ELSE 0 END),0) "
+    c.execute("SELECT COALESCE(SUM(revenue),0), COALESCE(SUM(unit_cost*qty),0), COALESCE(SUM(CASE WHEN qty>0 THEN 1 ELSE 0 END),0), "
+              "COALESCE(SUM(qty),0), "
+              "COALESCE(SUM(CASE WHEN discount>0 AND discount<100 THEN revenue*discount/(100-discount) ELSE 0 END),0), "
+              "COALESCE(SUM(CASE WHEN qty<0 THEN -revenue ELSE 0 END),0) "
               "FROM sales WHERE date BETWEEN ? AND ? AND reversed=0", (d1, d2))
-    tushum, cogs, soni, dona, cheg = c.fetchone()
+    tushum, cogs, soni, dona, cheg, qaytgan = c.fetchone()
     c.execute("SELECT expense_type, COALESCE(category,'boshqa'), COALESCE(SUM(amount),0) FROM expenses "
               "WHERE date BETWEEN ? AND ? AND reversed=0 GROUP BY expense_type, category", (d1, d2))
     togri = {}; xar = {}
@@ -7791,7 +7860,7 @@ def _his_asos(c, d1, d2):
     return {'tushum': r2(tushum), 'cogs': r2(cogs), 'togri': r2(t_togri), 'togri_tafsil': {k: r2(v) for k, v in togri.items()},
             'tannarx': r2(tannarx), 'yalpi': r2(yalpi), 'xarajat': r2(t_xar),
             'xarajat_tafsil': dict(sorted(((k, r2(v)) for k, v in xar.items()), key=lambda kv: -kv[1])),
-            'sof': r2(sof), 'soni': soni, 'dona': dona or 0, 'chegirma': r2(cheg),
+            'sof': r2(sof), 'soni': soni, 'dona': dona or 0, 'chegirma': r2(cheg), 'qaytarish': r2(qaytgan),
             'marja': round(yalpi / tushum * 100, 1) if tushum else 0.0,
             'sof_pct': round(sof / tushum * 100, 1) if tushum else 0.0}
 
@@ -7820,11 +7889,11 @@ def hisobot(d1, d2, od1=None, od2=None, nomi=''):
     h['mahsulotlar'] = mah
     h['top_tushum'] = sorted(mah, key=lambda x: -x['tushum'])[:5]
     h['top_foyda'] = sorted(mah, key=lambda x: -x['foyda'])[:5]
-    c.execute("SELECT customer, COUNT(*), ROUND(SUM(revenue),2), ROUND(SUM(revenue - unit_cost*qty),2) FROM sales "
+    c.execute("SELECT customer, SUM(CASE WHEN qty>0 THEN 1 ELSE 0 END), ROUND(SUM(revenue),2), ROUND(SUM(revenue - unit_cost*qty),2) FROM sales "
               "WHERE date BETWEEN ? AND ? AND reversed=0 AND TRIM(COALESCE(customer,''))<>'' GROUP BY customer ORDER BY 3 DESC", (d1, d2))
     h['mijozlar'] = [{'nom': r[0], 'soni': r[1], 'tushum': r[2], 'foyda': r[3]} for r in c.fetchall()]
     h['top_mijoz'] = h['mijozlar'][:5]
-    c.execute("SELECT COALESCE(NULLIF(seller_name,''),'Egasi / AI'), COUNT(*), COALESCE(SUM(qty),0), ROUND(SUM(revenue),2), "
+    c.execute("SELECT COALESCE(NULLIF(seller_name,''),'Egasi / AI'), SUM(CASE WHEN qty>0 THEN 1 ELSE 0 END), COALESCE(SUM(qty),0), ROUND(SUM(revenue),2), "
               "ROUND(SUM(revenue - unit_cost*qty),2) FROM sales WHERE date BETWEEN ? AND ? AND reversed=0 GROUP BY 1 ORDER BY 4 DESC", (d1, d2))
     h['sotuvchilar'] = [{'nom': r[0], 'soni': r[1], 'dona': r[2], 'tushum': r[3], 'foyda': r[4]} for r in c.fetchall()]
     c.execute("SELECT date, ROUND(SUM(revenue),2), ROUND(SUM(revenue - unit_cost*qty),2) FROM sales "
@@ -7859,6 +7928,7 @@ def his_matn(h):
          f"📦 Tannarx: {_usd2(h['tannarx'])}" + (f" (tovar {_usd2(h['cogs'])} + bank/yetkazish {_usd2(h['togri'])})" if h['togri'] else ""),
          f"🟢 Yalpi foyda: {_usd2(h['yalpi'])} · marja {h['marja']}%{f('yalpi')}"]
     if h['chegirma']: L.append(f"🏷 Berilgan chegirma: {_usd2(h['chegirma'])}")
+    if h.get('qaytarish'): L.append(f"↩️ Qaytarishlar: −{_usd2(h['qaytarish'])} (tushumdan ayirilgan)")
     L.append(f"💸 Xarajatlar: {_usd2(h['xarajat'])}{f('xarajat')}")
     for kat, v in list(h['xarajat_tafsil'].items())[:8]:
         L.append(f"   • {kat}: {_usd2(v)}")
@@ -8307,7 +8377,7 @@ def zavod_qabul(po_id, miqdor=None, user=None):
             c.execute("UPDATE transit SET received_qty=COALESCE(received_qty,0)+?, status=CASE WHEN ? THEN 'keldi' ELSE status END, "
                       "arrived_date=CASE WHEN ? THEN ? ELSE arrived_date END, product_id=? WHERE id=?",
                       (n, 1 if toliq else 0, 1 if toliq else 0, today(), pid, t))
-            out.append({'nom': q['nom'], 'dona': n, 'tannarx': round(q['tannarx'], 2)})
+            out.append({'nom': q['nom'], 'dona': n, 'tannarx': round(q['tannarx'], 2), 'pid': pid})
         _po_log(c, po_id, p['status'], "📦 qabul: " + ", ".join(f"{o['nom']} × {o['dona']}" for o in out), user)
         holat = _po_holat_avto(c, po_id, user)
         conn.commit()
@@ -8680,6 +8750,7 @@ async def zav_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             m, r = _zav_karta(_i(0))
             m = "✅ Omborga kirdi: " + ", ".join(f"{o['nom']} × {o['dona']} ({_usd2(o['tannarx'])})" for o in res['qabul']) + "\n\n" + m
+            r = sn_kirim_btn([(o.get('pid'), o['dona'], o['nom']) for o in res['qabul']]) + r
     elif act == 'p':
         st['pay'] = {'po': _i(0), 'sum': 0, 'm': 'naqd', 'tok': secrets.token_hex(3)}; m, r = _zav_tolov_ekran(st)
     elif act in ('pa', 'pc', 'pm', 'pok') and not st.get('pay'): alert = "Eskirgan"
@@ -8776,6 +8847,7 @@ async def zav_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 m, r = _zav_karta(int(po))
                 m = "✅ Omborga kirdi: " + ", ".join(f"{o['nom']} × {o['dona']} ({_usd2(o['tannarx'])})" for o in res['qabul']) + "\n\n" + m
+                r = sn_kirim_btn([(o.get('pid'), o['dona'], o['nom']) for o in res['qabul']]) + r
     elif w == 'pay':
         v = _son(msg); p = st.get('pay')
         if not p: m, r = "Eskirgan", [_x_btn('zav')]
@@ -10855,6 +10927,2729 @@ async def kontent_matn(u, ctx, st, w, t_):
     return False
 
 
+# ══════════════════════════════════════════════════════════════════
+# 10-bosqich: 💾 Zaxira · 📥 Qaytarish · 🧾 Smena (kassa yopish) · 🔢 Serial/kafolat · 🏷 Shtrix-kod/QR
+# Qoidalar: jadval/ustunlar faqat QO'SHILADI (idempotent); har pul/astatka amali BITTA tranzaksiyada;
+# davr yopilgan bo'lsa yozilmaydi; /undo bilan qaytariladi. Yangi majburiy env yo'q.
+# ══════════════════════════════════════════════════════════════════
+SOZ_DEFAULT.update({
+    'zaxira_kunlik': '1',      # har kuni avtomatik zaxira
+    'zaxira_vaqt': '23:30',    # Toshkent vaqti
+    'zaxira_soni': '7',        # serverda (Volume) nechta oxirgi nusxa saqlanadi
+    'zaxira_tg': '1',          # zaxira fayli egasiga Telegram orqali yuboriladi
+})
+TG_DOC_MAX = 49 * 1024 * 1024          # Bot API: hujjat yuborish chegarasi 50 MB (zaxira uchun 1 MB joy qoldiramiz)
+QAYTARISH_SABABLARI = (('brak', '🔧 Brak (nosoz)'), ('yoqmadi', "🙅 Yoqmadi"), ('notogri', "🔀 Noto'g'ri tovar"), ('boshqa', '✍️ Boshqa'))
+QAYTARISH_SABAB_NOMI = {k: v.split(' ', 1)[1] for k, v in QAYTARISH_SABABLARI}
+OMBOR_TURLARI.setdefault('qaytarish', 'Mijoz qaytardi')
+SERIAL_HOLAT = {'omborda': '📦 Omborda', 'sotilgan': '✅ Sotilgan', 'brak': '🔧 Brak', 'chiqarildi': '🗑 Hisobdan chiqarilgan'}
+
+
+class _SerialXato(Exception):
+    """POS: tanlangan serial band/topilmadi — savat saqlanmaydi."""
+    pass
+
+
+def init_b10_tables():
+    """Additiv va idempotent (har ishga tushishda xavfsiz). Eski ma'lumot o'zgarmaydi."""
+    conn = db(); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS zaxiralar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, fayl TEXT, hajm INTEGER DEFAULT 0, db_hajm INTEGER DEFAULT 0,
+        sha TEXT DEFAULT '', sabab TEXT DEFAULT '', holat TEXT DEFAULT 'ok', yuborildi INTEGER DEFAULT 0, xato TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS returns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, date TEXT, customer TEXT DEFAULT '', customer_id INTEGER DEFAULT 0,
+        reason TEXT DEFAULT '', note TEXT DEFAULT '', method TEXT DEFAULT '', total REAL DEFAULT 0, cogs REAL DEFAULT 0,
+        refund_cash REAL DEFAULT 0, refund_debt REAL DEFAULT 0, brak INTEGER DEFAULT 0, status TEXT DEFAULT 'ok',
+        requested_by INTEGER DEFAULT 0, requested_name TEXT DEFAULT '', approved_by INTEGER DEFAULT 0, approved_name TEXT DEFAULT '',
+        op_id INTEGER DEFAULT 0, plan TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS return_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, return_id INTEGER, sale_id INTEGER, product_id INTEGER, product TEXT,
+        qty INTEGER, revenue REAL, unit_cost REAL, profit REAL, return_sale_id INTEGER, brak INTEGER DEFAULT 0, serials TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS brak_tovarlar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, product_id INTEGER, product TEXT, qty INTEGER, unit_cost REAL,
+        manba TEXT DEFAULT 'qaytarish', return_id INTEGER DEFAULT 0, expense_id INTEGER DEFAULT 0, serials TEXT DEFAULT '',
+        status TEXT DEFAULT 'brak', note TEXT DEFAULT '', updated TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS smenalar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, user_name TEXT DEFAULT '', opened_at TEXT, opening_cash REAL DEFAULT 0,
+        closed_at TEXT DEFAULT '', closed_by INTEGER DEFAULT 0, closed_name TEXT DEFAULT '',
+        expected_naqd REAL DEFAULT 0, expected_karta REAL DEFAULT 0, counted_naqd REAL, counted_karta REAL,
+        diff_naqd REAL DEFAULT 0, diff_karta REAL DEFAULT 0, boshqa TEXT DEFAULT '{}', status TEXT DEFAULT 'ochiq',
+        note TEXT DEFAULT '', booking TEXT DEFAULT '', booking_ref TEXT DEFAULT '', booked_by TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS serials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, product TEXT DEFAULT '', serial TEXT NOT NULL,
+        status TEXT DEFAULT 'omborda', kirim_date TEXT DEFAULT '', kirim_ref TEXT DEFAULT '', sale_id INTEGER DEFAULT 0,
+        sold_date TEXT DEFAULT '', customer TEXT DEFAULT '', customer_id INTEGER DEFAULT 0, warranty_end TEXT DEFAULT '',
+        note TEXT DEFAULT '', created TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS serial_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, serial_id INTEGER, date TEXT, event TEXT, ref TEXT DEFAULT '',
+        note TEXT DEFAULT '', user_name TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS kafolat_murojaat (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, serial_id INTEGER DEFAULT 0, warranty_id INTEGER DEFAULT 0, product TEXT DEFAULT '',
+        customer TEXT DEFAULT '', opened TEXT, opened_by TEXT DEFAULT '', status TEXT DEFAULT 'ochiq', note TEXT DEFAULT '',
+        closed TEXT DEFAULT '', closed_by TEXT DEFAULT '', result TEXT DEFAULT '', tarix TEXT DEFAULT '')''')
+    for ddl in ("ALTER TABLE sales ADD COLUMN return_of INTEGER DEFAULT 0",
+                "ALTER TABLE products ADD COLUMN serialli INTEGER DEFAULT 0",
+                "ALTER TABLE products ADD COLUMN barcode TEXT DEFAULT ''",
+                "ALTER TABLE warranties ADD COLUMN serial TEXT DEFAULT ''"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass          # ustun allaqachon bor
+    for ddl in ("CREATE UNIQUE INDEX IF NOT EXISTS ux_serials_serial ON serials(serial COLLATE NOCASE)",
+                "CREATE INDEX IF NOT EXISTS ix_serials_pid ON serials(product_id, status)",
+                "CREATE INDEX IF NOT EXISTS ix_serials_sale ON serials(sale_id)",
+                "CREATE INDEX IF NOT EXISTS ix_sales_return_of ON sales(return_of)",
+                "CREATE INDEX IF NOT EXISTS ix_return_lines_sale ON return_lines(sale_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_products_barcode ON products(barcode) WHERE COALESCE(barcode,'')<>''"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError as e: log.warning("index: %s", e)
+    conn.commit(); conn.close()
+
+
+def _hm(): return datetime.now().strftime('%Y-%m-%d %H:%M')
+
+
+async def _b10_chiqar(u, matn, rows):
+    """Callback → tahrirlaydi; matn xabari → javob yozadi."""
+    q = getattr(u, 'callback_query', None)
+    if q is not None:
+        return await _pos_chiqar(q, matn, rows)
+    await u.message.reply_text(matn[:4000], reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
+
+def _som(usd, rate=None):
+    try: return f"{float(usd) * (rate or get_exchange_rate()):,.0f} so'm".replace(',', ' ')
+    except Exception: return ''
+
+
+def _pul_kirit(s):
+    """'450', '450$', '1 250 000' (so'm → $) → float yoki None."""
+    t = re.sub(r'[^\d.,]', '', str(s or '')).replace(',', '.')
+    if not t or t.count('.') > 1: return None
+    try: v = float(t)
+    except ValueError: return None
+    return round(_to_usd(v, 0, get_exchange_rate()), 2) if v >= 5000 else round(v, 2)
+
+
+# ── 💾 ZAXIRA: kunlik zip nusxa → egasiga Telegram + Volume'da oxirgi N ta ──────────────
+# Nusxa sqlite3 backup API bilan olinadi (bot yozib turgan paytda ham izchil). Fayl — zip ichida baza +
+# zaxira.json (sana, sha256). Shu faylni botga qayta yuborsa — tekshiradi va tasdiqdan keyin tiklaydi.
+ZAXIRA_RE = re.compile(r'^thermocrafts_\d{8}_\d{6}(?:_\d+)?\.zip$')
+
+
+def _zaxira_dir():
+    d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), 'zaxira')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _db_nomi():
+    return os.path.basename(DB_PATH) or 'thermocraft.db'
+
+
+def _fayl_sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''): h.update(b)
+    return h.hexdigest()
+
+
+def _mb(n): return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(1, n // 1024)} KB"
+
+
+def _zx_log(**kv):
+    try:
+        conn = db()
+        conn.execute("INSERT INTO zaxiralar (created,fayl,hajm,db_hajm,sha,sabab,holat,xato) VALUES (?,?,?,?,?,?,?,?)",
+                     (_hm(), kv.get('fayl', ''), kv.get('hajm', 0), kv.get('db_hajm', 0), kv.get('sha', ''),
+                      kv.get('sabab', ''), kv.get('holat', 'ok'), kv.get('xato', '')[:300]))
+        conn.commit(); conn.close()
+    except Exception:
+        log.exception("zaxiralar log")
+
+
+def zaxira_yarat(sabab="qo'lda"):
+    """Izchil nusxa → integrity_check → zip → zaxira/ papka. Qaytaradi {'ok', 'path','name','size','db_size','sha','soni'}."""
+    if not os.path.exists(DB_PATH):
+        return {'ok': False, 'error': "Baza fayli topilmadi"}
+    d = _zaxira_dir()
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    name = f"thermocrafts_{stamp}.zip"; k = 1
+    while os.path.exists(os.path.join(d, name)):
+        k += 1; name = f"thermocrafts_{stamp}_{k}.zip"
+    path = os.path.join(d, name)
+    fd, tmpdb = tempfile.mkstemp(suffix='.db', dir=d); os.close(fd)
+    tmpzip = path + '.tmp'
+    if not _BK_LOCK.acquire(timeout=180):
+        return {'ok': False, 'error': "Boshqa zaxira/tiklash jarayoni tugamadi"}
+    try:
+        src = sqlite3.connect(DB_PATH, timeout=30); dst = sqlite3.connect(tmpdb)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close(); src.close()
+        chk = sqlite3.connect(tmpdb)
+        try:
+            ic = chk.execute("PRAGMA integrity_check").fetchone()[0]
+            jad = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            soni = {t: chk.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in ('sales', 'products', 'cash_box') if t in jad}
+        finally:
+            chk.close()
+        if ic != 'ok':
+            raise RuntimeError(f"baza butunligi tekshiruvi: {ic}")
+        db_hajm = os.path.getsize(tmpdb); sha = _fayl_sha(tmpdb)
+        meta = {'dastur': 'ThermoCrafts', 'yaratildi': now_t(), 'sabab': sabab, 'db': _db_nomi(), 'db_hajm': db_hajm,
+                'sha256': sha, 'soni': soni}
+        with zipfile.ZipFile(tmpzip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            z.write(tmpdb, _db_nomi())
+            z.writestr('zaxira.json', json.dumps(meta, ensure_ascii=False, indent=1))
+        os.replace(tmpzip, path)
+    except Exception as e:
+        log.exception("zaxira_yarat")
+        _zx_log(sabab=sabab, holat='xato', xato=str(e))
+        return {'ok': False, 'error': str(e)[:200]}
+    finally:
+        _BK_LOCK.release()
+        for p_ in (tmpdb, tmpzip):
+            try: os.remove(p_)
+            except OSError: pass
+    hajm = os.path.getsize(path)
+    _zx_log(fayl=name, hajm=hajm, db_hajm=db_hajm, sha=sha, sabab=sabab)
+    ochdi = _zaxira_tozala()
+    return {'ok': True, 'path': path, 'name': name, 'size': hajm, 'db_size': db_hajm, 'sha': sha, 'soni': soni,
+            'ochirildi': ochdi, 'sabab': sabab}
+
+
+def _zaxira_soni():
+    try: return max(1, min(60, int(soz('zaxira_soni'))))
+    except (TypeError, ValueError): return 7
+
+
+def zaxira_royxat():
+    d = _zaxira_dir()
+    out = []
+    for n in os.listdir(d):
+        if ZAXIRA_RE.match(n):
+            p_ = os.path.join(d, n)
+            out.append({'name': n, 'path': p_, 'size': os.path.getsize(p_), 'mtime': os.path.getmtime(p_)})
+    out.sort(key=lambda x: x['name'], reverse=True)
+    try:
+        conn = db()
+        yub = {r[0] for r in conn.execute("SELECT fayl FROM zaxiralar WHERE yuborildi=1")}
+        conn.close()
+    except sqlite3.OperationalError:
+        yub = set()
+    for x in out:
+        x['yuborildi'] = x['name'] in yub
+        s = x['name'][13:28]
+        x['vaqt'] = f"{s[6:8]}.{s[4:6]}.{s[:4]} {s[9:11]}:{s[11:13]}"
+    return out
+
+
+def _zaxira_tozala():
+    """Oxirgi N tadan eskilarini o'chiradi (faqat bizning nomdagi fayllar)."""
+    fl = zaxira_royxat(); n = _zaxira_soni(); ochdi = []
+    for x in fl[n:]:
+        try: os.remove(x['path']); ochdi.append(x['name'])
+        except OSError: log.warning("zaxira o'chmadi: %s", x['name'])
+    return ochdi
+
+
+def zaxira_ochish(raw, fname=''):
+    """Yuborilgan fayl (.zip yoki .db) → tekshiradi. {'ok','db': bytes,'info': {...}} yoki {'ok': False,'error'}."""
+    raw = bytes(raw or b''); meta = {}
+    try:
+        if raw[:4] == b'PK\x03\x04':
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                azo = [i for i in z.infolist() if i.filename.lower().endswith(('.db', '.sqlite', '.sqlite3'))]
+                if not azo: return {'ok': False, 'error': "zip ichida baza fayli (.db) yo'q"}
+                if azo[0].file_size > 1024 * 1048576: return {'ok': False, 'error': "baza juda katta (1 GB dan ortiq)"}
+                data = z.read(azo[0])
+                if 'zaxira.json' in z.namelist():
+                    try: meta = json.loads(z.read('zaxira.json').decode('utf-8'))
+                    except Exception: meta = {}
+        elif raw[:15] == b'SQLite format 3':
+            data = raw
+        else:
+            return {'ok': False, 'error': "fayl zaxira emas (.zip yoki .db kutilgan)"}
+    except zipfile.BadZipFile:
+        return {'ok': False, 'error': "zip fayl buzilgan"}
+    if data[:15] != b'SQLite format 3':
+        return {'ok': False, 'error': "ichidagi fayl SQLite baza emas"}
+    if meta.get('sha256') and hashlib.sha256(data).hexdigest() != meta['sha256']:
+        return {'ok': False, 'error': "fayl buzilgan (sha256 mos emas)"}
+    fd, tmp = tempfile.mkstemp(suffix='.db'); os.close(fd)
+    try:
+        with open(tmp, 'wb') as f: f.write(data)
+        con = sqlite3.connect(tmp)
+        try:
+            ic = con.execute("PRAGMA integrity_check").fetchone()[0]
+            jad = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if ic != 'ok': return {'ok': False, 'error': f"baza butunligi buzilgan: {ic}"}
+            yoq = {'sales', 'products', 'cash_box'} - jad
+            if yoq: return {'ok': False, 'error': "bu ThermoCrafts bazasi emas (" + ", ".join(sorted(yoq)) + " jadvali yo'q)"}
+            info = {'sotuv': con.execute("SELECT COUNT(*) FROM sales").fetchone()[0],
+                    'tovar': con.execute("SELECT COUNT(*) FROM products").fetchone()[0],
+                    'kassa': round(con.execute("SELECT COALESCE(SUM(CASE WHEN type='kirim' THEN amount ELSE -amount END),0) "
+                                               "FROM cash_box").fetchone()[0] or 0, 2),
+                    'oxirgi_sotuv': (con.execute("SELECT MAX(date) FROM sales").fetchone()[0] or '—'),
+                    'yaratildi': meta.get('yaratildi', ''), 'hajm': len(data)}
+        finally:
+            con.close()
+    except sqlite3.DatabaseError as e:
+        return {'ok': False, 'error': f"baza ochilmadi: {str(e)[:100]}"}
+    finally:
+        try: os.remove(tmp)
+        except OSError: pass
+    return {'ok': True, 'db': data, 'info': info}
+
+
+def zaxira_tikla(data):
+    """Avval hozirgi bazani zaxiralaydi, keyin almashtiradi (/restore bilan bir xil yo'l: init + baseline).
+    backup_seq oshiriladi — keyingi restartda GitHub'dagi eski nusxa buni bosib ketmasin."""
+    pre = zaxira_yarat('tiklashdan oldin')
+    cur_seq = max(0, _db_seq_of(DB_PATH))
+    with _BK_LOCK:
+        _write_db_file(data)
+        init_all_tables()
+        _set_meta('backup_seq', max(cur_seq, _db_seq_of(DB_PATH), 0) + 1)
+        _set_meta('restored_at', now_t())
+        _BK['blocked'] = ''; _BK['restore_msg'] = ''
+        _bk_set_baseline()
+    _BK['migrate'] = True                 # GITHUB_TOKEN bo'lsa — tiklangan baza GitHub'ga ham yoziladi
+    return {'ok': True, 'oldingi': pre.get('name') if pre.get('ok') else None,
+            'oldingi_xato': None if pre.get('ok') else pre.get('error'), 'kassa': round(get_cash_balance(), 2)}
+
+
+async def zaxira_yubor(bot, res, chat_id=None):
+    """Zip faylni hujjat sifatida yuboradi. 50 MB dan katta bo'lsa — ogohlantiradi (fayl serverda qoladi)."""
+    chat_id = chat_id or OWNER_ID
+    if res['size'] > TG_DOC_MAX:
+        await bot.send_message(chat_id=chat_id, text=(
+            f"⚠️ Zaxira fayli {_mb(res['size'])} — Telegram 50 MB chegarasidan katta, yuborilmadi.\n"
+            f"Nusxa serverda saqlandi: {res['name']}" + (" (Volume)" if db_on_volume() else "") +
+            ("\nGitHub zaxira ham ishlaydi." if GITHUB_TOKEN else "")))
+        return False
+    soni = res.get('soni') or {}
+    cap = (f"💾 Zaxira · {now_t()} · {_mb(res['size'])}\n"
+           f"Sotuvlar: {soni.get('sales', '?')} · tovarlar: {soni.get('products', '?')} · sabab: {res.get('sabab', '')}\n"
+           "♻️ Tiklash: shu faylni botga qayta yuboring (faqat egasi)."
+           + ("\n⚠️ 20 MB dan katta fayl botga qayta yuklanmaydi — Railway Volume'dagi nusxadan foydalaning."
+              if res['size'] > TG_DL_MAX else ""))
+    with open(res['path'], 'rb') as fh:
+        await bot.send_document(chat_id=chat_id, document=fh, filename=res['name'], caption=cap[:1000])
+    try:
+        conn = db(); conn.execute("UPDATE zaxiralar SET yuborildi=1 WHERE fayl=?", (res['name'],)); conn.commit(); conn.close()
+    except Exception:
+        log.exception("zaxira yuborildi belgisi")
+    return True
+
+
+async def _egaga(bot, matn):
+    try: await bot.send_message(chat_id=OWNER_ID, text=matn[:4000])
+    except Exception: log.exception("egaga xabar")
+
+
+async def zaxira_kunlik(bot):
+    """Rejalashtiruvchi chaqiradi: yaratadi → (sozlama bo'yicha) Telegram'ga → xato bo'lsa egasiga ogohlantirish."""
+    try:
+        res = await asyncio.to_thread(zaxira_yarat, 'kunlik')
+    except Exception as e:
+        res = {'ok': False, 'error': str(e)[:200]}
+    if not res.get('ok'):
+        await _egaga(bot, f"⚠️ Kunlik zaxira BAJARILMADI: {res.get('error')}\nQo'lda urinib ko'ring: 💾 Zaxira → Hozir zaxira")
+        return res
+    if soz('zaxira_tg') == '1':
+        try:
+            await zaxira_yubor(bot, res)
+        except Exception as e:
+            log.exception("zaxira yuborish")
+            await _egaga(bot, f"⚠️ Zaxira yaratildi ({res['name']}), lekin Telegram'ga yuborib bo'lmadi: {str(e)[:150]}")
+    return res
+
+
+def zaxira_vaqti_keldimi(now=None):
+    """Bugun hali qilinmagan va belgilangan vaqt o'tgan bo'lsa True (bot o'sha daqiqada o'chiq bo'lsa ham bugun qiladi)."""
+    if soz('zaxira_kunlik') != '1': return False
+    now = now or datetime.now()
+    return soz('zaxira_ishladi') != now.strftime('%Y-%m-%d') and now.strftime('%H:%M') >= _hhmm(soz('zaxira_vaqt'))
+
+
+# ── UI ──
+def _zx_menu():
+    fl = zaxira_royxat()
+    on, tg = soz('zaxira_kunlik') == '1', soz('zaxira_tg') == '1'
+    m = ["💾 ZAXIRA (bazaning to'liq nusxasi)", ""]
+    m.append(f"Oxirgi: {fl[0]['vaqt']} · {_mb(fl[0]['size'])}" if fl else "Hali zaxira yo'q")
+    m.append(f"🗓 Avtomatik: {'har kuni ' + soz('zaxira_vaqt') + ' (Toshkent)' if on else 'o‘chirilgan'}")
+    m.append(f"📤 Telegram'ga yuborish: {'ha' if tg else 'yo‘q'}")
+    m.append(f"📁 Serverda saqlanadi: oxirgi {_zaxira_soni()} ta (hozir {len(fl)} ta)")
+    m.append(f"💽 Disk: {'Volume (doimiy)' if db_on_volume() else 'vaqtinchalik — Telegramdagi nusxa muhim!'}")
+    m.append(f"☁️ GitHub zaxira: {'ulangan' if GITHUB_TOKEN else 'sozlanmagan (ixtiyoriy)'}")
+    m.append("\n♻️ Tiklash: zaxira faylini (.zip) shu chatga yuboring — tekshirib, tasdiq so'rayman.")
+    rows = [[_btn("💾 Hozir zaxira", "zx:now"), _btn("📋 Oxirgi zaxiralar", "zx:ls")],
+            [_btn(f"⏰ Vaqt: {soz('zaxira_vaqt')}", "zx:t"), _btn(f"🔢 Saqlash: {_zaxira_soni()} ta", "zx:n")],
+            [_btn(f"🗓 Avto: {'ON' if on else 'OFF'}", "zx:d"), _btn(f"📤 Telegram: {'ON' if tg else 'OFF'}", "zx:tg")],
+            _x_btn('zx')]
+    return "\n".join(m), rows
+
+
+def _zx_royxat():
+    fl = zaxira_royxat()
+    if not fl: return "📋 Hali zaxira yo'q.", [[_btn("⬅️ Orqaga", "zx:menu")]]
+    m = ["📋 OXIRGI ZAXIRALAR (bosing — fayl qayta yuboriladi):"]
+    rows = [[_btn(f"{'📤' if x['yuborildi'] else '📁'} {x['vaqt']} · {_mb(x['size'])}", f"zx:s:{x['name'][13:-4]}")] for x in fl[:10]]
+    m.append("📤 — Telegram'ga yuborilgan · 📁 — faqat serverda")
+    rows.append([_btn("⬅️ Orqaga", "zx:menu")] + _x_btn('zx'))
+    return "\n".join(m), rows
+
+
+async def cmd_zaxira(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """💾 Zaxira tugmasi / /zaxira — faqat egasi"""
+    if not can(u, 'zaxira'):
+        if user_role(u): await u.message.reply_text("💾 Zaxira bo'limi faqat egasiga ochiq.")
+        return
+    _ui_yangi(ctx, 'zx')
+    m, r = _zx_menu()
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+
+async def zaxira_hujjat(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Egasi zaxira faylini (.zip/.db) yubordi → tekshiradi → tasdiq tugmasi."""
+    if not can(u, 'system'):
+        await u.message.reply_text("♻️ Zaxiradan tiklash faqat egasiga ruxsat etilgan."); return
+    doc = u.message.document
+    if (getattr(doc, 'file_size', 0) or 0) > TG_DL_MAX:
+        await u.message.reply_text("❌ Fayl 20 MB dan katta — Telegram bot uni yuklab ololmaydi.\n"
+                                   "Railway Volume'dagi zaxira/ papkasidan yoki GitHub zaxirasidan (/restore ha) foydalaning.")
+        return
+    await u.message.reply_text("⏳ Zaxira fayli tekshirilmoqda...")
+    try:
+        f = await ctx.bot.get_file(doc.file_id)
+        raw = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        await u.message.reply_text(f"❌ Faylni Telegram'dan yuklab bo'lmadi: {str(e)[:150]}"); return
+    res = await asyncio.to_thread(zaxira_ochish, raw, doc.file_name or '')
+    if not res['ok']:
+        await u.message.reply_text(f"❌ Tiklab bo'lmaydi: {res['error']}.\nHozirgi baza o'zgarmadi."); return
+    tok = secrets.token_hex(4)
+    path = os.path.join(_zaxira_dir(), f"tiklash_{tok}.db")
+    with open(path, 'wb') as fh: fh.write(res['db'])
+    _ui_yangi(ctx, 'zx', rs=path, rs_tok=tok)
+    i = res['info']
+    m = (f"♻️ ZAXIRADAN TIKLASH\n\nFayl: {doc.file_name}\n" + (f"Yaratilgan: {i['yaratildi']}\n" if i['yaratildi'] else "") +
+         f"Sotuvlar: {i['sotuv']} ta (oxirgisi {i['oxirgi_sotuv']})\nTovarlar: {i['tovar']} ta\nKassa: {_usd2(i['kassa'])}\n"
+         f"Baza hajmi: {_mb(i['hajm'])}\n\n⚠️ Hozirgi baza SHU nusxa bilan almashtiriladi. Undan keyingi yozuvlar yo'qoladi.\n"
+         "Xavfsizlik uchun hozirgi holat avval avtomatik zaxiralanadi.")
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(
+        [[_btn("♻️ Ha, shu nusxani tiklash", f"zx:rs:{tok}")], [_btn("❌ Bekor", "zx:rx")]]))
+
+
+async def zx_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'zaxira'):
+        await q.answer("Faqat egasi", show_alert=True); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    if act == 'x':
+        ctx.user_data.pop('zx', None); await q.answer()
+        return await _pos_chiqar(q, "💾 Zaxira oynasi yopildi.", None)
+    st = _ui_ol(ctx, 'zx') or _ui_yangi(ctx, 'zx')
+    st['wait'] = None
+    m = r = None; alert = None
+    if act == 'menu':
+        m, r = _zx_menu()
+    elif act == 'now':
+        if not _ui_done(ctx, 'zxnow' + str(int(time.time() // 20))):
+            await q.answer("⏳ Zaxira allaqachon tayyorlanmoqda"); return
+        await q.answer("⏳ Zaxira tayyorlanmoqda...")
+        res = await asyncio.to_thread(zaxira_yarat, "qo'lda")
+        if not res['ok']:
+            m, r = f"❌ Zaxira xatosi: {res['error']}", [[_btn("⬅️ Orqaga", "zx:menu")]]
+        else:
+            try:
+                yub = await zaxira_yubor(ctx.bot, res, u.effective_chat.id)
+            except Exception as e:
+                log.exception("zaxira yuborish"); yub = False
+                await q.message.reply_text(f"⚠️ Faylni yuborib bo'lmadi: {str(e)[:150]}")
+            m0, r = _zx_menu()
+            m = f"✅ Zaxira tayyor: {res['name']} ({_mb(res['size'])})" + (" — fayl yuqorida" if yub else "") + "\n\n" + m0
+        return await _pos_chiqar(q, m, r)
+    elif act == 'ls':
+        m, r = _zx_royxat()
+    elif act == 's':
+        name = f"thermocrafts_{arg[0] if arg else ''}.zip"
+        fl = {x['name']: x for x in zaxira_royxat()}
+        if not ZAXIRA_RE.match(name) or name not in fl:
+            alert = "Fayl topilmadi (eskirgan bo'lishi mumkin)"
+        else:
+            await q.answer("📤 Yuborilmoqda...")
+            x = fl[name]
+            try:
+                await zaxira_yubor(ctx.bot, {'path': x['path'], 'name': name, 'size': x['size'], 'sabab': 'qayta yuborish'},
+                                   u.effective_chat.id)
+            except Exception as e:
+                await q.message.reply_text(f"⚠️ Yuborib bo'lmadi: {str(e)[:150]}")
+            return
+    elif act == 't':
+        st['wait'] = 'vaqt'
+        m, r = "⏰ Zaxira vaqtini yozing (Toshkent), masalan 23:30:", [[_btn("⬅️ Orqaga", "zx:menu")]]
+    elif act == 'n':
+        qator = [3, 7, 14, 30]; cur = _zaxira_soni()
+        soz_yoz('zaxira_soni', next((v for v in qator if v > cur), qator[0]))
+        m, r = _zx_menu()
+    elif act in ('d', 'tg'):
+        kalit = 'zaxira_kunlik' if act == 'd' else 'zaxira_tg'
+        soz_yoz(kalit, '0' if soz(kalit) == '1' else '1'); m, r = _zx_menu()
+    elif act == 'rx':
+        p_ = st.pop('rs', None)
+        if p_:
+            try: os.remove(p_)
+            except OSError: pass
+        m, r = "❎ Tiklash bekor qilindi. Baza o'zgarmadi.", None
+    elif act == 'rs':
+        tok = arg[0] if arg else ''
+        p_ = st.get('rs')
+        if not p_ or st.get('rs_tok') != tok or not os.path.exists(p_) or not _ui_done(ctx, 'zxrs' + tok):
+            await q.answer("Eskirgan yoki allaqachon bajarilgan. Faylni qayta yuboring.", show_alert=True); return
+        await q.answer("⏳ Tiklanmoqda...")
+        with open(p_, 'rb') as fh: data = fh.read()
+        try:
+            res = await asyncio.to_thread(zaxira_tikla, data)
+        except Exception as e:
+            log.exception("zaxira_tikla")
+            return await _pos_chiqar(q, f"❌ Tiklashda xato: {str(e)[:200]}", None)
+        finally:
+            try: os.remove(p_)
+            except OSError: pass
+            st.pop('rs', None)
+        m = ("✅ Baza zaxiradan tiklandi.\n" + (f"Oldingi holat nusxasi: {res['oldingi']}\n" if res['oldingi'] else
+                                              f"⚠️ Oldingi holatni zaxiralab bo'lmadi: {res['oldingi_xato']}\n") +
+             f"💵 Kassa: {_usd2(res['kassa'])}\nXodimlar /start bossin (menyu yangilanadi).")
+        return await _pos_chiqar(q, m, None)
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, r)
+
+
+async def zx_matn(u, ctx, msg):
+    st = _ui_ol(ctx, 'zx')
+    if not st or st.get('wait') != 'vaqt' or not can(u, 'zaxira'): return False
+    mt = re.fullmatch(r'\s*([01]?\d|2[0-3])[:.]([0-5]\d)\s*', msg or '')
+    if not mt:
+        await u.message.reply_text("⚠️ Vaqtni HH:MM ko'rinishida yozing, masalan 23:30"); return True
+    st['wait'] = None
+    soz_yoz('zaxira_vaqt', f"{int(mt.group(1)):02d}:{mt.group(2)}")
+    m, r = _zx_menu()
+    await u.message.reply_text("✅ Vaqt saqlandi.\n\n" + m, reply_markup=InlineKeyboardMarkup(r))
+    return True
+
+
+# ── 📥 QAYTARISH (to'liq / qisman) ────────────────────────────────────────────────────
+# Usul: qaytarish sanasida MANFIY sotuv qatori (qty<0, revenue<0, profit<0, return_of=<asl sotuv>) yoziladi.
+# Shu sabab barcha hisobotlar (P&L, sotuvchi, TOP tovar, mijoz, kunlik) o'zgartirishsiz to'g'ri chiqadi va
+# yopilgan o'tgan oy raqamlari o'zgarmaydi. Tushum/tannarx asl sotuvga PROPORSIONAL (chegirma ham shunday).
+_SOTUV_KEYS = ('id', 'date', 'time', 'product', 'qty', 'unit_cost', 'revenue', 'profit', 'discount', 'customer',
+               'customer_type', 'reversed', 'seller_id', 'seller_name', 'customer_id', 'return_of')
+
+
+def _sotuv_qator(c, sid):
+    c.execute("SELECT id,date,time,product,qty,COALESCE(unit_cost,0),COALESCE(revenue,0),COALESCE(profit,0),COALESCE(discount,0),"
+              "COALESCE(customer,''),COALESCE(customer_type,'B2C'),reversed,COALESCE(seller_id,0),COALESCE(seller_name,''),"
+              "COALESCE(customer_id,0),COALESCE(return_of,0) FROM sales WHERE id=?", (int(sid),))
+    r = c.fetchone()
+    return dict(zip(_SOTUV_KEYS, r)) if r else None
+
+
+def _qaytgan(c, sid):
+    c.execute("SELECT COALESCE(SUM(-qty),0), COALESCE(SUM(-revenue),0) FROM sales WHERE return_of=? AND reversed=0", (int(sid),))
+    n, s = c.fetchone()
+    return int(n or 0), round(s or 0, 2)
+
+
+def _sotuv_pid(c, sid, product):
+    c.execute("SELECT product_id FROM stock_moves WHERE kind='sotuv' AND ref=? ORDER BY id DESC LIMIT 1", (f's{sid}',))
+    r = c.fetchone()
+    if r: return r[0]
+    c.execute('SELECT id FROM products WHERE name=?', (product,)); r = c.fetchone()
+    return r[0] if r else None
+
+
+def _sotuv_naqdmi(c, sid):
+    """Sotuv puli kassaga tushganmi → (True, usul). Tushmagan (nasiya/eski import) → (False, None)."""
+    c.execute("SELECT COALESCE(NULLIF(payment_method,''),'naqd') FROM cash_box WHERE type='kirim' AND note LIKE ? ORDER BY id LIMIT 1",
+              (f'%(#{int(sid)})',))
+    r = c.fetchone()
+    return (True, r[0]) if r else (False, None)
+
+
+def _nasiya_qarz_top(c, sid, s):
+    """Nasiya sotuvning ochiq debitorligi → (debt_id, qoldiq) yoki None (_nasiya_qaytar bilan bir xil qidiruv)."""
+    c.execute(f"SELECT id, amount, note FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL} AND note LIKE ? ORDER BY id DESC",
+              (f'%#s{int(sid)}%',))
+    tag = re.compile(rf"#s{int(sid)}(?!\d)")
+    hit = next((r for r in c.fetchall() if tag.search(r[2] or '')), None)
+    if not hit and (s.get('customer') or '').strip():
+        c.execute(f"SELECT id, amount, note FROM debts WHERE paid=0 AND type IN {DEBITOR_SQL} "
+                  "AND person=? AND date=? AND note LIKE ? AND note NOT LIKE '%#s%' ORDER BY id DESC LIMIT 1",
+                  (s['customer'], s['date'], f"nasiya:%{s['product']} x{s['qty']}%"))
+        hit = c.fetchone()
+    return (hit[0], round(hit[1] or 0, 2)) if hit else None
+
+
+def _qaytarish_reja(c, plan):
+    """Tekshiradi va hisoblaydi (yozmaydi). ValueError — foydalanuvchiga ko'rsatiladigan sabab."""
+    lines, seen = [], set()
+    for ln in plan.get('lines') or []:
+        sid = int(ln['sale_id']); n = int(ln.get('qty') or 0)
+        if n <= 0: continue
+        if sid in seen: raise ValueError("Bitta sotuv qatori ikki marta tanlangan")
+        seen.add(sid)
+        s = _sotuv_qator(c, sid)
+        if not s: raise ValueError(f"Sotuv #{sid} topilmadi")
+        if s['reversed']: raise ValueError(f"Sotuv #{sid} bekor qilingan")
+        if s['return_of'] or s['qty'] <= 0: raise ValueError(f"#{sid} — bu qaytarish yozuvi, sotuv emas")
+        qn, qs = _qaytgan(c, sid)
+        mavjud = s['qty'] - qn
+        if n > mavjud:
+            raise ValueError(f"{s['product']}: faqat {max(0, mavjud)} ta qaytarish mumkin" + (f" ({qn} tasi avval qaytgan)" if qn else ""))
+        rev = round(s['revenue'] - qs, 2) if n == mavjud else round(s['revenue'] * n / s['qty'], 2)
+        cogs = round((s['unit_cost'] or 0) * n, 2)
+        c.execute("SELECT id, serial FROM serials WHERE sale_id=? AND status='sotilgan' ORDER BY id", (sid,))
+        sotilgan = dict(c.fetchall())
+        sers = [int(x) for x in (ln.get('serials') or [])]
+        if sotilgan:
+            if not sers and n == len(sotilgan): sers = list(sotilgan)
+            if len(set(sers)) != n or any(x not in sotilgan for x in sers):
+                raise ValueError(f"{s['product']}: qaytariladigan serial raqamni tanlang ({n} ta)")
+        else:
+            sers = []
+        naqd, usul = _sotuv_naqdmi(c, sid)
+        lines.append({'sale': s, 'sid': sid, 'qty': n, 'rev': rev, 'cogs': cogs, 'pid': _sotuv_pid(c, sid, s['product']),
+                      'serials': sers, 'serial_txt': [sotilgan[x] for x in sers], 'naqd': naqd, 'usul': usul, 'mavjud': mavjud})
+    if not lines: raise ValueError("Qaytariladigan tovar tanlanmagan")
+    qarz_reja = {}
+    for L in lines:
+        L['qarzdan'] = 0.0; L['did'] = None
+        if not L['naqd']:
+            hit = _nasiya_qarz_top(c, L['sid'], L['sale'])
+            if hit:
+                did, amt = hit
+                part = round(min(L['rev'], max(0.0, round(amt - qarz_reja.get(did, 0), 2))), 2)
+                if part > 0:
+                    qarz_reja[did] = round(qarz_reja.get(did, 0) + part, 2); L['qarzdan'] = part; L['did'] = did
+        L['naqddan'] = round(L['rev'] - L['qarzdan'], 2)
+    usul = next((L['usul'] for L in lines if L['naqd']), None)
+    return {'lines': lines, 'jami': round(sum(L['rev'] for L in lines), 2), 'cogs': round(sum(L['cogs'] for L in lines), 2),
+            'qarzdan': round(sum(qarz_reja.values()), 2), 'naqd_qaytar': round(sum(L['naqddan'] for L in lines), 2),
+            'qarz_reja': qarz_reja, 'asl_usul': usul or 'naqd'}
+
+
+def qaytarish_hisob(plan):
+    """Oldindan ko'rish: {'ok', ...reja} yoki {'ok': False, 'error'}."""
+    conn = db(); c = conn.cursor()
+    try:
+        R = _qaytarish_reja(c, plan); R['ok'] = True; return R
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+def _serial_log(c, serial_id, event, ref='', note='', user=None):
+    c.execute("INSERT INTO serial_log (serial_id,date,event,ref,note,user_name) VALUES (?,?,?,?,?,?)",
+              (serial_id, _hm(), event, ref, (note or '')[:300], (user or (0, ''))[1] if user else ''))
+
+
+def _sabab_matn(plan):
+    k = plan.get('reason') or 'boshqa'
+    t = (plan.get('reason_text') or '').strip()
+    return (QAYTARISH_SABAB_NOMI.get(k, k) + (f": {t}" if t else ''))[:200]
+
+
+def qaytarish_bajar(plan, user=None, return_id=None):
+    """BITTA tranzaksiya: manfiy sotuv qatori + astatka (yoki brak) + pul (kassadan / qarzdan) + serial/kafolat + op_log.
+    return_id — sotuvchi so'rovini tasdiqlash (status 'kutilmoqda' → 'ok')."""
+    if is_closed(today()):
+        return {'ok': False, 'error': f"{today()[:7]} davri yopilgan — qaytarish yozib bo'lmaydi (/och {today()[:7]})"}
+    user = user or (0, '')
+    now = datetime.now(); d, t = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
+    sabab = _sabab_matn(plan); brak = bool(plan.get('brak'))
+    conn = db(); c = conn.cursor(); cids = set()
+    try:
+        R = _qaytarish_reja(c, plan)
+        method = tolov_usuli(plan.get('method') or '') or R['asl_usul']
+        if method not in TOLOV_USULLARI: method = 'naqd'
+        first = R['lines'][0]['sale']
+        if return_id:
+            c.execute("UPDATE returns SET status='ok', approved_by=?, approved_name=?, date=?, created=? WHERE id=? AND status='kutilmoqda'",
+                      (int(user[0] or 0), user[1] or '', d, f"{d} {t}", int(return_id)))
+            if c.rowcount != 1: raise ValueError("So'rov allaqachon ko'rib chiqilgan")
+            rid = int(return_id)
+        else:
+            c.execute("INSERT INTO returns (created,date,customer,customer_id,reason,note,status,approved_by,approved_name,plan) "
+                      "VALUES (?,?,?,?,?,?,'ok',?,?,?)", (f"{d} {t}", d, first['customer'], first['customer_id'], sabab,
+                                                          (plan.get('note') or '')[:300], int(user[0] or 0), user[1] or '',
+                                                          json.dumps(plan, ensure_ascii=False)))
+            rid = c.lastrowid
+        c.execute('INSERT INTO op_log (date,time,op_type,data_json) VALUES (?,?,?,?)', (d, t, 'return', '{}'))
+        op_id = c.lastrowid
+        data = {'rid': rid, 'sale_rows': [], 'moves': [], 'cash_ids': [], 'cash_sum': 0.0, 'method': method, 'debts': [],
+                'expense_ids': [], 'brak_ids': [], 'warranty': [], 'serials': [], 'jami': R['jami'],
+                'product': ", ".join(f"{L['sale']['product']} x{L['qty']}" for L in R['lines'])}
+        for L in R['lines']:
+            s = L['sale']; uc = s['unit_cost'] or 0; n = L['qty']
+            c.execute("INSERT INTO sales (date,time,product,qty,unit_cost,revenue,profit,discount,customer,customer_type,reversed,"
+                      "seller_id,seller_name,customer_id,return_of) VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)",
+                      (d, t, s['product'], -n, uc, -L['rev'], -round(L['rev'] - L['cogs'], 2), s['discount'], s['customer'],
+                       s['customer_type'], s['seller_id'], s['seller_name'], s['customer_id'], L['sid']))
+            rsid = c.lastrowid; data['sale_rows'].append(rsid)
+            if s['customer_id']: cids.add(s['customer_id'])
+            if L['pid']:
+                if not brak:
+                    c.execute('SELECT COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (L['pid'],))
+                    q0, c0 = c.fetchone(); baza = max(0, q0)
+                    new_cost = round((baza * c0 + n * uc) / (baza + n), 2) if baza + n > 0 else uc
+                    res = stock_move(c, L['pid'], n, 'qaytarish', f"#R{rid}: {sabab}"[:120], f'r{rid}', user, uc, new_cost)
+                    if res: data['moves'].append({'id': res[0], 'tur': 'yaxshi'})
+                else:
+                    m1 = stock_move(c, L['pid'], n, 'qaytarish', f"#R{rid}: {sabab} (brak)"[:120], f'r{rid}', user, uc)
+                    m2 = stock_move(c, L['pid'], -n, 'chiqim', f"Brak: qaytarish #R{rid}", f'r{rid}', user, uc, allow_negative=True)
+                    if m1 and m2: data['moves'] += [{'id': m1[0], 'tur': 'brak'}, {'id': m2[0], 'tur': 'brak'}]
+                    summa = round(uc * n, 2); eid = None
+                    if summa > 0:
+                        c.execute('INSERT INTO expenses (date,amount,category,expense_type,note) VALUES (?,?,?,?,?)',
+                                  (d, summa, 'spisanie', 'period', f"Brak qaytarish: {s['product']} x{n} (#R{rid})"))
+                        eid = c.lastrowid; data['expense_ids'].append(eid)
+                    c.execute("INSERT INTO brak_tovarlar (date,product_id,product,qty,unit_cost,manba,return_id,expense_id,serials,note) "
+                              "VALUES (?,?,?,?,?,'qaytarish',?,?,?,?)",
+                              (d, L['pid'], s['product'], n, uc, rid, eid or 0, ",".join(map(str, L['serials'])), sabab))
+                    data['brak_ids'].append(c.lastrowid)
+            for sr in L['serials']:
+                c.execute("SELECT status, sale_id, sold_date, customer, customer_id, warranty_end, serial FROM serials WHERE id=?", (sr,))
+                old = list(c.fetchone())
+                data['serials'].append({'id': sr, 'old': old[:6]})
+                c.execute("UPDATE serials SET status=?, sale_id=0, sold_date='', customer='', customer_id=0, warranty_end='' WHERE id=?",
+                          ('brak' if brak else 'omborda', sr))
+                _serial_log(c, sr, 'qaytarildi', f'#R{rid}', sabab + (" · brak" if brak else " · omborga"), user)
+                c.execute("SELECT id, status FROM warranties WHERE sale_id=? AND serial=?", (L['sid'], old[6]))
+                for wid, wst in c.fetchall():
+                    data['warranty'].append({'id': wid, 'old': wst})
+                    c.execute("UPDATE warranties SET status='returned' WHERE id=?", (wid,))
+            if n == L['mavjud']:                       # qator to'liq qaytdi — seriallsiz kafolat ham yopiladi
+                c.execute("SELECT id, status FROM warranties WHERE sale_id=? AND COALESCE(serial,'')='' AND status='active'", (L['sid'],))
+                for wid, wst in c.fetchall():
+                    data['warranty'].append({'id': wid, 'old': wst})
+                    c.execute("UPDATE warranties SET status='returned' WHERE id=?", (wid,))
+            c.execute("INSERT INTO return_lines (return_id,sale_id,product_id,product,qty,revenue,unit_cost,profit,return_sale_id,brak,serials) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, L['sid'], L['pid'] or 0, s['product'], n, L['rev'], uc,
+                                                         round(L['rev'] - L['cogs'], 2), rsid, 1 if brak else 0,
+                                                         ", ".join(L['serial_txt'])))
+        for did, part in R['qarz_reja'].items():
+            c.execute("SELECT amount, paid, note FROM debts WHERE id=?", (did,))
+            a, pd, nt = c.fetchone()
+            yangi = round((a or 0) - part, 2)
+            c.execute("UPDATE debts SET amount=?, paid=?, note=? WHERE id=?",
+                      (max(0.0, yangi), 1 if yangi <= 0.005 else 0, f"{nt or ''} | -{part:.2f}: qaytarish #R{rid}", did))
+            data['debts'].append({'id': did, 'part': part, 'old_amount': a, 'old_paid': pd, 'old_note': nt})
+        if R['naqd_qaytar'] > 0:
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (d, t, 'chiqim', R['naqd_qaytar'], 'qaytarish', f"Qaytarish #R{rid}: {data['product']}"[:200], method))
+            data['cash_ids'].append(c.lastrowid); data['cash_sum'] = R['naqd_qaytar']
+        c.execute("UPDATE returns SET total=?, cogs=?, refund_cash=?, refund_debt=?, method=?, brak=?, op_id=? WHERE id=?",
+                  (R['jami'], R['cogs'], R['naqd_qaytar'], R['qarzdan'], method, 1 if brak else 0, op_id, rid))
+        c.execute('UPDATE op_log SET data_json=? WHERE id=?', (json.dumps(data, ensure_ascii=False), op_id))
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return {'ok': False, 'error': str(e)}
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    for cid in cids:
+        try: yangila_jami(cid)
+        except Exception as e: log.warning(f'yangila_jami: {e}')
+    return {'ok': True, 'rid': rid, 'op_id': op_id, 'jami': R['jami'], 'naqd': R['naqd_qaytar'], 'qarzdan': R['qarzdan'],
+            'method': method, 'brak': brak, 'sabab': sabab, 'customer': first['customer'], 'sana': f"{d} {t}",
+            'qatorlar': [{'nom': L['sale']['product'], 'qty': L['qty'], 'summa': L['rev'], 'sid': L['sid'],
+                          'serial': L['serial_txt']} for L in R['lines']]}
+
+
+def reverse_return(op_id):
+    """Qaytarishni bekor qiladi (/undo) — BITTA tranzaksiyada hamma narsa teskari."""
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("SELECT date, data_json FROM op_log WHERE id=? AND op_type='return' AND reversed=0", (op_id,))
+        r = c.fetchone()
+        if not r: conn.close(); return False, "Topilmadi yoki allaqachon qaytarilgan"
+        for s_ in (r[0], today()):
+            if is_closed(s_):
+                conn.close(); return False, f"{s_[:7]} davri yopilgan — qaytarishni bekor qilib bo'lmaydi (/och {s_[:7]})"
+        d = json.loads(r[1] or '{}'); rid = d.get('rid')
+        c.execute("UPDATE op_log SET reversed=1 WHERE id=? AND reversed=0", (op_id,))
+        if c.rowcount != 1: raise ValueError("Topilmadi yoki allaqachon qaytarilgan")
+        for bid in d.get('brak_ids', []):
+            c.execute("SELECT status FROM brak_tovarlar WHERE id=?", (bid,))
+            b = c.fetchone()
+            if b and b[0] != 'brak': raise ValueError("Brak tovar holati o'zgargan (tuzatilgan/zavodga) — bekor qilib bo'lmaydi")
+            c.execute("UPDATE brak_tovarlar SET status='bekor', updated=? WHERE id=?", (_hm(), bid))
+        for mv in reversed(d.get('moves', [])):
+            c.execute("SELECT product_id, qty, unit_cost FROM stock_moves WHERE id=?", (mv['id'],))
+            m = c.fetchone()
+            if not m: continue
+            pid, qty, uc = m
+            if mv['tur'] == 'yaxshi' and qty > 0:
+                c.execute('SELECT COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+                q0, c0 = c.fetchone(); q1 = q0 - qty
+                nc = round((max(0, q0) * c0 - qty * (uc or 0)) / q1, 2) if q1 > 0 else c0
+                res = stock_move(c, pid, -qty, 'tuzatish', f"bekor: qaytarish #R{rid}", f'r{rid}u', unit_cost=uc,
+                                 new_cost=(nc if nc > 0 else c0))
+            else:
+                res = stock_move(c, pid, -qty, 'tuzatish', f"bekor: qaytarish #R{rid}", f'r{rid}u', unit_cost=uc, allow_negative=qty < 0)
+            if res is None: raise ValueError("Astatka yetmaydi — qaytgan tovar allaqachon sotilgan")
+        for sid_ in d.get('sale_rows', []):
+            c.execute("UPDATE sales SET reversed=1 WHERE id=?", (sid_,))
+        for eid in d.get('expense_ids', []):
+            c.execute("UPDATE expenses SET reversed=1 WHERE id=?", (eid,))
+        for w in d.get('warranty', []):
+            c.execute("UPDATE warranties SET status=? WHERE id=?", (w['old'], w['id']))
+        for s in d.get('serials', []):
+            c.execute("SELECT status, sale_id FROM serials WHERE id=?", (s['id'],))
+            cur = c.fetchone()
+            if not cur or cur[0] not in ('omborda', 'brak') or cur[1]:
+                raise ValueError("Qaytgan serial qayta sotilgan — bekor qilib bo'lmaydi")
+            o = s['old']
+            c.execute("UPDATE serials SET status=?, sale_id=?, sold_date=?, customer=?, customer_id=?, warranty_end=? WHERE id=?",
+                      (o[0], o[1], o[2], o[3], o[4], o[5], s['id']))
+            _serial_log(c, s['id'], 'qaytarish bekor', f'#R{rid}')
+        for db_ in d.get('debts', []):
+            c.execute("UPDATE debts SET amount=ROUND(amount+?,2), paid=0, note=COALESCE(note,'') || ? WHERE id=?",
+                      (db_['part'], f" | bekor #R{rid}", db_['id']))
+        if d.get('cash_sum'):
+            now = datetime.now()
+            c.execute("INSERT INTO cash_box (date,time,type,amount,category,note,payment_method) VALUES (?,?,?,?,?,?,?)",
+                      (now.strftime('%Y-%m-%d'), now.strftime('%H:%M'), 'kirim', d['cash_sum'], 'qaytarish',
+                       f"qaytarish bekor (#R{rid})", d.get('method') or 'naqd'))
+        c.execute("UPDATE returns SET status='bekor' WHERE id=?", (rid,))
+        c.execute("SELECT DISTINCT COALESCE(customer_id,0) FROM sales WHERE id IN (%s)" % ",".join("?" * len(d.get('sale_rows') or [0])),
+                  d.get('sale_rows') or [0])
+        cids = [x[0] for x in c.fetchall() if x[0]]
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return False, str(e)
+    except Exception:
+        conn.rollback(); conn.close()
+        raise
+    conn.close()
+    for cid in cids:
+        try: yangila_jami(cid)
+        except Exception: pass
+    return True, "qaytarildi"
+
+
+def qaytarish_sorov(plan, user):
+    """Sotuvchi: so'rov yaratadi (hech narsa o'zgarmaydi). Egasi/admin tasdiqlasa — qaytarish_bajar(return_id=...)."""
+    R = qaytarish_hisob(plan)
+    if not R['ok']: return R
+    if is_closed(today()): return {'ok': False, 'error': f"{today()[:7]} davri yopilgan"}
+    first = R['lines'][0]['sale']
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO returns (created,date,customer,customer_id,reason,note,total,refund_cash,refund_debt,brak,status,"
+              "requested_by,requested_name,plan) VALUES (?,?,?,?,?,?,?,?,?,?,'kutilmoqda',?,?,?)",
+              (_hm(), today(), first['customer'], first['customer_id'], _sabab_matn(plan), (plan.get('note') or '')[:300],
+               R['jami'], R['naqd_qaytar'], R['qarzdan'], 1 if plan.get('brak') else 0, int(user[0] or 0), user[1] or '',
+               json.dumps(plan, ensure_ascii=False)))
+    rid = c.lastrowid; conn.commit(); conn.close()
+    R['rid'] = rid
+    return R
+
+
+def qaytarish_rad(rid, user):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE returns SET status='rad', approved_by=?, approved_name=? WHERE id=? AND status='kutilmoqda'",
+              (int(user[0] or 0), user[1] or '', int(rid)))
+    n = c.rowcount; conn.commit(); conn.close()
+    return n == 1
+
+
+def brak_holat(bid, yangi, user=None):
+    """Brak tovar: 'tuzatildi' — sotuvga qaytadi (astatka +, spisanie xarajati bekor); 'zavodga' — faqat holat."""
+    if yangi not in ('tuzatildi', 'zavodga'): return {'ok': False, 'error': "Holat noma'lum"}
+    if is_closed(today()): return {'ok': False, 'error': f"{today()[:7]} davri yopilgan"}
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("SELECT product_id, product, qty, unit_cost, expense_id, serials, status FROM brak_tovarlar WHERE id=?", (bid,))
+        r = c.fetchone()
+        if not r or r[6] != 'brak': conn.close(); return {'ok': False, 'error': "Topilmadi yoki allaqachon ko'rib chiqilgan"}
+        pid, nom, n, uc, eid, sers, _ = r
+        sers = [int(x) for x in (sers or '').split(',') if x.strip().isdigit()]
+        if yangi == 'tuzatildi':
+            if eid:
+                c.execute("SELECT date FROM expenses WHERE id=?", (eid,)); e = c.fetchone()
+                if e and is_closed(e[0]):
+                    conn.close(); return {'ok': False, 'error': f"Xarajat {e[0][:7]} davrida (yopilgan) — 📦 Ombor → Kirim orqali qo'shing"}
+                c.execute("UPDATE expenses SET reversed=1 WHERE id=?", (eid,))
+            c.execute('SELECT COALESCE(qty,0), COALESCE(cost,0) FROM products WHERE id=?', (pid,))
+            q0, c0 = c.fetchone(); baza = max(0, q0)
+            nc = round((baza * c0 + n * uc) / (baza + n), 2) if baza + n > 0 else uc
+            stock_move(c, pid, n, 'kirim', f"brak tuzatildi #B{bid}", f'b{bid}', user, uc, nc)
+            for sr in sers:
+                c.execute("UPDATE serials SET status='omborda' WHERE id=? AND status='brak'", (sr,))
+                _serial_log(c, sr, 'brak tuzatildi', f'#B{bid}', '', user)
+        else:
+            for sr in sers:
+                c.execute("UPDATE serials SET status='chiqarildi' WHERE id=? AND status='brak'", (sr,))
+                _serial_log(c, sr, 'zavodga qaytarildi', f'#B{bid}', '', user)
+        c.execute("UPDATE brak_tovarlar SET status=?, updated=? WHERE id=?", (yangi, _hm(), bid))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'nom': nom, 'qty': n}
+
+
+# ── 📥 Qaytarish: chek, ro'yxatlar va tugmali oyna (prefiks 'qr:') ─────────────────────
+def qaytarish_chek(rid, rate=None):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT created,customer,reason,method,total,refund_cash,refund_debt,brak,status,approved_name,requested_name,plan "
+              "FROM returns WHERE id=?", (rid,))
+    r = c.fetchone()
+    if not r: conn.close(); return "Qaytarish topilmadi"
+    c.execute("SELECT sale_id, product, qty, revenue, serials FROM return_lines WHERE return_id=? ORDER BY id", (rid,))
+    lines = c.fetchall(); conn.close()
+    rate = rate or get_exchange_rate()
+    st = r[8]
+    sar = {'ok': "🧾 QAYTARISH CHEKI", 'kutilmoqda': "⏳ QAYTARISH SO'ROVI", 'rad': "🚫 RAD ETILGAN SO'ROV",
+           'bekor': "↩️ BEKOR QILINGAN QAYTARISH"}.get(st, "🧾 QAYTARISH")
+    out = [f"{sar} №R-{rid}", r[0] or '']
+    if r[1]: out.append(f"Mijoz: {r[1]}")
+    if not lines:                                         # so'rov — reja bo'yicha
+        R = qaytarish_hisob(json.loads(r[11] or '{}'))
+        if R.get('ok'):
+            lines = [(L['sid'], L['sale']['product'], L['qty'], L['rev'], ", ".join(L['serial_txt'])) for L in R['lines']]
+    sids = sorted({x[0] for x in lines})
+    if sids: out.append("Asl sotuv: " + ", ".join(f"#{s}" for s in sids))
+    out.append("──────────────")
+    for n, (sid, nom, q, rev, ser) in enumerate(lines, 1):
+        out.append(f"{n}. {nom} × {q} = {_usd2(rev)}" + (f"\n   SN: {ser}" if ser else ""))
+    out.append("──────────────")
+    out.append(f"JAMI QAYTARISH: {_usd2(r[4] or 0)} ≈ {_som(r[4] or 0, rate)}")
+    if (r[5] or 0) > 0: out.append(f"💵 Pul qaytariladi: {_usd2(r[5])} ({POS_USUL_NOMI.get(r[3], r[3] or 'naqd')})")
+    if (r[6] or 0) > 0: out.append(f"📝 Mijoz qarzidan ayiriladi: {_usd2(r[6])}")
+    out.append(f"Sabab: {r[2]}")
+    out.append("Holati: " + ("🔧 brak — hisobdan chiqarildi" if r[7] else "📦 omborga qaytdi (sotuvga yaroqli)"))
+    if r[10]: out.append(f"So'radi: {r[10]}")
+    if r[9] and st != 'kutilmoqda': out.append(f"{'Rad etdi' if st == 'rad' else 'Tasdiqladi'}: {r[9]}")
+    if st == 'ok': out.append("Xato bo'lsa: /undo")
+    return "\n".join(out)
+
+
+_QR_COLS = "id,date,time,product,qty,revenue,COALESCE(customer,''),COALESCE(customer_id,0),COALESCE(seller_id,0),COALESCE(seller_name,'')"
+
+
+def _sot_guruhla(rows):
+    """rows id DESC. Ketma-ket id + bir xil sana/vaqt/sotuvchi/mijoz → bitta chek (№S-<birinchi id>)."""
+    gs = []
+    for r in rows:
+        key = (r[1], r[2], r[8], r[7], r[6])
+        if gs and gs[-1]['key'] == key and gs[-1]['ids'][-1] - r[0] == 1:
+            gs[-1]['ids'].append(r[0]); gs[-1]['rows'].append(r)
+        else:
+            gs.append({'key': key, 'ids': [r[0]], 'rows': [r]})
+    for g in gs:
+        g['ids'].reverse(); g['rows'].reverse(); g['first'] = g['ids'][0]
+    return gs
+
+
+def _qaytgan_map(c, ids):
+    if not ids: return {}
+    out = {}
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        c.execute(f"SELECT return_of, SUM(-qty) FROM sales WHERE reversed=0 AND return_of IN ({','.join('?' * len(part))}) "
+                  "GROUP BY return_of", part)
+        out.update({a: int(b or 0) for a, b in c.fetchall()})
+    return out
+
+
+def sotuv_guruhlari(seller_id=None, customer_id=None, limit=8, offset=0, kun=90):
+    since = (datetime.now() - timedelta(days=kun)).strftime('%Y-%m-%d')
+    sql = f"SELECT {_QR_COLS} FROM sales WHERE reversed=0 AND COALESCE(return_of,0)=0 AND qty>0 AND date>=?"
+    args = [since]
+    if seller_id: sql += " AND seller_id=?"; args.append(int(seller_id))
+    if customer_id: sql += " AND customer_id=?"; args.append(int(customer_id))
+    conn = db(); c = conn.cursor()
+    c.execute(sql + " ORDER BY id DESC LIMIT 800", args)
+    rows = c.fetchall()
+    qm = _qaytgan_map(c, [r[0] for r in rows]); conn.close()
+    gs = [g for g in _sot_guruhla(rows) if any(r[4] - qm.get(r[0], 0) > 0 for r in g['rows'])]
+    for g in gs:
+        g['qoldi'] = {r[0]: r[4] - qm.get(r[0], 0) for r in g['rows']}
+    return gs[offset:offset + limit], len(gs)
+
+
+def sotuv_guruhi(sid):
+    """Sotuv id → shu sotuv kirgan chek (guruh) yoki None."""
+    conn = db(); c = conn.cursor()
+    c.execute(f"SELECT {_QR_COLS} FROM sales WHERE id=? AND reversed=0 AND COALESCE(return_of,0)=0 AND qty>0", (int(sid),))
+    t = c.fetchone()
+    if not t: conn.close(); return None
+    c.execute(f"SELECT {_QR_COLS} FROM sales WHERE reversed=0 AND COALESCE(return_of,0)=0 AND qty>0 AND date=? AND time=? "
+              "AND COALESCE(seller_id,0)=? AND COALESCE(customer_id,0)=? AND COALESCE(customer,'')=? AND id BETWEEN ? AND ? "
+              "ORDER BY id DESC", (t[1], t[2], t[8], t[7], t[6], t[0] - 80, t[0] + 80))
+    rows = c.fetchall()
+    qm = _qaytgan_map(c, [r[0] for r in rows]); conn.close()
+    g = next((g for g in _sot_guruhla(rows) if sid in g['ids']), None)
+    if g: g['qoldi'] = {r[0]: r[4] - qm.get(r[0], 0) for r in g['rows']}
+    return g
+
+
+def _qr_serials(sid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, serial FROM serials WHERE sale_id=? AND status='sotilgan' ORDER BY id", (int(sid),))
+    r = c.fetchall(); conn.close(); return r
+
+
+def _qr_rol(u):
+    if can(u, 'qaytarish'): return 'bajar'
+    if can(u, 'qaytarish_sorov'): return 'sorov'
+    return None
+
+
+def _qr_kutilmoqda_soni():
+    try:
+        conn = db(); n = conn.execute("SELECT COUNT(*) FROM returns WHERE status='kutilmoqda'").fetchone()[0]; conn.close()
+        return n
+    except sqlite3.OperationalError:
+        return 0
+
+
+def _qr_menu(u):
+    rows = [[_btn("🕘 Oxirgi sotuvlar", "qr:la:0"), _btn("👤 Mijoz bo'yicha", "qr:cs")],
+            [_btn("🔎 Chek № / serial", "qr:fd")]]
+    if can(u, 'qaytarish'):
+        rows.append([_btn(f"⏳ So'rovlar ({_qr_kutilmoqda_soni()})", "qr:rq"), _btn("📜 Tarix", "qr:hs:0")])
+        rows.append([_btn("🔧 Brak tovarlar", "qr:br")])
+    rows.append(_x_btn('qr'))
+    m = ("📥 QAYTARISH\n\nMijoz tovarni qaytardimi? Avval sotuvni toping:\n"
+         "• Oxirgi sotuvlar ro'yxatidan\n• Mijoz ismi bo'yicha\n• Chek raqami (S-123) yoki serial raqam bo'yicha")
+    if _qr_rol(u) == 'sorov':
+        m += "\n\nℹ️ Siz so'rov yuborasiz — egasi/admin tasdiqlagach pul va astatka o'zgaradi."
+    return m, rows
+
+
+def _qr_guruh_btn(g):
+    d = g['rows'][0]
+    jami = sum(r[5] for r in g['rows'])
+    return _btn(f"S-{g['first']} · {d[1][8:10]}.{d[1][5:7]} {d[2]} · {(d[6] or 'mijozsiz')[:16]} · {_usd2(jami)}", f"qr:g:{g['first']}")
+
+
+def _qr_royxat(u, page=0, cid=None):
+    x = xodim(u) or {}
+    gs, n = sotuv_guruhlari(seller_id=(x.get('id') if _qr_rol(u) == 'sorov' else None), customer_id=cid,
+                            limit=8, offset=page * 8)
+    sar = "👤 Mijoz sotuvlari" if cid else "🕘 Oxirgi sotuvlar (90 kun)"
+    if not gs:
+        return f"{sar}: qaytariladigan sotuv topilmadi.", [[_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr')]
+    rows = [[_qr_guruh_btn(g)] for g in gs]
+    nav = []
+    cb = (lambda p: f"qr:cu:{cid}:{p}") if cid else (lambda p: f"qr:la:{p}")
+    if page > 0: nav.append(_btn("◀️", cb(page - 1)))
+    if (page + 1) * 8 < n: nav.append(_btn("▶️", cb(page + 1)))
+    if nav: rows.append(nav)
+    rows.append([_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr'))
+    return f"{sar} — chekni tanlang ({n} ta):", rows
+
+
+def _qr_chek_ekran(st):
+    g = sotuv_guruhi(st['g'])
+    if not g: return "Bu sotuv topilmadi yoki bekor qilingan.", [[_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr')]
+    d = g['rows'][0]
+    st['ids'] = list(g['ids'])
+    m = [f"🧾 CHEK №S-{g['first']} · {d[1]} {d[2]}", f"Mijoz: {d[6] or '—'} · Sotuvchi: {d[9] or '—'}", ""]
+    rows = []
+    sel = st.setdefault('sel', {})
+    for i, r in enumerate(g['rows'], 1):
+        qoldi = g['qoldi'][r[0]]
+        tan = sel.get(r[0], 0)
+        m.append(f"{i}. {r[3]} × {r[4]} = {_usd2(r[5])}" + (f" (qaytgan: {r[4] - qoldi})" if qoldi < r[4] else ""))
+        if qoldi > 0:
+            rows.append([_btn(f"{'✅' if tan else '↩️'} {i}. {r[3][:22]} — {tan}/{qoldi}", f"qr:l:{r[0]}")])
+    m.append("\nQaytariladigan qatorni bosing va sonini tanlang.")
+    if any(sel.get(i, 0) for i in st['ids']):
+        rows.append([_btn(f"➡️ Davom etish ({sum(sel.get(i, 0) for i in st['ids'])} dona)", "qr:nx")])
+    rows.append([_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr'))
+    return "\n".join(m), rows
+
+
+def _qr_qator_ekran(st, sid):
+    g = sotuv_guruhi(st['g'])
+    if not g or sid not in g['ids']: return _qr_chek_ekran(st)
+    r = next(x for x in g['rows'] if x[0] == sid)
+    qoldi = g['qoldi'][sid]
+    sers = _qr_serials(sid)
+    if sers:
+        tan = st.setdefault('ser', {}).setdefault(sid, [])
+        rows = [[_btn(f"{'✅' if s_id in tan else '⬜'} {sn}", f"qr:sn:{sid}:{s_id}")] for s_id, sn in sers[:20]]
+        rows.append([_btn("✔ Tayyor", f"qr:g:{st['g']}")])
+        return f"🔢 {r[3]}: qaytariladigan serial raqam(lar)ni belgilang:", rows
+    m = f"↩️ {r[3]}\nSotilgan: {r[4]} ta · qaytarish mumkin: {qoldi} ta\nNechta qaytariladi?"
+    nums = [_btn(str(k), f"qr:lq:{sid}:{k}") for k in range(1, min(qoldi, 8) + 1)]
+    rows = [nums[i:i + 4] for i in range(0, len(nums), 4)]
+    if qoldi > 8: rows.append([_btn(f"Hammasi ({qoldi})", f"qr:lq:{sid}:{qoldi}")])
+    rows.append([_btn("0 — qaytarilmaydi", f"qr:lq:{sid}:0"), _btn("⬅️ Orqaga", f"qr:g:{st['g']}")])
+    return m, rows
+
+
+def _qr_plan(st):
+    return {'lines': [{'sale_id': sid, 'qty': n, 'serials': st.get('ser', {}).get(sid, [])}
+                      for sid, n in st.get('sel', {}).items() if n > 0 and sid in st.get('ids', [])],
+            'reason': st.get('reason') or 'boshqa', 'reason_text': st.get('reason_text') or '',
+            'brak': bool(st.get('brak')), 'method': st.get('method') or '', 'note': ''}
+
+
+def _qr_sabab_ekran():
+    rows = [[_btn(t, f"qr:rs:{k}")] for k, t in QAYTARISH_SABABLARI]
+    rows.append([_btn("⬅️ Orqaga", "qr:back")] + _x_btn('qr'))
+    return "❓ Qaytarish sababi:", rows
+
+
+def _qr_holat_ekran(st):
+    rows = [[_btn("📦 Sotuvga yaroqli — omborga", "qr:bk:0")], [_btn("🔧 Brak — hisobdan chiqarish", "qr:bk:1")],
+            [_btn("⬅️ Orqaga", "qr:nx")] + _x_btn('qr')]
+    return (f"Sabab: {_sabab_matn(_qr_plan(st))}\n\n📦 Tovar holati qanday?\n"
+            "• Yaroqli — omborga qaytadi, yana sotiladi\n• Brak — tannarxi xarajat (spisanie) bo'ladi, 🔧 Brak ro'yxatiga tushadi"), rows
+
+
+def _qr_usul_ekran(st, R):
+    cur = st.get('method') or R['asl_usul']
+    rows = [[_btn(("✅ " if k == cur else "") + t, f"qr:mt:{k}") for k, t in POS_USULLAR[i:i + 2] if k != 'nasiya']
+            for i in range(0, 6, 2)]
+    rows = [r for r in rows if r]
+    rows.append([_btn("➡️ Davom etish", "qr:ok0")])
+    rows.append([_btn("⬅️ Orqaga", "qr:rs:" + (st.get('reason') or 'boshqa'))] + _x_btn('qr'))
+    return f"💵 Mijozga {_usd2(R['naqd_qaytar'])} qaytariladi. Qaysi usulda?\n(Sotuvdagi usul: {POS_USUL_NOMI.get(R['asl_usul'])})", rows
+
+
+def _qr_tasdiq_ekran(u, st):
+    plan = _qr_plan(st)
+    R = qaytarish_hisob(plan)
+    if not R['ok']: return f"⚠️ {R['error']}", [[_btn("⬅️ Chekka qaytish", f"qr:g:{st['g']}")] + _x_btn('qr')]
+    rate = get_exchange_rate()
+    m = ["📥 QAYTARISHNI TASDIQLANG", ""]
+    for L in R['lines']:
+        m.append(f"• {L['sale']['product']} × {L['qty']} = {_usd2(L['rev'])}" + (f"\n   SN: {', '.join(L['serial_txt'])}" if L['serial_txt'] else ""))
+    m.append(f"\nJAMI: {_usd2(R['jami'])} ≈ {_som(R['jami'], rate)}")
+    if R['naqd_qaytar'] > 0:
+        m.append(f"💵 Kassadan qaytariladi: {_usd2(R['naqd_qaytar'])} ({POS_USUL_NOMI.get(plan['method'] or R['asl_usul'])})")
+    if R['qarzdan'] > 0: m.append(f"📝 Mijoz qarzidan ayiriladi: {_usd2(R['qarzdan'])}")
+    m.append(f"Sabab: {_sabab_matn(plan)}")
+    m.append("Holati: " + ("🔧 brak (hisobdan chiqariladi)" if plan['brak'] else "📦 omborga qaytadi"))
+    st['tok'] = secrets.token_hex(3)
+    if _qr_rol(u) == 'bajar':
+        rows = [[_btn("✅ Tasdiqlash — qaytarish", f"qr:ok:{st['tok']}")]]
+    else:
+        rows = [[_btn("📨 Tasdiqlashga yuborish", f"qr:ok:{st['tok']}")]]
+        m.append("\nℹ️ Egasi/admin tasdiqlagach bajariladi.")
+    rows.append([_btn("⬅️ Orqaga", "qr:bk:" + ('1' if plan['brak'] else '0'))] + _x_btn('qr'))
+    return "\n".join(m), rows
+
+
+def _qr_tasdiqchilar():
+    ids = [OWNER_ID] if OWNER_ID else []
+    try:
+        conn = db()
+        ids += [r[0] for r in conn.execute("SELECT telegram_id FROM users WHERE role='admin' AND active=1")]
+        conn.close()
+    except sqlite3.OperationalError:
+        pass
+    return list(dict.fromkeys(i for i in ids if i))
+
+
+async def _qr_sorov_yubor(bot, rid):
+    m = qaytarish_chek(rid)
+    kb = InlineKeyboardMarkup([[_btn("✅ Tasdiqlash", f"qr:ap:{rid}"), _btn("❌ Rad etish", f"qr:rj:{rid}")]])
+    for tid in _qr_tasdiqchilar():
+        try: await bot.send_message(chat_id=tid, text=m[:4000], reply_markup=kb)
+        except Exception as e: log.warning("qaytarish so'rovi yuborilmadi %s: %s", tid, e)
+
+
+def _qr_sorovlar():
+    conn = db()
+    rows = conn.execute("SELECT id, created, customer, total, requested_name FROM returns WHERE status='kutilmoqda' ORDER BY id DESC LIMIT 15").fetchall()
+    conn.close()
+    if not rows: return "⏳ Kutilayotgan so'rov yo'q.", [[_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr')]
+    m = ["⏳ KUTILAYOTGAN QAYTARISH SO'ROVLARI:"]
+    kb = []
+    for r in rows:
+        m.append(f"R-{r[0]} · {r[1]} · {r[2] or 'mijozsiz'} · {_usd2(r[3] or 0)} · {r[4]}")
+        kb.append([_btn(f"👁 R-{r[0]}", f"qr:v:{r[0]}"), _btn("✅", f"qr:ap:{r[0]}"), _btn("❌", f"qr:rj:{r[0]}")])
+    kb.append([_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr'))
+    return "\n".join(m), kb
+
+
+def _qr_tarix(page=0):
+    conn = db()
+    rows = conn.execute("SELECT id, created, customer, total, status FROM returns WHERE status<>'kutilmoqda' ORDER BY id DESC "
+                        "LIMIT 9 OFFSET ?", (page * 8,)).fetchall()
+    conn.close()
+    belgi = {'ok': '✅', 'rad': '🚫', 'bekor': '↩️'}
+    kb = [[_btn(f"{belgi.get(r[4], '•')} R-{r[0]} · {r[1][5:16]} · {(r[2] or 'mijozsiz')[:14]} · {_usd2(r[3] or 0)}", f"qr:v:{r[0]}")]
+          for r in rows[:8]]
+    nav = ([_btn("◀️", f"qr:hs:{page - 1}")] if page else []) + ([_btn("▶️", f"qr:hs:{page + 1}")] if len(rows) > 8 else [])
+    if nav: kb.append(nav)
+    kb.append([_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr'))
+    return ("📜 QAYTARISHLAR TARIXI" if rows else "📜 Hali qaytarish yo'q."), kb
+
+
+def _qr_brak():
+    conn = db()
+    rows = conn.execute("SELECT id, date, product, qty, unit_cost FROM brak_tovarlar WHERE status='brak' ORDER BY id DESC LIMIT 15").fetchall()
+    conn.close()
+    if not rows: return "🔧 Brak tovar yo'q.", [[_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr')]
+    m = ["🔧 BRAK TOVARLAR (hisobdan chiqarilgan):", "✅ Tuzatildi — omborga qaytadi (spisanie bekor)", "🏭 Zavodga — faqat belgi", ""]
+    kb = []
+    for r in rows:
+        m.append(f"B-{r[0]} · {r[1]} · {r[2]} × {r[3]} · {_usd2((r[4] or 0) * r[3])}")
+        kb.append([_btn(f"✅ B-{r[0]} tuzatildi", f"qr:bt:{r[0]}"), _btn(f"🏭 B-{r[0]} zavodga", f"qr:bz:{r[0]}")])
+    kb.append([_btn("⬅️ Orqaga", "qr:menu")] + _x_btn('qr'))
+    return "\n".join(m), kb
+
+
+async def cmd_qaytarish(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """📥 Qaytarish tugmasi / /qaytarish"""
+    if not _qr_rol(u):
+        if user_role(u): await u.message.reply_text("Qaytarish uchun ruxsat yo'q.")
+        return
+    _ui_yangi(ctx, 'qr')
+    m, r = _qr_menu(u)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+
+async def qr_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    rol = _qr_rol(u)
+    if not rol:
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    if act == 'x':
+        ctx.user_data.pop('qr', None); await q.answer()
+        return await _pos_chiqar(q, "📥 Qaytarish oynasi yopildi.", None)
+    # ── tasdiqlash / rad (holatsiz — xabardagi tugmalar) ──
+    if act in ('ap', 'rj', 'v', 'bt', 'bz', 'rq', 'hs', 'br') and rol != 'bajar':
+        await q.answer("Faqat egasi/admin", show_alert=True); return
+    if act in ('ap', 'rj'):
+        rid = int(arg[0]); user = _ui_user(u)
+        if not _ui_done(ctx, f"qr{act}{rid}"):
+            await q.answer("Allaqachon bajarilgan"); return
+        conn = db(); r = conn.execute("SELECT status, plan, requested_by FROM returns WHERE id=?", (rid,)).fetchone(); conn.close()
+        if not r or r[0] != 'kutilmoqda':
+            await q.answer("So'rov allaqachon ko'rib chiqilgan", show_alert=True)
+            return await _pos_chiqar(q, qaytarish_chek(rid), None)
+        if act == 'rj':
+            qaytarish_rad(rid, user); await q.answer("Rad etildi")
+            matn = qaytarish_chek(rid)
+        else:
+            res = qaytarish_bajar(json.loads(r[1] or '{}'), user, return_id=rid)
+            if not res['ok']:
+                ctx.user_data.get('ui_done', []).remove(f"qrap{rid}")
+                await q.answer(res['error'][:190], show_alert=True); return
+            await q.answer("✅ Bajarildi")
+            matn = qaytarish_chek(rid)
+        await _pos_chiqar(q, matn, None)
+        if r[2] and r[2] != _uid(u):
+            try: await ctx.bot.send_message(chat_id=r[2], text=matn[:4000])
+            except Exception as e: log.warning("so'rovchiga xabar: %s", e)
+        return
+    st = _ui_ol(ctx, 'qr')
+    if st is None:
+        st = _ui_yangi(ctx, 'qr')
+        if act not in ('menu', 'la', 'cs', 'fd', 'cu', 'g', 'rq', 'hs', 'br', 'v', 'sr'):
+            await q.answer("Oyna eskirgan — qaytadan boshlang", show_alert=True)
+            m, r_ = _qr_menu(u); return await _pos_chiqar(q, m, r_)
+    st['wait'] = None
+    m = rows = None; alert = None
+    if act == 'menu':
+        m, rows = _qr_menu(u)
+    elif act == 'la':
+        m, rows = _qr_royxat(u, int(arg[0]) if arg else 0)
+    elif act == 'cu':
+        m, rows = _qr_royxat(u, int(arg[1]) if len(arg) > 1 else 0, cid=int(arg[0]))
+    elif act == 'cs':
+        st['wait'] = 'cust'; m, rows = "👤 Mijoz ismi yoki telefonini yozing:", [[_btn("⬅️ Orqaga", "qr:menu")]]
+    elif act == 'fd':
+        st['wait'] = 'find'
+        m, rows = ("🔎 Chek raqami (masalan S-123) yoki serial raqamni yozing.\n📷 Shtrix-kod/QR rasmini ham yuborsangiz bo'ladi.",
+                   [[_btn("⬅️ Orqaga", "qr:menu")]])
+    elif act == 'g':
+        sid = int(arg[0])
+        if st.get('g') != sid:
+            st.update({'g': sid, 'sel': {}, 'ser': {}, 'reason': None, 'reason_text': '', 'brak': None, 'method': None})
+        m, rows = _qr_chek_ekran(st)
+    elif act == 'l':
+        m, rows = _qr_qator_ekran(st, int(arg[0]))
+    elif act == 'lq':
+        sid, n = int(arg[0]), int(arg[1])
+        st.setdefault('sel', {})[sid] = n
+        m, rows = _qr_chek_ekran(st)
+    elif act == 'sn':
+        sid, s_id = int(arg[0]), int(arg[1])
+        tan = st.setdefault('ser', {}).setdefault(sid, [])
+        if s_id in tan: tan.remove(s_id)
+        else: tan.append(s_id)
+        st.setdefault('sel', {})[sid] = len(tan)
+        m, rows = _qr_qator_ekran(st, sid)
+    elif act in ('nx', 'back'):
+        if act == 'back' or not any(st.get('sel', {}).get(i, 0) for i in st.get('ids', [])):
+            m, rows = _qr_chek_ekran(st) if st.get('g') else _qr_menu(u)
+        else:
+            m, rows = _qr_sabab_ekran()
+    elif act == 'rs':
+        k = arg[0] if arg else 'boshqa'
+        st['reason'] = k
+        if k == 'boshqa' and not st.get('reason_text'):
+            st['wait'] = 'reason'
+            m, rows = "✍️ Sababni qisqa yozing:", [[_btn("⬅️ Orqaga", "qr:nx")]]
+        else:
+            if k != 'boshqa': st['reason_text'] = ''
+            m, rows = _qr_holat_ekran(st)
+    elif act == 'bk':
+        st['brak'] = arg[0] == '1'
+        R = qaytarish_hisob(_qr_plan(st))
+        if R['ok'] and R['naqd_qaytar'] > 0:
+            m, rows = _qr_usul_ekran(st, R)
+        else:
+            m, rows = _qr_tasdiq_ekran(u, st)
+    elif act == 'mt':
+        st['method'] = arg[0] if arg and arg[0] in TOLOV_USULLARI else None
+        m, rows = _qr_tasdiq_ekran(u, st)
+    elif act == 'ok0':
+        m, rows = _qr_tasdiq_ekran(u, st)
+    elif act == 'ok':
+        if not arg or arg[0] != st.get('tok') or not _ui_done(ctx, 'qrok' + arg[0]):
+            await q.answer("Eskirgan tugma", show_alert=True); return
+        plan = _qr_plan(st); user = _ui_user(u)
+        if rol == 'bajar':
+            res = qaytarish_bajar(plan, user)
+            if not res['ok']:
+                await q.answer(); return await _pos_chiqar(q, f"❌ {res['error']}", [[_btn("⬅️ Chekka qaytish", f"qr:g:{st['g']}")] + _x_btn('qr')])
+            ctx.user_data.pop('qr', None)
+            await q.answer("✅ Qaytarildi")
+            return await _pos_chiqar(q, qaytarish_chek(res['rid']), [[_btn("📥 Yana qaytarish", "qr:menu")]])
+        res = qaytarish_sorov(plan, user)
+        if not res['ok']:
+            await q.answer(); return await _pos_chiqar(q, f"❌ {res['error']}", [[_btn("⬅️ Orqaga", f"qr:g:{st['g']}")]])
+        ctx.user_data.pop('qr', None)
+        await q.answer("📨 Yuborildi")
+        await _pos_chiqar(q, f"📨 So'rov R-{res['rid']} egasi/admin'ga yuborildi. Tasdiqlansa sizga xabar keladi.", None)
+        return await _qr_sorov_yubor(ctx.bot, res['rid'])
+    elif act == 'sr':                                         # 🔢 Serial kartasidan "📥 Qaytarish"
+        sr = serial_ol(int(arg[0])) if arg and arg[0].isdigit() else None
+        g = sotuv_guruhi(sr['sale_id']) if sr and sr['sale_id'] else None
+        if not g: alert = "Bu serialning faol sotuvi topilmadi"
+        else:
+            st.update({'g': g['first'], 'sel': {sr['sale_id']: 1}, 'ser': {sr['sale_id']: [sr['id']]}, 'reason': None,
+                       'reason_text': '', 'brak': None, 'method': None})
+            m, rows = _qr_chek_ekran(st)
+    elif act == 'rq':
+        m, rows = _qr_sorovlar()
+    elif act == 'hs':
+        m, rows = _qr_tarix(int(arg[0]) if arg else 0)
+    elif act == 'v':
+        m, rows = qaytarish_chek(int(arg[0])), [[_btn("⬅️ Orqaga", "qr:hs:0")] + _x_btn('qr')]
+    elif act == 'br':
+        m, rows = _qr_brak()
+    elif act in ('bt', 'bz'):
+        res = brak_holat(int(arg[0]), 'tuzatildi' if act == 'bt' else 'zavodga', _ui_user(u))
+        alert = (f"✅ {res['nom']} × {res['qty']} — " + ("omborga qaytdi" if act == 'bt' else "zavodga belgilandi")) if res['ok'] else res['error']
+        m, rows = _qr_brak()
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, rows)
+
+
+def _chek_raqam(msg):
+    mt = re.fullmatch(r'\s*(?:[sS][-\s]?|#|№\s*)?(\d{1,9})\s*', msg or '')
+    return int(mt.group(1)) if mt else None
+
+
+async def qr_matn(u, ctx, msg):
+    st = _ui_ol(ctx, 'qr')
+    if not st or not st.get('wait') or not _qr_rol(u): return False
+    w = st['wait']
+    if w == 'cust':
+        topildi = mijoz_qidir(msg)[:8]
+        if not topildi:
+            await u.message.reply_text("Mijoz topilmadi. Boshqacha yozib ko'ring:"); return True
+        st['wait'] = None
+        await u.message.reply_text("👤 Mijozni tanlang:", reply_markup=InlineKeyboardMarkup(
+            [[_btn(f"{c_['nom']}" + (f" · {c_['tel']}" if c_['tel'] else ''), f"qr:cu:{c_['id']}:0")] for c_ in topildi]
+            + [[_btn("⬅️ Orqaga", "qr:menu")]]))
+        return True
+    if w == 'find':
+        return await qr_kod_top(u, ctx, msg)
+    if w == 'reason':
+        st['reason_text'] = (msg or '').strip()[:150]; st['wait'] = None
+        m, rows = _qr_holat_ekran(st)
+        await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(rows)); return True
+    return False
+
+
+async def qr_kod_top(u, ctx, msg):
+    """Chek raqami / serial / shtrix-kod → sotuv cheki oynasi."""
+    st = _ui_ol(ctx, 'qr') or _ui_yangi(ctx, 'qr')
+    sid = None
+    sr = serial_top(msg)
+    if sr and sr['sale_id']: sid = sr['sale_id']
+    elif sr:
+        await u.message.reply_text(f"🔢 {sr['serial']} — {SERIAL_HOLAT.get(sr['status'], sr['status'])}, sotilmagan. Boshqa raqam yozing:")
+        return True
+    else:
+        sid = _chek_raqam(msg)
+    g = sotuv_guruhi(sid) if sid else None
+    if not g:
+        await u.message.reply_text("Bunday sotuv topilmadi (yoki to'liq qaytarilgan/bekor qilingan). Qayta yozing yoki ⬅️ Orqaga:",
+                                   reply_markup=InlineKeyboardMarkup([[_btn("⬅️ Orqaga", "qr:menu")]]))
+        return True
+    st.update({'wait': None, 'g': g['first'], 'sel': {}, 'ser': {}, 'reason': None, 'reason_text': '', 'brak': None, 'method': None})
+    if sr and sr['sale_id']:
+        st['sel'][sr['sale_id']] = 1; st['ser'][sr['sale_id']] = [sr['id']]
+    m, rows = _qr_chek_ekran(st)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(rows))
+    return True
+
+
+# ── 🧾 SMENA / KASSA YOPISH (Z-hisobot) ──────────────────────────────────────────────
+# Do'kon bo'yicha BITTA ochiq smena. Kutilgan naqd = ochilishdagi naqd + smena davomidagi kassa (naqd) harakati
+# (cash_box id oralig'i bo'yicha — vaqt bir xil daqiqada bo'lsa ham adashmaydi). Karta — alohida.
+_SM_COLS = ("id,user_id,user_name,opened_at,opening_cash,closed_at,closed_by,closed_name,expected_naqd,expected_karta,"
+            "counted_naqd,counted_karta,diff_naqd,diff_karta,boshqa,status,note,booking,booking_ref,booked_by")
+
+
+def _sm_dict(r):
+    if not r: return None
+    d = dict(zip(_SM_COLS.split(','), r))
+    try: d['meta'] = json.loads(d['boshqa'] or '{}')
+    except ValueError: d['meta'] = {}
+    return d
+
+
+def smena_ol(sid):
+    conn = db(); r = conn.execute(f"SELECT {_SM_COLS} FROM smenalar WHERE id=?", (int(sid),)).fetchone(); conn.close()
+    return _sm_dict(r)
+
+
+def smena_ochiq():
+    conn = db(); r = conn.execute(f"SELECT {_SM_COLS} FROM smenalar WHERE status='ochiq' ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return _sm_dict(r)
+
+
+def smena_och(user, opening=0.0):
+    try: opening = round(float(opening or 0), 2)
+    except (TypeError, ValueError): return {'ok': False, 'error': "Summa noto'g'ri"}
+    if opening < 0: return {'ok': False, 'error': "Summa manfiy bo'lmasin"}
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT id, user_name FROM smenalar WHERE status='ochiq' LIMIT 1")
+        r = c.fetchone()
+        if r: conn.rollback(); conn.close(); return {'ok': False, 'error': f"Smena allaqachon ochiq (#{r[0]}, {r[1]})"}
+        c.execute("SELECT COALESCE(MAX(id),0) FROM cash_box"); cf = c.fetchone()[0]
+        c.execute("INSERT INTO smenalar (user_id,user_name,opened_at,opening_cash,boshqa,status) VALUES (?,?,?,?,?,'ochiq')",
+                  (int(user[0] or 0), user[1] or '', _hm(), opening, json.dumps({'cash_from': cf})))
+        sid = c.lastrowid; conn.commit()
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
+    return {'ok': True, 'id': sid, 'opening': opening}
+
+
+def smena_kutilgan(sm, cash_to=None):
+    """{'naqd': kutilgan naqd, 'karta':..., 'usullar': {usul: (kirim, chiqim)}, 'cash_to': id}"""
+    cf = int(sm['meta'].get('cash_from', 0))
+    conn = db(); c = conn.cursor()
+    if cash_to is None:
+        c.execute("SELECT COALESCE(MAX(id),0) FROM cash_box"); cash_to = c.fetchone()[0]
+    c.execute("SELECT COALESCE(NULLIF(payment_method,''),'naqd'), SUM(CASE WHEN type='kirim' THEN amount ELSE 0 END), "
+              "SUM(CASE WHEN type='chiqim' THEN amount ELSE 0 END), COUNT(*) FROM cash_box WHERE id>? AND id<=? GROUP BY 1",
+              (cf, cash_to))
+    us = {r[0]: (round(r[1] or 0, 2), round(r[2] or 0, 2), r[3]) for r in c.fetchall()}
+    c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM cash_box WHERE id>? AND id<=? AND type='kirim' AND category='sotuv'",
+              (cf, cash_to))
+    sn, ss = c.fetchone(); conn.close()
+    net = lambda k: round(us.get(k, (0, 0, 0))[0] - us.get(k, (0, 0, 0))[1], 2)
+    return {'naqd': round((sm['opening_cash'] or 0) + net('naqd'), 2), 'karta': net('karta'), 'usullar': us,
+            'cash_to': cash_to, 'sotuv_soni': sn, 'sotuv_summa': round(ss or 0, 2)}
+
+
+def smena_yop(sid, user, counted_naqd, counted_karta=None, note=''):
+    """Atomar: faqat 'ochiq' smena yopiladi (ikki marta yopib bo'lmaydi)."""
+    sm = smena_ol(sid)
+    if not sm: return {'ok': False, 'error': "Smena topilmadi"}
+    if sm['status'] != 'ochiq': return {'ok': False, 'error': "Bu smena allaqachon yopilgan"}
+    k = smena_kutilgan(sm)
+    dn = round(float(counted_naqd) - k['naqd'], 2)
+    dk = round(float(counted_karta) - k['karta'], 2) if counted_karta is not None else 0.0
+    meta = dict(sm['meta']); meta.update({'cash_to': k['cash_to'], 'sotuv_soni': k['sotuv_soni'], 'sotuv_summa': k['sotuv_summa'],
+                                          'usullar': {a: list(b) for a, b in k['usullar'].items()}})
+    booking = 'teng' if abs(dn) < 0.01 and abs(dk) < 0.01 else ''
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE smenalar SET status='yopilgan', closed_at=?, closed_by=?, closed_name=?, expected_naqd=?, expected_karta=?, "
+              "counted_naqd=?, counted_karta=?, diff_naqd=?, diff_karta=?, boshqa=?, note=?, booking=? WHERE id=? AND status='ochiq'",
+              (_hm(), int(user[0] or 0), user[1] or '', k['naqd'], k['karta'], round(float(counted_naqd), 2),
+               None if counted_karta is None else round(float(counted_karta), 2), dn, dk, json.dumps(meta), (note or '')[:300],
+               booking, int(sid)))
+    n = c.rowcount; conn.commit(); conn.close()
+    if n != 1: return {'ok': False, 'error': "Bu smena allaqachon yopilgan"}
+    return {'ok': True, 'sm': smena_ol(sid)}
+
+
+def smena_hisobla(sid, tanlov, user):
+    """Egasi: farqni qanday yozish. tanlov: 'kassa' — kamomad → xarajat (kassadan chiqim) / ortiqcha → kassaga kirim;
+    'izoh' — faqat belgi. Atomar: bir marta."""
+    if tanlov not in ('kassa', 'izoh'): return {'ok': False, 'error': "Tanlov noma'lum"}
+    if tanlov == 'kassa' and is_closed(today()):
+        return {'ok': False, 'error': f"{today()[:7]} davri yopilgan"}
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE smenalar SET booking='jarayonda', booked_by=? WHERE id=? AND status='yopilgan' AND COALESCE(booking,'')=''",
+              (user[1] or '', int(sid)))
+    n = c.rowcount; conn.commit(); conn.close()
+    if n != 1: return {'ok': False, 'error': "Allaqachon hal qilingan"}
+    sm = smena_ol(sid); d = round(sm['diff_naqd'] or 0, 2); ref = ''
+    try:
+        if tanlov == 'kassa' and d < 0:
+            eid = add_expense(abs(d), 'kassa_kamomad', 'period', f"Smena #{sid} kamomad ({sm['closed_name']})", cash=True)
+            ref = f"x{eid}"; bk = 'xarajat'
+        elif tanlov == 'kassa' and d > 0:
+            add_cash(d, 'kirim', 'kassa_ortiqcha', f"Smena #{sid} ortiqcha ({sm['closed_name']})", 'naqd'); bk = 'kirim'
+        else:
+            bk = 'izoh'
+    except Exception:
+        conn = db(); conn.execute("UPDATE smenalar SET booking='' WHERE id=?", (int(sid),)); conn.commit(); conn.close()
+        raise
+    conn = db(); conn.execute("UPDATE smenalar SET booking=?, booking_ref=? WHERE id=?", (bk, ref, int(sid))); conn.commit(); conn.close()
+    return {'ok': True, 'booking': bk, 'summa': d}
+
+
+def _farq_matn(d):
+    if abs(d or 0) < 0.01: return "✅ teng"
+    return f"🔻 kamomad {_usd2(abs(d))}" if d < 0 else f"🔺 ortiqcha {_usd2(d)}"
+
+
+def smena_matn(sm, rate=None):
+    rate = rate or get_exchange_rate()
+    m = [f"🧾 SMENA #{sm['id']} — {'🟢 ochiq' if sm['status'] == 'ochiq' else '🔒 yopilgan'}",
+         f"Ochdi: {sm['user_name']} · {sm['opened_at']}", f"Ochilishdagi naqd: {_usd2(sm['opening_cash'] or 0)}"]
+    if sm['status'] != 'ochiq':
+        mt = sm['meta']
+        m.append(f"Yopdi: {sm['closed_name']} · {sm['closed_at']}")
+        m.append(f"Sotuvlar: {mt.get('sotuv_soni', 0)} ta · {_usd2(mt.get('sotuv_summa', 0))} (kassaga tushgan)")
+        m.append("")
+        m.append(f"💵 Naqd: kutilgan {_usd2(sm['expected_naqd'])} · sanalgan {_usd2(sm['counted_naqd'] or 0)} → {_farq_matn(sm['diff_naqd'])}")
+        if abs(sm['diff_naqd'] or 0) >= 0.01: m.append(f"   ≈ {_som(abs(sm['diff_naqd']), rate)}")
+        if sm['counted_karta'] is not None:
+            m.append(f"💳 Karta: kutilgan {_usd2(sm['expected_karta'])} · terminal {_usd2(sm['counted_karta'])} → {_farq_matn(sm['diff_karta'])}")
+        boshqa = {k: v for k, v in (mt.get('usullar') or {}).items() if k not in ('naqd', 'karta')}
+        for k, v in boshqa.items():
+            m.append(f"{POS_USUL_NOMI.get(k, k)}: +{_usd2(v[0])} / −{_usd2(v[1])}")
+        if sm['note']: m.append(f"📝 {sm['note']}")
+        bk = {'teng': '', 'xarajat': "📕 Kamomad xarajat sifatida yozildi", 'kirim': "📗 Ortiqcha kassaga kirim qilindi",
+              'izoh': "📝 Faqat qayd etildi (kassaga yozilmadi)", '': "⏳ Egasi qarorini kutmoqda", 'jarayonda': '⏳'}.get(sm['booking'] or '', '')
+        if bk: m.append(bk)
+    return "\n".join(m)
+
+
+def _sm_egasi_kb(sm):
+    if sm['booking'] or abs(sm['diff_naqd'] or 0) < 0.01: return None
+    t = "📕 Xarajat qilib yozish" if sm['diff_naqd'] < 0 else "📗 Kassaga kirim qilish"
+    return [[_btn(t, f"sm:bk:{sm['id']}:kassa")], [_btn("📝 Faqat qayd (kassaga tegmasin)", f"sm:bk:{sm['id']}:izoh")]]
+
+
+def _sm_menu(u):
+    sm = smena_ochiq(); rows = []
+    if sm:
+        m = [smena_matn(sm)]
+        if can(u, 'boshqaruv'):                        # sotuvchi "ko'r" sanaydi — kutilgan summani ko'rmaydi
+            k = smena_kutilgan(sm)
+            m.append(f"\nHozir kutilmoqda: 💵 {_usd2(k['naqd'])} · 💳 {_usd2(k['karta'])}")
+            m.append(f"Sotuvlar: {k['sotuv_soni']} ta · {_usd2(k['sotuv_summa'])}")
+        rows.append([_btn("🔒 Smenani yopish (kassani sanash)", "sm:cl")])
+    else:
+        m = ["🧾 SMENA\n\nHozir ochiq smena yo'q.", "Kun boshida oching (kassadagi boshlang'ich naqdni yozing)."]
+        rows.append([_btn("🔓 Smena ochish", "sm:op")])
+    rows.append([_btn("📋 Kunlik hisobot", "sm:rp:0"), _btn("📅 7 kun", "sm:rp:7")])
+    rows.append(_x_btn('sm'))
+    return "\n".join(m), rows
+
+
+def _sm_hisobot(kun):
+    if kun == 0: since, sar = today(), "BUGUN"
+    elif kun == 1: since, sar = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'), "KECHA VA BUGUN"
+    else: since, sar = (datetime.now() - timedelta(days=kun - 1)).strftime('%Y-%m-%d'), f"OXIRGI {kun} KUN"
+    conn = db()
+    rows = conn.execute(f"SELECT {_SM_COLS} FROM smenalar WHERE status='yopilgan' AND substr(closed_at,1,10)>=? ORDER BY id DESC",
+                        (since,)).fetchall()
+    conn.close()
+    sms = [_sm_dict(r) for r in rows]
+    m = [f"📋 KASSA YOPILISHLARI — {sar}"]
+    if not sms: m.append("\nYopilgan smena yo'q.")
+    kb = []
+    for s in sms[:15]:
+        m.append(f"\n#{s['id']} · {s['closed_at'][5:]} · {s['closed_name']}\n   💵 {_usd2(s['counted_naqd'] or 0)} → {_farq_matn(s['diff_naqd'])}")
+        kb.append([_btn(f"👁 #{s['id']} · {s['closed_at'][5:]} · {_farq_matn(s['diff_naqd'])}", f"sm:v:{s['id']}")])
+    if sms:
+        m.append(f"\nJami farq (naqd): {_farq_matn(round(sum(s['diff_naqd'] or 0 for s in sms), 2))}")
+    kb.append([_btn("Bugun", "sm:rp:0"), _btn("Kecha", "sm:rp:1"), _btn("7 kun", "sm:rp:7"), _btn("30 kun", "sm:rp:30")])
+    kb.append([_btn("⬅️ Orqaga", "sm:menu")] + _x_btn('sm'))
+    return "\n".join(m), kb
+
+
+async def cmd_smena(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🧾 Smena tugmasi / /smena"""
+    if not can(u, 'smena'): return
+    _ui_yangi(ctx, 'sm')
+    m, r = _sm_menu(u)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+
+def _sm_tasdiq_ekran(u, st):
+    sm = smena_ochiq()
+    if not sm: return "Ochiq smena yo'q.", [[_btn("⬅️ Orqaga", "sm:menu")]]
+    k = smena_kutilgan(sm)
+    dn = round(st['naqd'] - k['naqd'], 2)
+    m = [f"🔒 SMENA #{sm['id']} YOPILADI", "", f"💵 Sanalgan naqd: {_usd2(st['naqd'])} ≈ {_som(st['naqd'])}"]
+    if st.get('karta') is not None: m.append(f"💳 Terminal (karta): {_usd2(st['karta'])}")
+    if can(u, 'boshqaruv'):
+        m.append(f"Kutilgan naqd: {_usd2(k['naqd'])} → {_farq_matn(dn)}")
+    if st.get('note'): m.append(f"📝 {st['note']}")
+    m.append("\nTasdiqlaysizmi?")
+    st['tok'] = secrets.token_hex(3)
+    return "\n".join(m), [[_btn("✅ Yopish", f"sm:cf:{st['tok']}")], [_btn("📝 Izoh qo'shish", "sm:nt"), _btn("✏️ Qayta sanash", "sm:cl")],
+                          _x_btn('sm')]
+
+
+async def sm_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'smena'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    if act == 'x':
+        ctx.user_data.pop('sm', None); await q.answer()
+        return await _pos_chiqar(q, "🧾 Smena oynasi yopildi.", None)
+    if act == 'bk':                                         # egasining qarori (bildirishnomadagi tugma)
+        if user_role(u) != 'owner':
+            await q.answer("Faqat egasi hal qiladi", show_alert=True); return
+        res = smena_hisobla(int(arg[0]), arg[1] if len(arg) > 1 else '', _ui_user(u))
+        await q.answer(("✅ Saqlandi" if res['ok'] else res['error'])[:190], show_alert=not res['ok'])
+        sm = smena_ol(int(arg[0]))
+        if sm: await _pos_chiqar(q, smena_matn(sm), _sm_egasi_kb(sm))
+        return
+    st = _ui_ol(ctx, 'sm') or _ui_yangi(ctx, 'sm')
+    st['wait'] = None
+    m = rows = None; alert = None
+    if act == 'menu':
+        m, rows = _sm_menu(u)
+    elif act == 'op':
+        if smena_ochiq(): m, rows = _sm_menu(u); alert = "Smena allaqachon ochiq"
+        else:
+            conn = db(); r = conn.execute("SELECT counted_naqd FROM smenalar WHERE status='yopilgan' ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+            st['wait'] = 'open'
+            rows = [[_btn("0 bilan ochish", "sm:o:0")]]
+            if r and (r[0] or 0) > 0: rows.insert(0, [_btn(f"Oxirgi yopilishdagi {_usd2(r[0])} bilan", f"sm:o:{r[0]}")])
+            rows.append([_btn("⬅️ Orqaga", "sm:menu")])
+            m = "🔓 Kassadagi boshlang'ich naqd pulni yozing ($ yoki so'm, masalan 50 yoki 600000) yoki tugmani bosing:"
+    elif act == 'o':
+        res = smena_och(_ui_user(u), float(arg[0]) if arg else 0)
+        alert = None if res['ok'] else res['error']
+        m, rows = _sm_menu(u)
+    elif act == 'cl':
+        if not smena_ochiq():
+            alert = "Ochiq smena yo'q"; m, rows = _sm_menu(u)
+        else:
+            st['wait'] = 'naqd'
+            m, rows = ("💵 Kassadagi NAQD pulni sanang va yozing ($ yoki so'm):", [[_btn("⬅️ Orqaga", "sm:menu")]])
+    elif act == 'ks':
+        st['karta'] = None
+        if 'naqd' not in st: m, rows = _sm_menu(u)
+        else: m, rows = _sm_tasdiq_ekran(u, st)
+    elif act == 'nt':
+        st['wait'] = 'note'; m, rows = "📝 Izohni yozing:", [[_btn("⬅️ Orqaga", "sm:back")]]
+    elif act == 'back':
+        m, rows = _sm_tasdiq_ekran(u, st) if 'naqd' in st else _sm_menu(u)
+    elif act == 'cf':
+        sm = smena_ochiq()
+        if not arg or arg[0] != st.get('tok') or 'naqd' not in st or not sm or not _ui_done(ctx, 'smcf' + arg[0]):
+            await q.answer("Eskirgan tugma", show_alert=True); return
+        res = smena_yop(sm['id'], _ui_user(u), st['naqd'], st.get('karta'), st.get('note', ''))
+        if not res['ok']:
+            alert = res['error']; m, rows = _sm_menu(u)
+        else:
+            s2 = res['sm']; ctx.user_data.pop('sm', None)
+            await q.answer("✅ Smena yopildi")
+            egasi = user_role(u) == 'owner'
+            await _pos_chiqar(q, smena_matn(s2), _sm_egasi_kb(s2) if egasi else None)
+            if not egasi and OWNER_ID:
+                try: await ctx.bot.send_message(chat_id=OWNER_ID, text="🔔 Kassa yopildi\n\n" + smena_matn(s2),
+                                                reply_markup=InlineKeyboardMarkup(_sm_egasi_kb(s2)) if _sm_egasi_kb(s2) else None)
+                except Exception as e: log.warning("smena egasiga: %s", e)
+            return
+    elif act == 'rp':
+        m, rows = _sm_hisobot(int(arg[0]) if arg else 0)
+    elif act == 'v':
+        sm = smena_ol(int(arg[0]))
+        if sm:
+            m = smena_matn(sm)
+            rows = (_sm_egasi_kb(sm) or []) if user_role(u) == 'owner' else []
+            rows = rows + [[_btn("⬅️ Orqaga", "sm:rp:0")]]
+        else: alert = "Topilmadi"
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, rows)
+
+
+async def sm_matn(u, ctx, msg):
+    st = _ui_ol(ctx, 'sm')
+    if not st or not st.get('wait') or not can(u, 'smena'): return False
+    w = st['wait']
+    if w == 'note':
+        st['note'] = (msg or '').strip()[:300]; st['wait'] = None
+        m, rows = _sm_tasdiq_ekran(u, st)
+        await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(rows)); return True
+    v = _pul_kirit(msg)
+    if v is None or v < 0:
+        await u.message.reply_text("⚠️ Summani raqam bilan yozing (masalan 120 yoki 1 500 000):"); return True
+    if w == 'open':
+        st['wait'] = None
+        res = smena_och(_ui_user(u), v)
+        m, rows = _sm_menu(u)
+        await u.message.reply_text((f"✅ Smena ochildi ({_usd2(v)})\n\n" if res['ok'] else f"⚠️ {res['error']}\n\n") + m,
+                                   reply_markup=InlineKeyboardMarkup(rows))
+        return True
+    if w == 'naqd':
+        st['naqd'] = v; st['wait'] = 'karta'
+        await u.message.reply_text(f"💵 Naqd: {_usd2(v)}\n\n💳 Karta terminali bo'yicha summa (Z-chek)? Yozing yoki o'tkazib yuboring:",
+                                   reply_markup=InlineKeyboardMarkup([[_btn("⏭ Karta yo'q / o'tkazib yuborish", "sm:ks")]]))
+        return True
+    if w == 'karta':
+        st['karta'] = v; st['wait'] = None
+        m, rows = _sm_tasdiq_ekran(u, st)
+        await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(rows)); return True
+    return False
+
+
+# ── 🔢 SERIAL RAQAMLAR VA KAFOLAT ────────────────────────────────────────────────────
+# products.serialli=1 bo'lsa: kirimda seriallar kiritiladi, POS'da serial tanlanmasa sotilmaydi,
+# har serialga alohida kafolat (warranties.serial). Matnli/AI sotuv eskicha ishlaydi (serialsiz).
+SERIAL_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-_/.]{2,39}$')
+_SR_COLS = "id,product_id,product,serial,status,kirim_date,kirim_ref,sale_id,sold_date,customer,customer_id,warranty_end,note,created"
+
+
+def _serialli(pid):
+    try:
+        conn = db(); r = conn.execute("SELECT COALESCE(serialli,0) FROM products WHERE id=?", (int(pid),)).fetchone(); conn.close()
+        return bool(r and r[0])
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return False
+
+
+def serial_ajrat(matn):
+    out = []
+    for s in re.split(r'[\s,;]+', (matn or '').strip()):
+        s = s.strip().strip('.')
+        if s and s.upper() not in {x.upper() for x in out}: out.append(s)
+    return out
+
+
+def _sr_dict(r):
+    return dict(zip(_SR_COLS.split(','), r)) if r else None
+
+
+def serial_top(matn):
+    s = (matn or '').strip()
+    if not s or len(s) > 60: return None
+    try:
+        conn = db(); r = conn.execute(f"SELECT {_SR_COLS} FROM serials WHERE serial=? COLLATE NOCASE", (s,)).fetchone(); conn.close()
+    except sqlite3.OperationalError:
+        return None
+    return _sr_dict(r)
+
+
+def serial_ol(sr_id):
+    conn = db(); r = conn.execute(f"SELECT {_SR_COLS} FROM serials WHERE id=?", (int(sr_id),)).fetchone(); conn.close()
+    return _sr_dict(r)
+
+
+def serial_omborda(pid, limit=200):
+    conn = db()
+    r = conn.execute("SELECT id, serial FROM serials WHERE product_id=? AND status='omborda' ORDER BY id LIMIT ?", (int(pid), limit)).fetchall()
+    conn.close(); return r
+
+
+def serial_holat_soni(pid):
+    conn = db()
+    r = dict(conn.execute("SELECT status, COUNT(*) FROM serials WHERE product_id=? GROUP BY status", (int(pid),)).fetchall())
+    q = conn.execute("SELECT COALESCE(qty,0) FROM products WHERE id=?", (int(pid),)).fetchone()
+    conn.close()
+    r['_qty'] = q[0] if q else 0
+    r['_bosh'] = max(0, r['_qty'] - r.get('omborda', 0))         # astatkada bor, lekin serial kiritilmagan
+    return r
+
+
+def serial_qosh(pid, matn, user=None, ref='', c=None):
+    """Bir nechta serial (vergul/probel/yangi qator bilan). Sig'im: astatka − omborda ro'yxatdagi seriallar.
+    Qaytaradi {'ok', 'qoshildi': [...], 'band': [...], 'xato': [...], 'ortiqcha': [...]}."""
+    royxat = serial_ajrat(matn)
+    if not royxat: return {'ok': False, 'error': "Serial raqam topilmadi", 'qoshildi': [], 'band': [], 'xato': [], 'ortiqcha': []}
+    own = c is None
+    conn = db() if own else None
+    cur = c or conn.cursor()
+    cur.execute("SELECT name, COALESCE(qty,0) FROM products WHERE id=?", (int(pid),))
+    p = cur.fetchone()
+    if not p:
+        if own: conn.close()
+        return {'ok': False, 'error': "Mahsulot topilmadi", 'qoshildi': [], 'band': [], 'xato': [], 'ortiqcha': []}
+    cur.execute("SELECT COUNT(*) FROM serials WHERE product_id=? AND status='omborda'", (int(pid),))
+    joy = max(0, p[1] - cur.fetchone()[0])
+    out = {'ok': True, 'qoshildi': [], 'band': [], 'xato': [], 'ortiqcha': [], 'ids': []}
+    for s in royxat:
+        if not SERIAL_RE.match(s): out['xato'].append(s); continue
+        if len(out['qoshildi']) >= joy: out['ortiqcha'].append(s); continue
+        try:
+            cur.execute("INSERT INTO serials (product_id,product,serial,status,kirim_date,kirim_ref,created) VALUES (?,?,?,'omborda',?,?,?)",
+                        (int(pid), p[0], s, today(), ref, _hm()))
+        except sqlite3.IntegrityError:
+            out['band'].append(s); continue
+        out['qoshildi'].append(s); out['ids'].append(cur.lastrowid)
+        _serial_log(cur, cur.lastrowid, 'kirim', ref, '', user)
+    if own:
+        conn.commit(); conn.close()
+    return out
+
+
+def serial_qosh_matn(res, nom=''):
+    m = []
+    if res.get('error'): return f"⚠️ {res['error']}"
+    if res['qoshildi']: m.append(f"✅ Qo'shildi: {len(res['qoshildi'])} ta" + (f" ({nom})" if nom else ""))
+    if res['band']: m.append("⛔ Allaqachon bor: " + ", ".join(res['band'][:10]))
+    if res['xato']: m.append("⚠️ Noto'g'ri format: " + ", ".join(res['xato'][:10]) + " (3–40 belgi: harf, raqam, - _ / .)")
+    if res['ortiqcha']: m.append("⚠️ Astatkadan ortiq (avval kirim qiling): " + ", ".join(res['ortiqcha'][:10]))
+    return "\n".join(m) or "Hech narsa qo'shilmadi"
+
+
+def serial_rejim(pid, on=None):
+    """Serialli rejimni yoqadi/o'chiradi (on=None — teskari). Yangi holatni qaytaradi."""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(serialli,0) FROM products WHERE id=?", (int(pid),)); r = c.fetchone()
+    if not r: conn.close(); return None
+    yangi = (0 if r[0] else 1) if on is None else (1 if on else 0)
+    c.execute("UPDATE products SET serialli=? WHERE id=?", (yangi, int(pid))); conn.commit(); conn.close()
+    return bool(yangi)
+
+
+def _sotuv_seriallar(c, sale_id, pid, serials, d, customer, end, user):
+    """_sotuv_tx ichida: tanlangan seriallarni 'sotilgan' qiladi. Band bo'lsa _SerialXato (butun savat bekor)."""
+    for sr in serials:
+        c.execute("UPDATE serials SET status='sotilgan', sale_id=?, sold_date=?, customer=?, warranty_end=? "
+                  "WHERE id=? AND product_id=? AND status='omborda'", (sale_id, d, customer or '', end or '', int(sr), int(pid)))
+        if c.rowcount != 1:
+            c.execute("SELECT serial FROM serials WHERE id=?", (int(sr),)); r = c.fetchone()
+            raise _SerialXato(r[0] if r else str(sr))
+        _serial_log(c, int(sr), 'sotildi', f'#s{sale_id}', customer or '', user)
+
+
+def kafolat_qoldi(end):
+    if not end: return None
+    try: return (datetime.strptime(end[:10], '%Y-%m-%d').date() - datetime.now().date()).days
+    except ValueError: return None
+
+
+def serial_karta(sr):
+    """Serial kartasi matni: tovar, holat, kim/qachon oldi, kafolat qoldig'i, murojaatlar, tarix."""
+    conn = db(); c = conn.cursor()
+    m = [f"🔢 SERIAL: {sr['serial']}", f"📦 {sr['product']}", f"Holat: {SERIAL_HOLAT.get(sr['status'], sr['status'])}"]
+    if sr['kirim_date']: m.append(f"Kirim: {sr['kirim_date']}" + (f" ({sr['kirim_ref']})" if sr['kirim_ref'] else ""))
+    if sr['sale_id']:
+        c.execute("SELECT date, time, revenue, qty, COALESCE(seller_name,''), COALESCE(customer,'') FROM sales WHERE id=?", (sr['sale_id'],))
+        s = c.fetchone()
+        if s:
+            m.append(f"\n🛒 Sotilgan: {s[0]} {s[1]} · chek #{sr['sale_id']} · {_usd2((s[2] or 0) / max(1, s[3] or 1))}")
+            m.append(f"👤 Xaridor: {sr['customer'] or s[5] or '—'}" + (f" · sotuvchi: {s[4]}" if s[4] else ""))
+        qol = kafolat_qoldi(sr['warranty_end'])
+        if qol is None: m.append("🛡 Kafolat: yo'q")
+        elif qol >= 0: m.append(f"🛡 Kafolat: {sr['warranty_end']} gacha — {qol} kun qoldi ✅")
+        else: m.append(f"🛡 Kafolat: {sr['warranty_end']} da tugagan ({-qol} kun oldin) ❌")
+    c.execute("SELECT id, opened, status, note, closed, result FROM kafolat_murojaat WHERE serial_id=? ORDER BY id DESC LIMIT 5", (sr['id'],))
+    mur = c.fetchall()
+    if mur:
+        m.append("\n🛠 Murojaatlar:")
+        for r in mur:
+            m.append(f"• #{r[0]} {r[1]} — {'🟡 ochiq' if r[2] == 'ochiq' else '✅ yopilgan'}: {r[3]}" + (f"\n   Natija ({r[4]}): {r[5]}" if r[2] != 'ochiq' else ""))
+    c.execute("SELECT date, event, ref, user_name FROM serial_log WHERE serial_id=? ORDER BY id DESC LIMIT 6", (sr['id'],))
+    lg = c.fetchall(); conn.close()
+    if lg:
+        m.append("\n📜 Tarix:")
+        m += [f"• {r[0]} — {r[1]}" + (f" {r[2]}" if r[2] else "") + (f" ({r[3]})" if r[3] else "") for r in lg]
+    return "\n".join(m)
+
+
+def murojaat_och(sr_id, note, user):
+    sr = serial_ol(sr_id)
+    if not sr: return {'ok': False, 'error': "Serial topilmadi"}
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM warranties WHERE sale_id=? AND serial=? ORDER BY id DESC LIMIT 1", (sr['sale_id'] or -1, sr['serial']))
+    w = c.fetchone()
+    c.execute("INSERT INTO kafolat_murojaat (serial_id,warranty_id,product,customer,opened,opened_by,status,note) VALUES (?,?,?,?,?,?,'ochiq',?)",
+              (sr['id'], w[0] if w else 0, sr['product'], sr['customer'], _hm(), (user or (0, ''))[1], (note or '')[:500]))
+    mid = c.lastrowid
+    _serial_log(c, sr['id'], 'kafolat murojaati', f'#M{mid}', note, user)
+    conn.commit(); conn.close()
+    return {'ok': True, 'id': mid}
+
+
+def murojaat_yop(mid, natija, user):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE kafolat_murojaat SET status='yopilgan', closed=?, closed_by=?, result=? WHERE id=? AND status='ochiq'",
+              (_hm(), (user or (0, ''))[1], (natija or '')[:500], int(mid)))
+    ok = c.rowcount == 1
+    if ok:
+        c.execute("SELECT serial_id FROM kafolat_murojaat WHERE id=?", (int(mid),)); r = c.fetchone()
+        if r and r[0]: _serial_log(c, r[0], 'murojaat yopildi', f'#M{mid}', natija, user)
+    conn.commit(); conn.close()
+    return ok
+
+
+# ── 🔢 Serial: tugmali oyna (prefiks 'sn:') + POS va Ombor ulanishlari ─────────────────
+def sn_kirim_btn(items):
+    """Kirim/zavod qabulidan keyin: serialli tovarlar uchun 'seriallarni kiritish' tugmasi."""
+    rows = []
+    for pid, n, nom in items:
+        if pid and _serialli(pid):
+            rows.append([_btn(f"🔢 {str(nom)[:22]}: {n} ta serial kiritish", f"sn:in:{pid}:{n}")])
+    return rows
+
+
+def _omb_karta_b10(u, pid, out, rows):
+    """📦 Tovar kartasiga: serial holati, shtrix-kod va tugmalar (ro'yxatlarni joyida to'ldiradi)."""
+    try:
+        conn = db(); r = conn.execute("SELECT COALESCE(serialli,0), COALESCE(barcode,'') FROM products WHERE id=?", (pid,)).fetchone(); conn.close()
+    except sqlite3.OperationalError:
+        return
+    if not r: return
+    if r[0]:
+        s = serial_holat_soni(pid)
+        out.append(f"🔢 Serialli: omborda {s.get('omborda', 0)} ta serial" + (f" · ⚠️ {s['_bosh']} tasiga serial kiritilmagan" if s['_bosh'] else ""))
+    if r[1]: out.append(f"🏷 Shtrix-kod: {r[1]}")
+    b = [_btn("🔢 Seriallar", f"sn:pp:{pid}")]
+    if can(u, 'ombor'): b.append(_btn("🏷 Yorliq", f"kod:p:{pid}"))
+    rows.append(b)
+
+
+def _sn_menu(u):
+    rows = [[_btn("📋 Serialli tovarlar", "sn:pl:0"), _btn("🛠 Ochiq murojaatlar", "sn:mo")], _x_btn('sn')]
+    return ("🔢 SERIAL / KAFOLAT\n\nSerial raqamni yozing (yoki shtrix-kod/QR rasmini yuboring) — kim, qachon olgani va "
+            "kafolat qancha qolgani chiqadi."), rows
+
+
+def _sn_tovarlar(u, page=0):
+    conn = db()
+    rows_ = conn.execute("SELECT id, name, COALESCE(qty,0), COALESCE(serialli,0) FROM products WHERE COALESCE(active,1)=1 "
+                         "ORDER BY serialli DESC, name").fetchall()
+    sn = dict(conn.execute("SELECT product_id, COUNT(*) FROM serials WHERE status='omborda' GROUP BY product_id").fetchall())
+    conn.close()
+    per = 10; pages = max(1, math.ceil(len(rows_) / per)); page = min(max(0, page), pages - 1)
+    kb = []
+    for pid, nom, q, s in rows_[page * per:(page + 1) * per]:
+        kb.append([_btn(f"{'🔢' if s else '▫️'} {nom[:28]} · {q} ta" + (f" · SN {sn.get(pid, 0)}" if s else ""), f"sn:pp:{pid}")])
+    nav = ([_btn("◀️", f"sn:pl:{page - 1}")] if page else []) + ([_btn("▶️", f"sn:pl:{page + 1}")] if page < pages - 1 else [])
+    if nav: kb.append(nav)
+    kb.append([_btn("⬅️ Orqaga", "sn:menu")] + _x_btn('sn'))
+    return "📋 Tovarlar (🔢 — serialli). Tovarni bosing:", kb
+
+
+def _sn_tovar(u, pid):
+    p = _omb_mahsulot(pid)
+    if not p: return "Topilmadi", [[_btn("⬅️ Orqaga", "sn:pl:0")]]
+    on = _serialli(pid); s = serial_holat_soni(pid)
+    m = [f"🔢 {p['name']}", f"Serialli rejim: {'✅ yoqilgan' if on else '⛔ o‘chiq'}", f"Astatka: {p['qty']} ta"]
+    if on or any(k for k in s if not k.startswith('_')):
+        m.append("Seriallar: " + ", ".join(f"{SERIAL_HOLAT.get(k, k)} {v}" for k, v in s.items() if not k.startswith('_')) if len(s) > 2 else "Seriallar: hali yo'q")
+        if s['_bosh']: m.append(f"⚠️ {s['_bosh']} ta tovarga serial kiritilmagan (POS'da yozilganda avtomatik qo'shiladi)")
+        om = serial_omborda(pid, 30)
+        if om: m.append("\nOmborda: " + ", ".join(x[1] for x in om) + (" ..." if len(om) == 30 else ""))
+    kb = []
+    if can(u, 'ombor'):
+        kb.append([_btn("➕ Serial qo'shish", f"sn:in:{pid}:0"), _btn(f"{'⛔ O‘chirish' if on else '✅ Yoqish'} (serialli)", f"sn:tg:{pid}")])
+    om = serial_omborda(pid, 8)
+    kb += [[_btn(f"🔎 {x[1]}", f"sn:v:{x[0]}")] for x in om[:6]]
+    kb.append([_btn("⬅️ Orqaga", "sn:pl:0")] + _x_btn('sn'))
+    if not on: m.append("\nYoqilsa: kirimda seriallar so'raladi, 🛒 Sotuvda serial tanlanmasa sotilmaydi, kafolat serial bo'yicha yuritiladi.")
+    return "\n".join(m), kb
+
+
+def _sn_karta_kb(u, sr):
+    kb = []
+    if sr['status'] == 'sotilgan':
+        kb.append([_btn("🛠 Kafolat murojaati ochish", f"sn:mn:{sr['id']}")])
+        if _qr_rol(u): kb.append([_btn("📥 Qaytarish", f"qr:sr:{sr['id']}")])
+    conn = db(); ochiq = conn.execute("SELECT id FROM kafolat_murojaat WHERE serial_id=? AND status='ochiq'", (sr['id'],)).fetchall(); conn.close()
+    if can(u, 'boshqaruv'):
+        kb += [[_btn(f"✅ Murojaat #{r[0]} ni yopish", f"sn:mc:{r[0]}")] for r in ochiq]
+    kb.append([_btn("⬅️ Orqaga", "sn:menu")] + _x_btn('sn'))
+    return kb
+
+
+def _sn_murojaatlar():
+    conn = db()
+    rows = conn.execute("SELECT m.id, m.opened, m.product, m.customer, m.note, m.serial_id, COALESCE(s.serial,'') FROM kafolat_murojaat m "
+                        "LEFT JOIN serials s ON s.id=m.serial_id WHERE m.status='ochiq' ORDER BY m.id DESC LIMIT 15").fetchall()
+    conn.close()
+    if not rows: return "🛠 Ochiq kafolat murojaati yo'q.", [[_btn("⬅️ Orqaga", "sn:menu")] + _x_btn('sn')]
+    m = ["🛠 OCHIQ KAFOLAT MUROJAATLARI:"]
+    kb = []
+    for r in rows:
+        m.append(f"#{r[0]} · {r[1]} · {r[2]} · SN {r[6]} · {r[3] or '—'}\n   {r[4]}")
+        if r[5]: kb.append([_btn(f"🔎 #{r[0]} · {r[6]}", f"sn:v:{r[5]}")])
+    kb.append([_btn("⬅️ Orqaga", "sn:menu")] + _x_btn('sn'))
+    return "\n".join(m), kb
+
+
+async def cmd_serial(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🔢 Serial tugmasi / /serial [raqam]"""
+    if not can(u, 'stock_view'): return
+    st = _ui_yangi(ctx, 'sn', wait='find')
+    arg = " ".join(ctx.args or []) if getattr(ctx, 'args', None) else ''
+    if arg:
+        st['wait'] = None
+        return await kod_natija(u, ctx, arg, 'sn')
+    m, r = _sn_menu(u)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+
+async def sn_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'stock_view'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    if act == 'x':
+        ctx.user_data.pop('sn', None); await q.answer()
+        return await _pos_chiqar(q, "🔢 Serial oynasi yopildi.", None)
+    st = _ui_ol(ctx, 'sn') or _ui_yangi(ctx, 'sn')
+    st['wait'] = None
+    m = rows = None; alert = None
+
+    def _i(k, d=0):
+        try: return int(arg[k])
+        except (IndexError, ValueError): return d
+    if act == 'menu':
+        st['wait'] = 'find'; m, rows = _sn_menu(u)
+    elif act == 'pl':
+        m, rows = _sn_tovarlar(u, _i(0))
+    elif act == 'pp':
+        m, rows = _sn_tovar(u, _i(0))
+    elif act == 'tg':
+        if not can(u, 'ombor'): alert = "Faqat egasi/admin"
+        else:
+            yangi = serial_rejim(_i(0)); alert = None if yangi is None else ("✅ Serialli rejim yoqildi" if yangi else "Serialli rejim o'chirildi")
+            m, rows = _sn_tovar(u, _i(0))
+    elif act == 'in':
+        if not can(u, 'ombor'): alert = "Faqat egasi/admin"
+        else:
+            p = _omb_mahsulot(_i(0))
+            if not p: alert = "Mahsulot topilmadi"
+            else:
+                if not _serialli(p['id']): serial_rejim(p['id'], True)
+                st['wait'] = f"in:{p['id']}"
+                s = serial_holat_soni(p['id'])
+                m = (f"🔢 {p['name']} — serial raqamlarni yuboring" + (f" ({_i(1)} ta keldi)" if _i(1) else "") + ".\n"
+                     f"Bir xabarda bir nechta: har birini yangi qatorga yoki vergul bilan.\n📷 Shtrix-kod rasmini ham yuborsa bo'ladi.\n"
+                     f"Serial kutilmoqda: {s['_bosh']} ta")
+                rows = [[_btn("✔ Tayyor", f"sn:pp:{p['id']}")]]
+    elif act == 'v':
+        sr = serial_ol(_i(0))
+        if not sr: alert = "Topilmadi"
+        else: m, rows = serial_karta(sr), _sn_karta_kb(u, sr)
+    elif act == 'mn':
+        sr = serial_ol(_i(0))
+        if not sr: alert = "Topilmadi"
+        else:
+            st['wait'] = f"mn:{sr['id']}"
+            m, rows = f"🛠 {sr['serial']} — muammoni qisqa yozing (masalan: 'qizimayapti'):", [[_btn("⬅️ Orqaga", f"sn:v:{sr['id']}")]]
+    elif act == 'mc':
+        if not can(u, 'boshqaruv'): alert = "Faqat egasi/admin"
+        else:
+            st['wait'] = f"mc:{_i(0)}"
+            m, rows = f"✅ Murojaat #{_i(0)} — natijani yozing (masalan: 'almashtirildi', 'ta'mirlandi'):", [[_btn("⬅️ Orqaga", "sn:mo")]]
+    elif act == 'mo':
+        m, rows = _sn_murojaatlar()
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, rows)
+
+
+async def sn_matn(u, ctx, msg):
+    st = _ui_ol(ctx, 'sn')
+    if not st or not st.get('wait') or not can(u, 'stock_view'): return False
+    w = st['wait']
+    if w == 'find':
+        return await kod_natija(u, ctx, msg, 'sn')
+    if w.startswith('in:'):
+        if not can(u, 'ombor'): return False
+        pid = int(w.split(':')[1]); p = _omb_mahsulot(pid)
+        res = serial_qosh(pid, msg, _ui_user(u), ref='qo\'lda')
+        s = serial_holat_soni(pid)
+        await u.message.reply_text(serial_qosh_matn(res, p['name'] if p else '') + f"\n\nYana serial kutilmoqda: {s['_bosh']} ta. Davom eting yoki ✔ Tayyor.",
+                                   reply_markup=InlineKeyboardMarkup([[_btn("✔ Tayyor", f"sn:pp:{pid}")]]))
+        return True
+    if w.startswith('mn:'):
+        st['wait'] = None
+        res = murojaat_och(int(w.split(':')[1]), msg, _ui_user(u))
+        sr = serial_ol(int(w.split(':')[1]))
+        await u.message.reply_text((f"✅ Murojaat #{res['id']} ochildi.\n\n" if res['ok'] else f"⚠️ {res['error']}\n\n") + (serial_karta(sr) if sr else ''),
+                                   reply_markup=InlineKeyboardMarkup(_sn_karta_kb(u, sr)) if sr else None)
+        if res['ok'] and OWNER_ID and _uid(u) != OWNER_ID and sr:
+            try: await ctx.bot.send_message(chat_id=OWNER_ID, text=f"🛠 Yangi kafolat murojaati #{res['id']}\n{sr['product']} · SN {sr['serial']}\n{sr['customer'] or ''}\n📝 {msg[:300]}")
+            except Exception as e: log.warning("murojaat egaga: %s", e)
+        return True
+    if w.startswith('mc:'):
+        if not can(u, 'boshqaruv'): return False
+        st['wait'] = None
+        ok = murojaat_yop(int(w.split(':')[1]), msg, _ui_user(u))
+        m, rows = _sn_murojaatlar()
+        await u.message.reply_text(("✅ Murojaat yopildi.\n\n" if ok else "⚠️ Allaqachon yopilgan.\n\n") + m, reply_markup=InlineKeyboardMarkup(rows))
+        return True
+    return False
+
+
+# ── POS: serialli tovar ──
+def _pos_sn_hook(pos, act, arg):
+    try: pid = int(arg[0])
+    except (IndexError, ValueError): return False
+    return _serialli(pid)
+
+
+def pos_ekran_serial(pos, p, izoh=''):
+    it = _pos_qator(pos, p['id'])
+    tanlangan = list(zip(it.get('serials', []), it.get('sn', []))) if it else []
+    band = {s for s, _ in tanlangan}
+    om = [x for x in serial_omborda(p['id'], 60) if x[0] not in band]
+    s = serial_holat_soni(p['id'])
+    m = [f"🔢 {p['name']} — serialli tovar", f"Narx: {_usd2(p['price'] or 0)}", ""]
+    if izoh: m.insert(0, izoh + "\n")
+    m.append("Savatda: " + (", ".join(sn for _, sn in tanlangan) if tanlangan else "hali yo'q"))
+    m.append("Serialni tanlang yoki yozing / skanerlang (📷 rasm ham bo'ladi).")
+    if s['_bosh'] > 0: m.append(f"ℹ️ {s['_bosh']} ta tovar seriali kiritilmagan — yozsangiz shu yerning o'zida qo'shiladi.")
+    rows = [[_btn(f"✅ {sn} (olib tashlash)", f"pos:sn:{p['id']}:{sid}")] for sid, sn in tanlangan[:8]]
+    btns = [_btn(sn[:20], f"pos:sn:{p['id']}:{sid}") for sid, sn in om[:18]]
+    rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([_btn("✍️ Serial yozish / skaner", f"pos:snw:{p['id']}")])
+    rows.append([_btn("⬅️ Orqaga", "pos:cats")] + _pos_savat_btn(pos))
+    rows.append(_pos_bekor())
+    return "\n".join(m), rows
+
+
+def _pos_sn_qosh(pos, p, sid, sn):
+    """True — qo'shildi; False — savatda bor; None — astatka yetmaydi."""
+    it = _pos_qator(pos, p['id'])
+    if it and sid in it.get('serials', []): return False
+    if _pos_mavjud(pos, p['id'], p['qty']) <= 0: return None
+    if not it:
+        pos['items'].append({'pid': p['id'], 'name': p['name'], 'qty': 0, 'list': float(p['price'] or 0),
+                             'price': float(p['price'] or 0), 'serials': [], 'sn': []})
+        it = pos['items'][-1]
+    it.setdefault('serials', []); it.setdefault('sn', [])
+    if sid in it['serials']: return False
+    it['serials'].append(sid); it['sn'].append(sn); it['qty'] = len(it['serials'])
+    return True
+
+
+def _pos_sn_ol(pos, pid, sid):
+    it = _pos_qator(pos, pid)
+    if not it or sid not in it.get('serials', []): return False
+    i = it['serials'].index(sid); it['serials'].pop(i); it['sn'].pop(i); it['qty'] = len(it['serials'])
+    if it['qty'] <= 0: pos['items'].remove(it)
+    return True
+
+
+def _pos_sn_xato(pos):
+    for it in pos['items']:
+        if _serialli(it['pid']) and len(set(it.get('serials') or [])) != it['qty']:
+            return f"{it['name']}: serial raqam tanlanmagan ({len(it.get('serials') or [])}/{it['qty']}) — savatdan o'chirib, qayta qo'shing"
+    return None
+
+
+async def pos_sn_callback(u, ctx, pos, act, arg):
+    q = u.callback_query
+    try: pid = int(arg[0])
+    except (IndexError, ValueError):
+        await q.answer("Xato"); return
+    p = _pos_mahsulot(pid)
+    if not p:
+        await q.answer("Mahsulot topilmadi", show_alert=True); return
+    izoh = ''
+    if act == 'sn':
+        try: sid = int(arg[1])
+        except (IndexError, ValueError): sid = 0
+        if _pos_sn_ol(pos, pid, sid): izoh = "🗑 Olib tashlandi"
+        else:
+            sr = serial_ol(sid) if sid else None
+            if not sr or sr['status'] != 'omborda' or sr['product_id'] != pid:
+                await q.answer("Bu serial endi mavjud emas", show_alert=True)
+            else:
+                ok_ = _pos_sn_qosh(pos, p, sid, sr['serial'])
+                izoh = f"✅ {sr['serial']} qo'shildi" if ok_ else ("⛔ Astatka yetmaydi" if ok_ is None else "")
+    elif act == 'snw':
+        pos['wait'] = f"sn:{pid}"
+        await q.answer()
+        return await _pos_chiqar(q, f"✍️ {p['name']} — serial raqamni yozing yoki skanerlang (bir nechtasini vergul bilan ham bo'ladi).\n📷 Shtrix-kod rasmini yuborsangiz ham bo'ladi.",
+                                 [[_btn("⬅️ Orqaga", f"pos:p:{pid}")], _pos_bekor()])
+    elif act == 'ei' and arg[1:2] == ['-1']:
+        it = _pos_qator(pos, pid)
+        if it and it.get('serials'): _pos_sn_ol(pos, pid, it['serials'][-1]); izoh = "➖ Oxirgi serial olib tashlandi"
+    else:
+        izoh = "🔢 Serialli tovar — sonini serial tanlab belgilang"
+    await q.answer()
+    m, r = pos_ekran_serial(pos, p, izoh)
+    await _pos_chiqar(q, m, r)
+
+
+async def pos_kod_matn(u, ctx, pos, msg, w):
+    """POS: serial/shtrix-kod matni (yozilgan, skaner ilovasi yoki rasm). True qaytaradi."""
+    rate = get_exchange_rate()
+    pid0 = int(w.split(':')[1]) if w.startswith('sn:') else None
+    natija = []; ochiladi = None
+    kodlar = serial_ajrat(msg) if pid0 else [msg.strip()]
+    for kod in kodlar[:30]:
+        sr = serial_top(kod)
+        if sr:
+            if pid0 and sr['product_id'] != pid0: natija.append(f"⛔ {kod} — boshqa tovar ({sr['product']})"); continue
+            if sr['status'] != 'omborda':
+                natija.append(f"⛔ {kod} — {SERIAL_HOLAT.get(sr['status'], sr['status'])}" + (f" ({sr['sold_date']}, {sr['customer'] or '—'})" if sr['sale_id'] else "")); continue
+            p = _pos_mahsulot(sr['product_id'])
+            if not p: natija.append(f"⛔ {kod} — tovar topilmadi"); continue
+            ok_ = _pos_sn_qosh(pos, p, sr['id'], sr['serial'])
+            natija.append(f"✅ {sr['serial']} — {p['name']}" if ok_ else
+                          (f"⛔ {sr['serial']} — astatka yetmaydi" if ok_ is None else f"ℹ️ {sr['serial']} savatda bor"))
+            ochiladi = ochiladi or p
+            continue
+        k = kod_top(kod) if not pid0 else None
+        if k and k['tur'] == 'tovar':
+            p = _pos_mahsulot(k['pid'])
+            if p:
+                pos['wait'] = None
+                if _serialli(p['id']):
+                    m, r = pos_ekran_serial(pos, p, f"🏷 {kod} → {p['name']}")
+                elif _pos_mavjud(pos, p['id'], p['qty']) <= 0:
+                    m, r = f"❌ {p['name']} — astatkada yo'q", [[_btn("⬅️ Kategoriyalar", "pos:cats")], _pos_bekor()]
+                else:
+                    m, r = pos_ekran_son(pos, p, rate); m = f"🏷 {kod} → {p['name']}\n\n" + m
+                await u.message.reply_text(m[:4000], reply_markup=InlineKeyboardMarkup(r)); return True
+        if pid0:
+            res = serial_qosh(pid0, kod, _ui_user(u), ref='pos')
+            if res['qoshildi']:
+                p = _pos_mahsulot(pid0)
+                ok_ = _pos_sn_qosh(pos, p, res['ids'][0], res['qoshildi'][0]); ochiladi = ochiladi or p
+                natija.append(f"✅ {kod} — ro'yxatga olindi va savatga qo'shildi" if ok_ else f"✅ {kod} — ro'yxatga olindi (savatga: astatka yetmaydi)")
+            else:
+                natija.append(f"⛔ {kod} — " + ("astatkadan ortiq (avval kirim qiling)" if res['ortiqcha'] else
+                                               "noto'g'ri format" if res['xato'] else "allaqachon bor" if res['band'] else "qo'shilmadi"))
+        else:
+            natija.append(f"⛔ '{kod[:30]}' — bunday kod/serial topilmadi")
+    p = ochiladi or (_pos_mahsulot(pid0) if pid0 else None)
+    if p:
+        if pid0: pos['wait'] = f"sn:{pid0}"          # ketma-ket skanerlash davom etadi
+        m, r = pos_ekran_serial(pos, p, "\n".join(natija))
+    else:
+        pos['wait'] = 'search'
+        m, r = "\n".join(natija) + "\n\nQaytadan yozing (nom, serial yoki shtrix-kod):", [[_btn("⬅️ Kategoriyalar", "pos:cats")], _pos_bekor()]
+    await u.message.reply_text(m[:4000], reply_markup=InlineKeyboardMarkup(r))
+    return True
+
+
+# ── 🏷 SHTRIX-KOD / QR: yaratish, yorliq varaqlari, rasmdan o'qish ─────────────────────
+# zxing-cpp (pip, tizim kutubxonasi kerak emas) bo'lsa — QR/Code128 yaratish va rasmdan o'qish.
+# Bo'lmasa: Code128 o'zimizning sof-Python chizgich bilan, QR — 'qrcode' kutubxonasi bo'lsa; o'qish — opencv/pyzbar
+# bo'lsa, aks holda foydalanuvchi kodni yozadi (telefondagi skaner ilovasi ham matn yuboradi).
+try:
+    import zxingcpp as _zx
+except Exception:                                    # o'rnatilmagan — fallback
+    _zx = None
+KOD_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-_/.+]{2,47}$')
+_C128 = ("212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 "
+         "123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 "
+         "232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121 "
+         "313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 "
+         "111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 "
+         "111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113 "
+         "114311 411113 411311 113141 114131 311141 411131 211412 211214 211232").split()
+_C128_STOP = "2331112"
+
+
+def _c128_modullar(matn):
+    """Code128-B: [qora/oq kengliklar] ro'yxati (sof Python)."""
+    vals = [104] + [ord(ch) - 32 for ch in matn]
+    chk = (104 + sum(i * v for i, v in enumerate(vals[1:], 1))) % 103
+    out = []
+    for v in vals + [chk]: out += [int(x) for x in _C128[v]]
+    return out + [int(x) for x in _C128_STOP]
+
+
+def _pil():
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        return Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+
+
+def _shrift(size, bold=False):
+    _, _, ImageFont = _pil()
+    try:
+        import matplotlib
+        f = os.path.join(matplotlib.get_data_path(), 'fonts', 'ttf', 'DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf')
+        return ImageFont.truetype(f, size)
+    except Exception:
+        try: return ImageFont.load_default(size=size)
+        except Exception: return ImageFont.load_default()
+
+
+def kod_rasm(kod, tur='code128', balandlik=120, modul=3):
+    """PIL rasm (oq fonda qora). tur: 'code128' | 'qr'. Imkon bo'lmasa None."""
+    P = _pil()
+    if not P or not kod: return None
+    Image, ImageDraw, _ = P
+    if _zx is not None:
+        try:
+            fmt = _zx.BarcodeFormat.QRCode if tur == 'qr' else _zx.BarcodeFormat.Code128
+            b = _zx.create_barcode(kod, fmt)
+            import numpy as _np
+            im = Image.fromarray(_np.array(b.to_image(scale=(8 if tur == 'qr' else modul), add_quiet_zones=True))).convert('L')
+            if tur != 'qr' and im.height != balandlik:
+                im = im.resize((im.width, balandlik), Image.NEAREST)
+            return im
+        except Exception as e:
+            log.warning("zxing yaratish: %s", e)
+    if tur == 'qr':
+        try:
+            import qrcode
+            return qrcode.make(kod, box_size=8, border=2).get_image().convert('L')
+        except Exception:
+            tur = 'code128'                              # QR imkoni yo'q — Code128
+    if any(ord(ch) < 32 or ord(ch) > 126 for ch in kod): return None
+    w = _c128_modullar(kod); q = 10
+    im = Image.new('L', ((sum(w) + 2 * q) * modul, balandlik), 255)
+    d = ImageDraw.Draw(im); x = q * modul
+    for i, wd in enumerate(w):
+        if i % 2 == 0: d.rectangle([x, 0, x + wd * modul - 1, balandlik - 1], fill=0)
+        x += wd * modul
+    return im
+
+
+def kod_oqi(raw):
+    """Rasm baytlari → topilgan kodlar matni ro'yxati (bo'sh — o'qilmadi yoki kutubxona yo'q)."""
+    P = _pil()
+    if not P or not raw: return []
+    Image = P[0]
+    try:
+        im = Image.open(io.BytesIO(bytes(raw))); im.load(); im = im.convert('RGB')
+    except Exception:
+        return []
+    out = []
+    if _zx is not None:
+        try:
+            for variant in (im, im.convert('L').resize((im.width * 2, im.height * 2)) if max(im.size) < 900 else None):
+                if variant is None: continue
+                out = [r.text for r in _zx.read_barcodes(variant) if r.text]
+                if out: return list(dict.fromkeys(out))
+        except Exception as e:
+            log.warning("zxing o'qish: %s", e)
+    try:
+        import cv2, numpy as _np
+        arr = cv2.cvtColor(_np.array(im), cv2.COLOR_RGB2BGR)
+        t, *_ = cv2.QRCodeDetector().detectAndDecode(arr)
+        if t: return [t]
+        if hasattr(cv2, 'barcode'):
+            ok, infos, *_ = cv2.barcode.BarcodeDetector().detectAndDecode(arr)
+            vals = [x for x in (infos if isinstance(infos, (list, tuple)) else [infos]) if x]
+            if vals: return list(dict.fromkeys(vals))
+    except Exception:
+        pass
+    try:
+        from pyzbar import pyzbar
+        out = [r.data.decode('utf-8', 'ignore') for r in pyzbar.decode(im)]
+        if out: return list(dict.fromkeys(out))
+    except Exception:
+        pass
+    return []
+
+
+def kod_oqish_mavjud():
+    if _zx is not None: return 'zxing-cpp'
+    for mod in ('cv2', 'pyzbar'):
+        try:
+            __import__(mod); return mod
+        except Exception:
+            pass
+    return None
+
+
+def tovar_kodi(pid, yarat=True):
+    """Tovarning shtrix-kodi; bo'sh bo'lsa ichki 'TC000123' beriladi (yarat=True)."""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COALESCE(barcode,'') FROM products WHERE id=?", (int(pid),)); r = c.fetchone()
+    if not r: conn.close(); return None
+    if r[0] or not yarat: conn.close(); return r[0] or None
+    kod = f"TC{int(pid):06d}"
+    for k in range(5):
+        try:
+            c.execute("UPDATE products SET barcode=? WHERE id=? AND COALESCE(barcode,'')=''", (kod, int(pid))); conn.commit(); break
+        except sqlite3.IntegrityError:
+            kod = f"TC{int(pid):06d}{k + 1}"
+    c.execute("SELECT COALESCE(barcode,'') FROM products WHERE id=?", (int(pid),)); kod = c.fetchone()[0]
+    conn.close()
+    return kod or None
+
+
+def tovar_kodi_ornat(pid, kod):
+    kod = (kod or '').strip()
+    if not KOD_RE.match(kod): return {'ok': False, 'error': "Kod 3–48 belgi bo'lsin (harf, raqam, - _ / . +)"}
+    sr = serial_top(kod)
+    if sr: return {'ok': False, 'error': f"Bu kod {sr['product']} seriali sifatida ro'yxatda"}
+    conn = db(); c = conn.cursor()
+    try:
+        c.execute("UPDATE products SET barcode=? WHERE id=?", (kod, int(pid))); conn.commit()
+    except sqlite3.IntegrityError:
+        c.execute("SELECT name FROM products WHERE barcode=? COLLATE NOCASE", (kod,)); r = c.fetchone(); conn.close()
+        return {'ok': False, 'error': f"Bu kod allaqachon boshqa tovarda: {r[0] if r else '?'}"}
+    conn.close()
+    return {'ok': True, 'kod': kod}
+
+
+def kod_top(matn):
+    """Matn → {'tur': 'serial', 'sr': {...}} | {'tur': 'tovar', 'pid', 'nom', 'kod'} | None."""
+    s = (matn or '').strip()
+    if not s or len(s) > 60 or '\n' in s: return None
+    sr = serial_top(s)
+    if sr: return {'tur': 'serial', 'sr': sr}
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT id, name, barcode FROM products WHERE COALESCE(barcode,'')<>'' AND barcode=? COLLATE NOCASE", (s,))
+        r = c.fetchone()
+        if not r:
+            mt = re.fullmatch(r'TC(\d{6})\d?', s, re.I)
+            if mt:
+                c.execute("SELECT id, name, COALESCE(barcode,'') FROM products WHERE id=?", (int(mt.group(1)),)); r = c.fetchone()
+        conn.close()
+    except sqlite3.OperationalError:
+        return None
+    return {'tur': 'tovar', 'pid': r[0], 'nom': r[1], 'kod': r[2] or s} if r else None
+
+
+def _yorliq_bitta(nom, narx, kod, tur, w, h, rate):
+    """Bitta yorliq rasmi (w×h px): nom, narx ($ + so'm), shtrix-kod/QR, kod matni."""
+    Image, ImageDraw, _ = _pil()
+    im = Image.new('L', (w, h), 255); d = ImageDraw.Draw(im)
+    f1, f2, f3 = _shrift(max(14, h // 11), True), _shrift(max(13, h // 12)), _shrift(max(11, h // 15))
+    pad = max(6, w // 40)
+    qatorlar, cur = [], ''
+    for so in str(nom).split():
+        t = (cur + ' ' + so).strip()
+        if d.textlength(t, font=f1) <= w - 2 * pad: cur = t
+        else:
+            if cur: qatorlar.append(cur)
+            cur = so
+    if cur: qatorlar.append(cur)
+    y = pad
+    for ql in qatorlar[:2]:
+        d.text((pad, y), ql, font=f1, fill=0); y += f1.size + 3
+    if narx:
+        d.text((pad, y), f"${narx:,.2f}" + (f" · {narx * rate:,.0f} so'm".replace(',', ' ') if rate else ''), font=f2, fill=0)
+        y += f2.size + 4
+    br = kod_rasm(kod, tur)
+    joy_h = h - y - f3.size - 2 * pad
+    if br is not None and joy_h > 20:
+        k = min((w - 2 * pad) / br.width, joy_h / br.height)
+        if tur == 'qr' or k < 1:
+            br = br.resize((max(1, int(br.width * k)), max(1, int(br.height * k))), Image.NEAREST)
+        else:
+            br = br.resize((min(w - 2 * pad, br.width), joy_h), Image.NEAREST)
+        im.paste(br, ((w - br.width) // 2, y)); y += br.height + 2
+    d.text(((w - d.textlength(kod, font=f3)) / 2, min(y, h - f3.size - pad)), kod, font=f3, fill=0)
+    d.rectangle([0, 0, w - 1, h - 1], outline=180)
+    return im
+
+
+def yorliq_varaq(elementlar, tur='code128', fayl=None, yakka=False):
+    """elementlar: [(nom, narx_usd, kod)] → A4 PDF (3×8 = 24 ta/sahifa) yoki yakka=True — bitta yorliq PNG (58×40 mm).
+    Qaytaradi fayl yo'li yoki None (Pillow yo'q)."""
+    if not _pil() or not elementlar: return None
+    Image = _pil()[0]
+    rate = get_exchange_rate()
+    if yakka:
+        nom, narx, kod = elementlar[0]
+        im = _yorliq_bitta(nom, narx, kod, tur, 464, 320, rate)          # 58×40 mm @ 203 dpi (termoprinter)
+        fayl = fayl or os.path.join(tempfile.gettempdir(), f"yorliq_{secrets.token_hex(3)}.png")
+        im.save(fayl, 'PNG', dpi=(203, 203)); return fayl
+    W, H, kol, qat, chet = 1654, 2339, 3, 8, 50                           # A4 @ 200 dpi
+    lw, lh = (W - 2 * chet) // kol, (H - 2 * chet) // qat
+    sahifalar = []
+    for i in range(0, len(elementlar), kol * qat):
+        pg = Image.new('L', (W, H), 255)
+        for j, (nom, narx, kod) in enumerate(elementlar[i:i + kol * qat]):
+            pg.paste(_yorliq_bitta(nom, narx, kod, tur, lw - 10, lh - 10, rate), (chet + (j % kol) * lw + 5, chet + (j // kol) * lh + 5))
+        sahifalar.append(pg.convert('RGB'))
+    fayl = fayl or os.path.join(tempfile.gettempdir(), f"yorliqlar_{secrets.token_hex(3)}.pdf")
+    sahifalar[0].save(fayl, 'PDF', resolution=200.0, save_all=True, append_images=sahifalar[1:])
+    return fayl
+
+
+# ── 🏷 Yorliqlar oynasi (prefiks 'kod:'), skanerlash va umumiy matn dispetcheri ────────
+def _kod_menu(st):
+    tur = st.get('tur', 'code128'); tan = st.setdefault('tan', {})
+    m = ["🏷 YORLIQLAR (shtrix-kod / QR)", "",
+         "Tovarlarni belgilang → 🖨 PDF (A4, 24 ta/varaq). Yorliqda: nom, narx ($ va so'm), kod.",
+         f"Kod turi: {'QR' if tur == 'qr' else 'Shtrix-kod (Code128)'}",
+         f"Tanlangan: {len(tan)} tovar, {sum(tan.values())} ta yorliq"]
+    if not kod_oqish_mavjud(): m.append("ℹ️ Rasmdan o'qish kutubxonasi yo'q — kodni yozing yoki telefon skaner ilovasidan yuboring.")
+    rows = [[_btn("📋 Tovar tanlash", "kod:pl:0"), _btn("🗂 Astatkadagi hammasi", "kod:all")],
+            [_btn(f"🔁 Turi: {'QR' if tur == 'qr' else 'Code128'}", "kod:fmt"), _btn("📷 Skanerlash", "kod:sc")]]
+    if tan: rows.append([_btn(f"🖨 PDF ({sum(tan.values())} ta)", "kod:pdf"), _btn("🧹 Tozalash", "kod:clr")])
+    rows.append(_x_btn('kod'))
+    return "\n".join(m), rows
+
+
+def _kod_tovarlar(st, page=0):
+    prods = sorted(get_products(), key=lambda p: p['name'])
+    per = 10; pages = max(1, math.ceil(len(prods) / per)); page = min(max(0, page), pages - 1)
+    tan = st.setdefault('tan', {})
+    rows = [[_btn(f"{'✅ ' + str(tan[p['id']]) + '× ' if p['id'] in tan else '▫️ '}{p['name'][:28]} · {p['qty'] or 0} ta",
+                  f"kod:t:{p['id']}:{page}")] for p in prods[page * per:(page + 1) * per]]
+    nav = ([_btn("◀️", f"kod:pl:{page - 1}")] if page else []) + [_btn(f"{page + 1}/{pages}", "pos:noop")] + \
+          ([_btn("▶️", f"kod:pl:{page + 1}")] if page < pages - 1 else [])
+    rows.append(nav)
+    rows.append([_btn("✔ Tayyor", "kod:menu")] + _x_btn('kod'))
+    return "Bosing: 1 → 2 → 5 → 10 → olib tashlash (yorliq soni):", rows
+
+
+def _kod_tovar(pid):
+    p = _omb_mahsulot(pid)
+    if not p: return "Topilmadi", [[_btn("⬅️ Orqaga", "kod:menu")]]
+    kod = tovar_kodi(pid, yarat=False)
+    s = serial_holat_soni(pid)
+    m = [f"🏷 {p['name']}", f"Narx: {_usd2(p['price'])} · astatka {p['qty']} ta",
+         f"Shtrix-kod: {kod or 'yo‘q (yorliq chiqarilsa TC' + format(pid, '06d') + ' beriladi)'}"]
+    rows = [[_btn(f"🖨 {n} ta", f"kod:pp:{pid}:{n}") for n in (1, 5, 10)] + ([_btn(f"🖨 {p['qty']} ta", f"kod:pp:{pid}:{p['qty']}")] if p['qty'] > 1 else []),
+            [_btn("🖼 Yakka yorliq PNG", f"kod:png:{pid}"), _btn("✍️ Kodni o'rnatish", f"kod:set:{pid}")]]
+    if s.get('omborda'): rows.append([_btn(f"🔢 Serial yorliqlari ({s['omborda']} ta, QR)", f"kod:sl:{pid}")])
+    rows.append([_btn("⬅️ Ombor kartasi", f"omb:p:{pid}")] + _x_btn('kod'))
+    return "\n".join(m), rows
+
+
+async def _kod_yubor(u, ctx, q, elementlar, tur, yakka=False, nom='yorliqlar'):
+    if not _pil():
+        await q.message.reply_text("⚠️ Rasm kutubxonasi (Pillow) o'rnatilmagan. Kodlar:\n" + "\n".join(f"{e[0]}: {e[2]}" for e in elementlar[:50]))
+        return
+    fayl = await asyncio.to_thread(yorliq_varaq, elementlar, tur, None, yakka)
+    try:
+        with open(fayl, 'rb') as fh:
+            await ctx.bot.send_document(chat_id=u.effective_chat.id, document=fh, filename=f"{nom}.{'png' if yakka else 'pdf'}",
+                                            caption=f"🏷 {len(elementlar)} ta yorliq · {'QR' if tur == 'qr' else 'Code128'}")
+    finally:
+        try: os.remove(fayl)
+        except OSError: pass
+
+
+async def cmd_yorliq(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🏷 Yorliqlar / /yorliq"""
+    if not can(u, 'ombor'):
+        if user_role(u): await u.message.reply_text("🏷 Yorliqlar — faqat egasi/admin.")
+        return
+    st = _ui_yangi(ctx, 'kod', tur='code128', tan={})
+    m, r = _kod_menu(st)
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+
+async def kod_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    parts = (q.data or '').split(':'); act = parts[1] if len(parts) > 1 else ''; arg = parts[2:]
+    if act == 'x':
+        ctx.user_data.pop('kod', None); await q.answer()
+        return await _pos_chiqar(q, "🏷 Oyna yopildi.", None)
+    if not (can(u, 'ombor') or (act == 'sc' and can(u, 'stock_view'))):
+        await q.answer("Faqat egasi/admin", show_alert=True); return
+    st = _ui_ol(ctx, 'kod') or _ui_yangi(ctx, 'kod', tur='code128', tan={})
+    st['wait'] = None
+    m = rows = None; alert = None
+
+    def _i(k, d=0):
+        try: return int(arg[k])
+        except (IndexError, ValueError): return d
+    if act == 'menu':
+        m, rows = _kod_menu(st)
+    elif act == 'pl':
+        m, rows = _kod_tovarlar(st, _i(0))
+    elif act == 't':
+        tan = st.setdefault('tan', {}); pid = _i(0)
+        nxt = {None: 1, 1: 2, 2: 5, 5: 10}.get(tan.get(pid))
+        if nxt: tan[pid] = nxt
+        else: tan.pop(pid, None)
+        m, rows = _kod_tovarlar(st, _i(1))
+    elif act == 'all':
+        st['tan'] = {p['id']: 1 for p in get_products() if (p['qty'] or 0) > 0}
+        m, rows = _kod_menu(st)
+    elif act == 'clr':
+        st['tan'] = {}; m, rows = _kod_menu(st)
+    elif act == 'fmt':
+        st['tur'] = 'code128' if st.get('tur') == 'qr' else 'qr'; m, rows = _kod_menu(st)
+    elif act == 'sc':
+        st['wait'] = 'scan'
+        m, rows = "📷 Shtrix-kod/QR rasmini yuboring yoki kodni yozing (telefon skaner ilovasi ham bo'ladi):", [_x_btn('kod')]
+    elif act in ('pdf', 'pp', 'png', 'sl'):
+        if act == 'pdf':
+            reja = list(st.get('tan', {}).items())
+        elif act == 'pp':
+            reja = [(_i(0), max(1, min(200, _i(1, 1))))]
+        else:
+            reja = [(_i(0), 1)]
+        by = {p['id']: p for p in get_products()}
+        el = []
+        if act == 'sl':
+            p = by.get(_i(0))
+            el = [(p['name'], p['price'] or 0, sn) for _, sn in serial_omborda(_i(0), 500)] if p else []
+        else:
+            for pid, n in reja:
+                p = by.get(pid)
+                if not p: continue
+                kod = tovar_kodi(pid)
+                el += [(p['name'], p['price'] or 0, kod)] * n
+        if not el: alert = "Tanlangan tovar yo'q"
+        elif len(el) > 1000: alert = "Juda ko'p (1000 dan ortiq) — kamroq tanlang"
+        else:
+            await q.answer("⏳ Tayyorlanmoqda...")
+            try:
+                await _kod_yubor(u, ctx, q, el, 'qr' if act == 'sl' else st.get('tur', 'code128'), yakka=(act == 'png'))
+            except Exception as e:
+                log.exception("yorliq"); await q.message.reply_text(f"⚠️ Yorliq xatosi: {str(e)[:150]}")
+            return
+    elif act == 'p':
+        m, rows = _kod_tovar(_i(0))
+    elif act == 'set':
+        st['wait'] = f"set:{_i(0)}"
+        m, rows = ("✍️ Tovar qutisidagi shtrix-kodni yozing yoki rasmini yuboring (masalan EAN-13 raqami):",
+                   [[_btn("⬅️ Orqaga", f"kod:p:{_i(0)}")]])
+    else:
+        alert = "Eski tugma"
+    await q.answer(alert[:190] if alert else None, show_alert=bool(alert))
+    if m is not None: await _pos_chiqar(q, m, rows)
+
+
+async def kod_natija(u, ctx, msg, joy='sn'):
+    """Kod/serial → karta (tovar yoki serial). Topilmasa xabar. True qaytaradi."""
+    k = kod_top(msg)
+    if not k:
+        await u.message.reply_text(f"🔎 '{(msg or '')[:40]}' — bunday serial yoki shtrix-kod topilmadi. Qaytadan yozing:",
+                                   reply_markup=InlineKeyboardMarkup([_x_btn(joy if joy in ('sn', 'kod') else 'sn')]))
+        st = _ui_ol(ctx, joy)
+        if st is not None: st['wait'] = 'find' if joy == 'sn' else ('scan' if joy == 'kod' else 'search')
+        return True
+    if k['tur'] == 'serial':
+        _ui_ol(ctx, 'sn') or _ui_yangi(ctx, 'sn')
+        await u.message.reply_text(serial_karta(k['sr']), reply_markup=InlineKeyboardMarkup(_sn_karta_kb(u, k['sr'])))
+    else:
+        _ui_ol(ctx, 'omb') or _ui_yangi(ctx, 'omb')
+        m, r = _omb_karta(u, k['pid'])
+        await u.message.reply_text(f"🏷 {k['kod']}\n" + m, reply_markup=InlineKeyboardMarkup(r))
+    return True
+
+
+async def kod_matn(u, ctx, msg):
+    st = _ui_ol(ctx, 'kod')
+    if not st or not st.get('wait'): return False
+    w = st['wait']
+    if w == 'scan':
+        if not can(u, 'stock_view'): return False
+        st['wait'] = None
+        return await kod_natija(u, ctx, msg, 'kod')
+    if w.startswith('set:') and can(u, 'ombor'):
+        pid = int(w.split(':')[1])
+        res = tovar_kodi_ornat(pid, msg)
+        if not res['ok']:
+            await u.message.reply_text(f"⚠️ {res['error']}\nQaytadan yozing:"); return True
+        st['wait'] = None
+        m, r = _kod_tovar(pid)
+        await u.message.reply_text(f"✅ Shtrix-kod saqlandi: {res['kod']}\n\n" + m, reply_markup=InlineKeyboardMarkup(r))
+        return True
+    return False
+
+
+def _skan_holat(ctx):
+    """Rasm kutayotgan oyna: (joy, wait) yoki None."""
+    pos = ctx.user_data.get('pos')
+    if pos and (pos.get('wait') == 'search' or str(pos.get('wait') or '').startswith('sn:')):
+        return 'pos', pos['wait']
+    for joy, mos in (('omb', ('search',)), ('sn', ('find', 'in:')), ('kod', ('scan', 'set:')), ('qr', ('find',))):
+        st = ctx.user_data.get(joy)
+        w = str((st or {}).get('wait') or '')
+        if w and any(w == x or (x.endswith(':') and w.startswith(x)) for x in mos):
+            if time.time() - st.get('ts', 0) <= UI_TTL: return joy, w
+    return None
+
+
+async def skan_rasm(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """handle_photo_ai boshida: skaner kutilayotgan bo'lsa — rasmdagi shtrix-kod/QR'ni o'qiydi. True = ishlatildi."""
+    if not getattr(u, 'message', None) or not u.message.photo: return False
+    h = _skan_holat(ctx)
+    if not h or not can(u, 'stock_view'): return False
+    joy, w = h
+    try:
+        f = await ctx.bot.get_file(u.message.photo[-1].file_id)
+        raw = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        await u.message.reply_text(f"⚠️ Rasmni yuklab bo'lmadi: {str(e)[:120]}"); return True
+    kodlar = await asyncio.to_thread(kod_oqi, raw)
+    if not kodlar:
+        kut = kod_oqish_mavjud()
+        await u.message.reply_text("📷 Rasmdan kod o'qilmadi." + (" Yaqinroq, tekis va yorug' joyda suratga oling" if kut else
+                                   " (serverda o'qish kutubxonasi yo'q)") + " yoki kodni yozib yuboring.")
+        return True
+    matn = "\n".join(kodlar)
+    await u.message.reply_text("📷 O'qildi: " + ", ".join(kodlar)[:300])
+    if joy == 'pos':
+        pos = _pos_ol(ctx)
+        if not pos: return True
+        pos['wait'] = None
+        return await pos_kod_matn(u, ctx, pos, matn if w.startswith('sn:') else kodlar[0], w)
+    if joy == 'omb':
+        return await kod_natija(u, ctx, kodlar[0], 'omb')
+    if joy == 'qr':
+        return await qr_kod_top(u, ctx, kodlar[0])
+    if joy == 'sn':
+        return await sn_matn(u, ctx, matn if w.startswith('in:') else kodlar[0])
+    return await kod_matn(u, ctx, kodlar[0])
+
+
+async def b10_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """10-bosqich oynalari yozma kiritish kutayotgan bo'lsa (handle_text zanjirida)."""
+    if not any(ctx.user_data.get(k) for k in ('zx', 'qr', 'sm', 'sn', 'kod')): return False
+    msg = (u.message.text or '').strip()
+    return (await zx_matn(u, ctx, msg) or await qr_matn(u, ctx, msg) or await sm_matn(u, ctx, msg)
+            or await sn_matn(u, ctx, msg) or await kod_matn(u, ctx, msg))
+
+
+async def kod_erkin(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Hech qaysi oyna kutmayotganda: xabar AYNAN ro'yxatdagi serial yoki shtrix-kod bo'lsa — kartasi.
+    (Telefon skaner ilovasi kodni matn qilib yuboradi.) Boshqa barcha matn — eskicha AI/buyruqlarga."""
+    msg = (u.message.text or '').strip()
+    if not (6 <= len(msg) <= 48) or ' ' in msg or not can(u, 'stock_view'): return False
+    harf, raqam = any(ch.isalpha() for ch in msg), any(ch.isdigit() for ch in msg)
+    if not ((harf and raqam) or (msg.isdigit() and len(msg) >= 8)): return False
+    if not kod_top(msg): return False
+    return await kod_natija(u, ctx, msg, 'sn')
+
+
 async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     # Faqat egasi: aks holda kanal/forward qilingan xabardagi tugma orqali begona odam
@@ -10928,10 +13723,11 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rol: return
     msg = u.message.text
     if msg in MENU_MAP:
-        for _k in ('pos', 'omb', 'mij', 'his', 'zav', 'mkt'):     # menyu bosildi — tugmali oynalar kutishi bekor
+        for _k in ('pos', 'omb', 'mij', 'his', 'zav', 'mkt', 'zx', 'qr', 'sm', 'sn', 'kod'):  # menyu bosildi — kutish bekor
             if ctx.user_data.get(_k): ctx.user_data[_k]['wait'] = None
     elif (await pos_matn(u, ctx) or await omb_matn(u, ctx) or await mij_matn(u, ctx)
-          or await his_matn_kirit(u, ctx) or await zav_matn(u, ctx) or await mkt_matn(u, ctx)):
+          or await his_matn_kirit(u, ctx) or await zav_matn(u, ctx) or await mkt_matn(u, ctx)
+          or await b10_matn(u, ctx) or await kod_erkin(u, ctx)):
         return
     if rol == 'sotuvchi':
         await sotuvchi_matn(u, ctx, msg); return
@@ -11923,7 +14719,8 @@ async def cmd_restore(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not args or args[0].lower() not in ('ha', 'yes'):
         await u.message.reply_text(
             "⚠️ Bu hozirgi bazani GitHub dagi zaxira bilan ALMASHTIRADI.\n"
-            "Hozirgi ma'lumotlar yo'qoladi.\n\nTasdiqlash: /restore ha")
+            "Hozirgi ma'lumotlar yo'qoladi.\n\nTasdiqlash: /restore ha\n\n"
+            "💾 Telegram'dagi zaxira faylidan (.zip) tiklash: faylni shu chatga yuboring.")
         return
     status, raw, info = await asyncio.to_thread(db_fetch_remote)
     if status != 'ok':
@@ -12039,6 +14836,8 @@ async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fname = ((doc.file_name if doc else '') or '').lower()
     if fname.endswith(('.xlsx', '.xlsm')):
         return await handle_excel(u, ctx)
+    if fname.endswith(('.zip', '.db', '.sqlite', '.sqlite3')):
+        return await zaxira_hujjat(u, ctx)                 # 💾 zaxira faylidan tiklash (faqat egasi, tasdiq bilan)
     if fname.endswith(('.xls', '.csv', '.ods', '.numbers')):
         await u.message.reply_text("📥 Excel faylni .xlsx formatida saqlab yuboring (Fayl → Saqlash → Excel .xlsx).")
         return
@@ -12046,6 +14845,7 @@ async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("Bot kodini yangilash faqat egasiga ruxsat etilgan."); return
     if not doc or not fname.endswith('.py'):
         await u.message.reply_text("Qabul qilinadigan fayllar:\n• .xlsx — Excel jadval (astatka, sotuv, xarajat, kassa import)\n"
+                                   "• .zip — 💾 zaxira faylidan tiklash (faqat egasi)\n"
                                    "• .py — bot kodini yangilash")
         return
     await u.message.reply_text(f"⏳ {doc.file_name} qabul qilindi, tekshirilmoqda...")
@@ -13017,6 +15817,11 @@ def main():
     app.add_handler(CommandHandler('hisobotlar', cmd_hisobotlar))
     app.add_handler(CommandHandler('zavod', cmd_zavod_ui))
     app.add_handler(CommandHandler('marketing', cmd_marketing))
+    app.add_handler(CommandHandler('zaxira', cmd_zaxira))
+    app.add_handler(CommandHandler('qaytarish', cmd_qaytarish))
+    app.add_handler(CommandHandler('smena', cmd_smena))
+    app.add_handler(CommandHandler('serial', cmd_serial))
+    app.add_handler(CommandHandler('yorliq', cmd_yorliq))
     app.add_handler(CommandHandler('help', cmd_yordam))
     app.add_handler(CommandHandler('yordam', cmd_yordam))
     app.add_handler(CommandHandler('astatka', cmd_astatka))
@@ -13089,6 +15894,11 @@ def main():
     app.add_handler(CallbackQueryHandler(mkt_callback, pattern=r'^mkt:'))
     app.add_handler(CallbackQueryHandler(lead_callback, pattern=r'^lead:'))
     app.add_handler(CallbackQueryHandler(pub_callback, pattern=r'^pub:'))
+    app.add_handler(CallbackQueryHandler(zx_callback, pattern=r'^zx:'))
+    app.add_handler(CallbackQueryHandler(qr_callback, pattern=r'^qr:'))
+    app.add_handler(CallbackQueryHandler(sm_callback, pattern=r'^sm:'))
+    app.add_handler(CallbackQueryHandler(sn_callback, pattern=r'^sn:'))
+    app.add_handler(CallbackQueryHandler(kod_callback, pattern=r'^kod:'))
     app.add_handler(MessageHandler(filters.CONTACT & ~STAFF, pub_contact))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
