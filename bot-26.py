@@ -20,7 +20,7 @@ try:
 except Exception:
     pass
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                       InputMediaPhoto, ReplyKeyboardMarkup)
+                       InputMediaPhoto, InputMediaVideo, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                            CallbackQueryHandler, ConversationHandler,
                            filters, ContextTypes, TypeHandler, ApplicationHandlerStop)
@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 # httpx har so'rovni INFO darajada URL bilan yozadi — URL ichida BOT_TOKEN bor (Railway loglarida token ochiq turardi)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)      # Instagram so'rovlari URL'ida token bo'lishi mumkin
 
 # ── CONFIG ────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv('BOT_TOKEN', '')
@@ -412,6 +413,7 @@ def init_db():
     conn.commit(); conn.close()
     init_stock_tables()          # ombor jurnali + boshlang'ich qoldiq (idempotent)
     init_po_tables()             # zavod buyurtmalari (8-bosqich, idempotent)
+    init_marketing_tables()      # marketing: postlar, so'rovlar, sozlamalar, sayt keshi (9-bosqich, idempotent)
     log.info("DB tayyor!")
 
 
@@ -2963,9 +2965,12 @@ async def handle_photo_ai(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not can(u, 'boshqaruv'): return
     cap = (u.message.caption or "").strip()
     if any(w in cap.lower() for w in ("kanal", "post", "e'lon", "elon")):
-        return await handle_photo_post(u, ctx)
+        return await mkt_media(u, ctx)                     # oldindan ko'rish bilan (avval darhol kanalga ketardi)
     if ctx.user_data.get('photo_product_id'):
         return await handle_photo(u, ctx)
+    _mst = _ui_ol(ctx, 'mkt')
+    if _mst and (_mst.get('wait') == 'media' or (getattr(u.message, 'media_group_id', None) and _mst.get('mg') == u.message.media_group_id)):
+        return await mkt_media(u, ctx)
     await ctx.bot.send_chat_action(chat_id=u.effective_chat.id, action='typing')
     try:
         f = await ctx.bot.get_file(u.message.photo[-1].file_id)
@@ -3049,6 +3054,14 @@ async def _scheduler(app):
             except Exception: log.exception("ertalab ogohlantirish")
         if hm == be and ('e' + key[:10]) not in sent:
             sent.add('e' + key[:10]); await _briefing(app, 'evening')
+        # Kunlik kontent (9-bosqich): vaqt — 📢 Marketing sozlamasi; restartdan keyin takrorlanmaydi (kontent_ishladi)
+        try:
+            if (app is not None and ('k' + key[:10]) not in sent and hm == _hhmm(soz('kontent_vaqt'))
+                    and soz('kontent_kunlik') == '1' and soz('kontent_ishladi') != key[:10]):
+                sent.add('k' + key[:10]); soz_yoz('kontent_ishladi', key[:10])
+                _t = asyncio.create_task(kontent_kunlik(app.bot)); _FON.add(_t); _t.add_done_callback(_FON.discard)
+        except Exception:
+            log.exception("kunlik kontent")
         # Eski kunlarni tozalash (avval sent.clear() — xuddi shu daqiqada xulosa ikkinchi marta ketishi mumkin edi)
         if len(sent) > 50: sent = {k for k in sent if k[1:] == key[:10]}
         # Kunlik kursni oldindan (alohida oqimda) olib qo'yamiz — handlerlar keshdan oladi, tarmoqni kutmaydi
@@ -4850,11 +4863,12 @@ MENU_MAP = {
     "📊 Hisobotlar": "hisobotlar",
     "🏭 Zavod": "zavod_ui",
     "⚙️ Boshqa": "boshqa",
+    "📢 Marketing": "marketing",
     "⬅️ Asosiy menyu": "asosiy",
 }
 
 # Egasi/admin asosiy menyusi (5–8-bosqich). Eski to'liq menyu — "⚙️ Boshqa" ichida, barcha eski tugmalar ishlaydi.
-ASOSIY_KB = [["🛒 Sotuv", "📦 Ombor"], ["👥 Mijozlar", "📊 Hisobotlar"], ["🏭 Zavod", "👷 Sotuvchilar"], ["⚙️ Boshqa"]]
+ASOSIY_KB = [["🛒 Sotuv", "📦 Ombor"], ["👥 Mijozlar", "📊 Hisobotlar"], ["🏭 Zavod", "👷 Sotuvchilar"], ["📢 Marketing", "⚙️ Boshqa"]]
 # Olib tashlangan (yangi ekran to'liq qoplaydi): 📦 Astatka → 📦 Ombor; 💰 Bugun / 📈 Oylik / 📅 Yillik → 📊 Hisobotlar;
 # 💳 Zavod qarzi → 🏭 Zavod → Zavodlar balansi; 💳 Qarzlar → 👥 Mijozlar → Qarzdorlar/Kreditorlar;
 # 💵 Cash Flow → 📊 Hisobotlar → 💰 Kassa; 👥 Mijozlar (takror). Buyruqlari (/astatka, /bugun, /oy ...) qoladi.
@@ -4917,6 +4931,7 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     elif action == 'ombor':         await cmd_ombor(u, ctx)
     elif action == 'hisobotlar':    await cmd_hisobotlar(u, ctx)
     elif action == 'zavod_ui':      await cmd_zavod_ui(u, ctx)
+    elif action == 'marketing':     await cmd_marketing(u, ctx)
     elif action == 'boshqa':
         if can(u, 'boshqaruv'):
             await u.message.reply_text("⚙️ Boshqa bo'limlar. Qaytish: ⬅️ Asosiy menyu",
@@ -4934,6 +4949,8 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
 
 async def cmd_start_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Mijoz /start bosganda — ro'yxatga oladi va katalog ko'rsatadi"""
+    if ctx.args and await pub_start_link(u, ctx, ctx.args[0]):      # kanal tugmasi: /start p<ID>
+        return
     us = u.effective_user
     nomi = (us.first_name or '') + ((' ' + us.last_name) if us.last_name else '')
     yangi = sub_add(us.id, nomi.strip(), us.username or '', 'start')
@@ -4976,8 +4993,16 @@ async def cmd_stop_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("Obuna bekor qilindi. Qaytish uchun /start bosing.")
 
 async def handle_text_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Mijoz yozganda — egasiga yetkazadi"""
+    """Mijoz yozganda: so'rov (ism/telefon) → tovar kartasi → aks holda egasiga yetkazadi"""
     us = u.effective_user
+    if await pub_matn(u, ctx): return
+    if not _rl_ok(us.id, 'msg', 20, 60):
+        if _rl_ok(us.id, 'ogoh', 1, 60): await u.message.reply_text("Juda ko'p xabar — 1 daqiqadan keyin yozing.")
+        return
+    try:
+        if await pub_qidir(u, ctx): return
+    except Exception:
+        log.exception("ochiq qidiruv")
     sub_add(us.id, ((us.first_name or '') + (' ' + us.last_name if us.last_name else '')).strip(),
             us.username or '', 'message')
     await u.message.reply_text(
@@ -5650,6 +5675,7 @@ async def cmd_yordam(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📦 *Ombor:* /ombor · kam qolganlar: /kam\n"
         "👥 *Mijozlar:* 👥 Mijozlar tugmasi · qarzdorlar: /qarzdorlar\n"
         "📊 *Hisobotlar:* /hisobotlar · 🏭 *Zavod buyurtmalari:* /zavod\n"
+        "📢 *Marketing:* /marketing — video/rasm yuboring → tovar → ko'rinish → kanal/Instagram\n"
         "⚙️ Boshqa — eski to'liq menyu\n"
         "👷 *Xodimlar:* /xodim\\_qosh /xodimlar /xodim\\_ochir\n"
         "📊 Sotuvchilar hisoboti: /sotuvchilar · ID bilish: /id\n\n"
@@ -8772,6 +8798,2063 @@ async def zav_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return True
 
 
+# ══════════════════════════════════════════════════════════════════
+# ── 📢 MARKETING (9-bosqich): kanal posti, Instagram, ochiq katalog, so'rovlar (lead)
+# ══════════════════════════════════════════════════════════════════
+# Xavfsizlik: post/karta matnlari faqat sotuv narxi (price) dan tuziladi — tannarx (cost/factory)
+# hech qachon o'qilmaydi (_mkt_p SELECT'ida cost yo'q). Instagram tokeni hech qachon logga yozilmaydi.
+TG_CAPTION_MAX = 1024          # Telegram: media izohi
+TG_TEXT_MAX = 4096
+IG_CAPTION_MAX = 2200          # Instagram: izoh
+IG_HASHTAG_MAX = 30
+IG_POLL_SEC = 5                # media konteyner holatini so'rash oralig'i (test: 0)
+IG_POLL_TIMEOUT = 300
+IG_FON = True                  # Instagram'ga fon vazifada (test: False — kutib turadi)
+TG_DL_MAX = 20 * 1024 * 1024   # Bot API getFile chegarasi (20 MB)
+SOZ_DEFAULT = {
+    'ochiq_qoldiq': '0',       # ochiq kartada aniq dona sonini ko'rsatish
+    'lead_sotuvchi': '0',      # so'rovlar sotuvchilarga ham boradimi
+    'aloqa_tel': '',           # bo'sh — FIRMA_TEL
+    'auto_post': '0',          # kunlik kontent: 1 — oldindan ko'rsatmasdan joylaydi
+    'auto_platforma': 'tg',    # tg | ig | both
+    'kontent_kunlik': '1',     # kunlik kontent (oldindan ko'rish) yoqilgan
+    'kontent_vaqt': '10:00',   # Toshkent vaqti
+    'kontent_kun': '14',       # shu kun ichida joylangan tovar takrorlanmaydi
+    'manba_korsat': '1',       # "Manba: <brend> rasmiy sayti"
+}
+PLATFORMA_NOMI = {'tg': 'Telegram', 'ig': 'Instagram', 'both': 'Telegram + Instagram'}
+
+
+class IgXato(Exception):
+    pass
+
+
+def init_marketing_tables():
+    """Additiv va idempotent: sozlamalar, postlar, qoralamalar, so'rovlar, yetkazuvchi kontenti keshi."""
+    conn = db(); c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS sozlamalar (kalit TEXT PRIMARY KEY, qiymat TEXT)")
+    c.execute('''CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, product_id INTEGER, product TEXT DEFAULT '',
+        platform TEXT, status TEXT, message_id TEXT DEFAULT '', link TEXT DEFAULT '', media_type TEXT DEFAULT '',
+        caption TEXT DEFAULT '', draft_id INTEGER, source TEXT DEFAULT '', user_id INTEGER DEFAULT 0, error TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS post_drafts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, source TEXT DEFAULT 'tg', product_id INTEGER,
+        media TEXT DEFAULT '[]', caption TEXT DEFAULT '', custom INTEGER DEFAULT 0, show_price INTEGER DEFAULT 1,
+        extra TEXT DEFAULT '', video_link TEXT DEFAULT '', manba TEXT DEFAULT '', status TEXT DEFAULT 'qoralama',
+        user_id INTEGER DEFAULT 0, chat_id INTEGER DEFAULT 0, note TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, chat_id INTEGER, username TEXT DEFAULT '',
+        name TEXT DEFAULT '', phone TEXT DEFAULT '', product_id INTEGER, product TEXT DEFAULT '',
+        qty INTEGER DEFAULT 1, status TEXT DEFAULT 'yangi', handled_by TEXT DEFAULT '', note TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS supplier_content (
+        product_id INTEGER PRIMARY KEY, url TEXT, fetched TEXT, title TEXT DEFAULT '',
+        images TEXT DEFAULT '[]', videos TEXT DEFAULT '[]', text TEXT DEFAULT '',
+        status TEXT DEFAULT '', error TEXT DEFAULT '')''')
+    for ddl in ("ALTER TABLE products ADD COLUMN public_show INTEGER DEFAULT 1",
+                "ALTER TABLE products ADD COLUMN public_price INTEGER DEFAULT 1",
+                "ALTER TABLE products ADD COLUMN supplier_url TEXT DEFAULT ''",
+                "ALTER TABLE products ADD COLUMN supplier_url_ok INTEGER DEFAULT 0"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass
+    c.execute("CREATE INDEX IF NOT EXISTS idx_posts_pid ON posts(product_id, created)")
+    conn.commit(); conn.close()
+
+
+def soz(kalit):
+    try:
+        conn = db(); r = conn.execute("SELECT qiymat FROM sozlamalar WHERE kalit=?", (kalit,)).fetchone(); conn.close()
+    except sqlite3.OperationalError:
+        r = None
+    return r[0] if r and r[0] is not None else SOZ_DEFAULT.get(kalit, '')
+
+
+def soz_yoz(kalit, qiymat):
+    conn = db()
+    conn.execute("INSERT INTO sozlamalar (kalit, qiymat) VALUES (?,?) ON CONFLICT(kalit) DO UPDATE SET qiymat=excluded.qiymat",
+                 (kalit, str(qiymat)))
+    conn.commit(); conn.close()
+
+
+def _mkt_vaqt(): return _local_now().strftime('%Y-%m-%d %H:%M')
+
+
+def _mkt_p(pid):
+    """Post/karta uchun tovar. ATAYLAB tannarx (cost/factory_price) o'qilmaydi."""
+    try: pid = int(pid)
+    except (TypeError, ValueError): return None
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id,name,cat,supplier,qty,price,warranty_days,active,COALESCE(public_show,1),COALESCE(public_price,1),"
+              "COALESCE(supplier_url,''),COALESCE(supplier_url_ok,0) FROM products WHERE id=?", (pid,))
+    r = c.fetchone(); conn.close()
+    if not r: return None
+    return {'id': r[0], 'name': r[1], 'cat': r[2] or '', 'sup': r[3] or '', 'qty': int(r[4] or 0),
+            'price': float(r[5] or 0), 'warranty': int(r[6] or 0), 'active': int(r[7] or 0),
+            'public_show': int(r[8]), 'public_price': int(r[9]), 'supplier_url': r[10] or '', 'url_ok': int(r[11])}
+
+
+def _mkt_tel(): return (soz('aloqa_tel') or FIRMA.get('tel') or '').strip()
+
+
+def _uzs_txt(usd, rate):
+    return f"{round(float(usd) * float(rate) / 1000) * 1000:,.0f}".replace(',', ' ')
+
+
+def _narx_txt(p, rate=None):
+    """'$1,250 (~15 625 000 so'm)'"""
+    rate = rate or get_exchange_rate()
+    return f"{fmt(p['price'])} (~{_uzs_txt(p['price'], rate)} so'm)"
+
+
+def _kafolat_txt(days):
+    d = int(days or 0)
+    if d <= 0: return ''
+    if d % 365 == 0: return f"{d // 365} yil"
+    if d % 30 == 0: return f"{d // 30} oy"
+    return f"{d} kun"
+
+
+def _brend(sup):
+    s = (sup or '').lower().replace(' ', '')
+    for k, v in SUPPLIER_SAYTLAR.items():
+        if k.replace(' ', '') in s: return v['nom']
+    return sup or ''
+
+
+def _heshteg(s):
+    t = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_]", '', str(s or '').replace(' ', ''))
+    return ('#' + t) if len(t) >= 2 else ''
+
+
+def _heshteglar(p, ig=False):
+    tags = ['#ThermoCrafts', _heshteg(_brend(p['sup'])), _heshteg(p['cat'])]
+    sup = (p['sup'] or '').lower()
+    if ig:
+        tags += ['#Toshkent', '#Uzbekistan', '#biznes']
+        if 'tree' in sup: tags += ['#lazerstanok', '#lazergravyor', '#cnc', '#lasercutting', '#laserengraving']
+        elif 'freesub' in sup: tags += ['#termopress', '#sublimatsiya', '#heatpress', '#sublimation', '#futbolkapechat']
+        tags.append(_heshteg(p['name']))
+    out = []
+    for t_ in tags:
+        if t_ and t_.lower() not in [o.lower() for o in out]: out.append(t_)
+    return ' '.join(out[:IG_HASHTAG_MAX if ig else 5])
+
+
+def _yigish(bosh, ixt, oxir, limit):
+    """Majburiy bosh/oxir qatorlari + ixtiyoriy (oxiridan tashlab) — limitga sig'diradi."""
+    sp = list(ixt)
+    while True:
+        t_ = '\n'.join(bosh + sp + oxir)
+        t_ = re.sub(r'\n{3,}', '\n\n', t_).strip()
+        if len(t_) <= limit or not sp: break
+        sp.pop()
+    if len(t_) > limit: t_ = t_[:limit - 1].rstrip() + '…'
+    return t_
+
+
+def _narxsiz(s):
+    """Begona narxlarni ($499, 499 USD, €…) olib tashlaydi — yetkazuvchi narxi postga tushmasin."""
+    s = re.sub(r'(?:US\s*)?[$€£¥]\s?\d[\d,.\s]*', '', str(s or ''))
+    return re.sub(r'\b\d[\d,.]*\s?(?:USD|EUR|usd|dollar)\b', '', s)
+
+
+def post_matn(p, show_price=True, extra='', video_link='', manba='', ig=False, rate=None, bot_user=''):
+    """Kanal (ig=False) yoki Instagram (ig=True) uchun tayyor matn (oddiy matn). Tannarx YO'Q."""
+    rate = rate or get_exchange_rate()
+    brend = _brend(p['sup'])
+    bosh = [f"🔥 {p['name']}"]
+    if brend or p['cat']: bosh.append("🏷 " + " · ".join(x for x in (brend, p['cat']) if x))
+    bosh.append('')
+    if show_price and p['price'] > 0: bosh.append(f"💵 Narxi: {_narx_txt(p, rate)}")
+    else: bosh.append("💬 Narxi: so'rov bo'yicha")
+    bosh.append("✅ Mavjud — Toshkentda" if p['qty'] > 0 else "🕐 Buyurtma asosida")
+    ixt = []
+    feats = [ln.strip(' •-*\t') for ln in _narxsiz(extra).splitlines() if ln.strip(' •-*\t')]
+    if feats:
+        ixt += ['', "✨ Afzalliklari:"] + [f"• {ln}" for ln in feats[:8]]
+    specs = get_product_specs(p['id'])
+    if specs:
+        ixt += ['', "⚙️ Xususiyatlari:"] + [f"• {k}: {v}" for k, v in specs[:12]]
+    oxir = ['']
+    kf = _kafolat_txt(p['warranty'])
+    if kf: oxir.append(f"🛡 Kafolat: {kf}")
+    if video_link: oxir.append(f"🎬 Video: {video_link}")
+    oxir.append(f"📍 {FIRMA.get('manzil') or 'Toshkent'}")
+    tel = _mkt_tel()
+    if ig:
+        oxir.append("📩 Buyurtma: Direct'ga yozing" + (f" yoki 📞 {tel}" if tel else ''))
+        if bot_user: oxir.append(f"🤖 Telegram: @{bot_user}")
+    else:
+        oxir.append((f"📞 {tel} yoki " if tel else "📞 ") + "pastdagi «🛒 Buyurtma berish» tugmasi")
+    if manba: oxir.append(f"ℹ️ Manba: {manba} rasmiy sayti")
+    oxir += ['', _heshteglar(p, ig)]
+    return _yigish(bosh, ixt, oxir, IG_CAPTION_MAX if ig else TG_CAPTION_MAX)
+
+
+def _tg_html(matn):
+    """Birinchi qator qalin, qolgani escape — foydalanuvchi matni HTML sifatida talqin qilinmaydi."""
+    bir, _, qol = str(matn).partition('\n')
+    return f"<b>{_html.escape(bir)}</b>" + (('\n' + _html.escape(qol)) if qol else '')
+
+
+def _ig_caption_qoshimcha(caption, p, bot_user=''):
+    """Qo'lda yozilgan matn: Instagram uchun tugma o'rniga aloqa + heshteglar qo'shiladi."""
+    t_ = re.sub(r".*«🛒 Buyurtma berish».*\n?", '', caption).rstrip()
+    tel = _mkt_tel()
+    if "Direct" not in t_:
+        t_ += "\n\n📩 Buyurtma: Direct'ga yozing" + (f" yoki 📞 {tel}" if tel else '')
+        if bot_user: t_ += f"\n🤖 Telegram: @{bot_user}"
+    if p and '#' not in t_: t_ += "\n\n" + _heshteglar(p, True)
+    return t_[:IG_CAPTION_MAX]
+
+
+# ── AI bilan matn (ixtiyoriy; ishlamasa — shablon) ──
+def _ai_matn(system, user, max_tokens=700):
+    try:
+        resp = ai.messages.create(model=AI_MODEL, max_tokens=max_tokens, system=system,
+                                  messages=[{"role": "user", "content": user}])
+        return ''.join(getattr(b, 'text', '') for b in resp.content).strip()
+    except Exception as e:
+        log.warning("AI matn: %s", type(e).__name__)
+        return ''
+
+
+def _ai_tekshir(matn, p, show_price, limit):
+    """AI matni: narx aynan bizniki, boshqa $-summa yo'q, limitga sig'adi."""
+    if not matn or len(matn) > limit: return False
+    summalar = set(re.findall(r'\$\s?[\d,]+(?:\.\d+)?', matn))
+    if show_price and p['price'] > 0:
+        return summalar <= {fmt(p['price'])} and fmt(p['price']) in matn
+    return not summalar
+
+
+def ai_post_matn(p, asos, show_price=True, manba_matn=''):
+    system = ("Sen ThermoCrafts (Toshkent, lazer/CNC/termopress uskunalari) Telegram kanali uchun o'zbek tilida (lotin) "
+              "post yozasan. Qoidalar: faqat berilgan faktlardan foydalan, yangi raqam yoki xususiyat o'ylab topma; "
+              "narx qatorini aynan saqla (narx bo'lmasa narx yozma); tannarx, foyda, ulgurji narx haqida hech narsa yozma; "
+              "900 belgidan oshmasin; emoji me'yorida; aloqa qatori va heshteglarni saqla. Faqat post matnini qaytar.")
+    user = f"Shablon post:\n{asos}"
+    if manba_matn:
+        user += "\n\nIshlab chiqaruvchi ma'lumoti (inglizcha — kerakli 3-5 ta afzallikni tarjima qilib qo'sh):\n" + _narxsiz(manba_matn)[:2500]
+    m = _ai_matn(system, user)
+    return m if _ai_tekshir(m, p, show_price, TG_CAPTION_MAX) else ''
+
+
+def ai_xususiyatlar(matn, n=5):
+    """Yetkazuvchi (inglizcha) matnidan 3-5 ta qisqa o'zbekcha afzallik. Ishlamasa — []."""
+    if not matn: return []
+    m = _ai_matn("Inglizcha texnik matndan uskunaning eng muhim 3-5 ta afzalligini o'zbek tilida (lotin), har birini alohida "
+                 "qatorda, qisqa (60 belgigacha) yoz. Narx, chegirma, yetkazib berish, kafolat shartlarini yozma. Faqat ro'yxat.",
+                 _narxsiz(matn)[:3000], 400)
+    out = [ln.strip(' •-*0123456789.)\t') for ln in m.splitlines()]
+    out = [ln[:90] for ln in out if 3 <= len(ln) and '$' not in ln]      # narx qatori bo'lsa — tashlanadi
+    return out[:n]
+
+
+def _matndan_xususiyat(matn, n=5):
+    """Shablon (AI yo'q): yetkazuvchi matnidan 'Kalit: qiymat' qatorlari (asl tilda)."""
+    out = []
+    for ln in _narxsiz(matn).splitlines():
+        ln = ln.strip(' •-*\t')
+        if 8 <= len(ln) <= 90 and (':' in ln or re.search(r'\d', ln)): out.append(ln)
+        if len(out) >= n: break
+    return out
+
+
+# ── Qoralamalar ──
+def draft_yarat(source, pid=None, media=None, user_id=0, chat_id=0, extra='', video_link='', manba='', show_price=1):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO post_drafts (created,source,product_id,media,show_price,extra,video_link,manba,user_id,chat_id) "
+              "VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (_mkt_vaqt(), source, pid, json.dumps(media or []), int(show_price), extra or '', video_link or '',
+               manba or '', user_id, chat_id))
+    did = c.lastrowid; conn.commit(); conn.close()
+    if pid: draft_matn_yangila(did)
+    return did
+
+
+def draft_ol(did):
+    try: did = int(did)
+    except (TypeError, ValueError): return None
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id,created,source,product_id,media,caption,custom,show_price,extra,video_link,manba,status,user_id,chat_id,note "
+              "FROM post_drafts WHERE id=?", (did,))
+    r = c.fetchone(); conn.close()
+    if not r: return None
+    k = ('id', 'created', 'source', 'pid', 'media', 'caption', 'custom', 'show_price', 'extra', 'video_link', 'manba',
+         'status', 'user_id', 'chat_id', 'note')
+    d = dict(zip(k, r, strict=True))
+    try: d['media'] = json.loads(d['media'] or '[]')
+    except ValueError: d['media'] = []
+    return d
+
+
+def draft_yoz(did, **kv):
+    ruxsat = {'product_id', 'media', 'caption', 'custom', 'show_price', 'extra', 'video_link', 'manba', 'status', 'note'}
+    kv = {k: (json.dumps(v) if k == 'media' else v) for k, v in kv.items() if k in ruxsat}
+    if not kv: return
+    conn = db()
+    conn.execute(f"UPDATE post_drafts SET {', '.join(k + '=?' for k in kv)} WHERE id=?", (*kv.values(), int(did)))
+    conn.commit(); conn.close()
+
+
+def draft_band(did, eski='qoralama', yangi='joylanmoqda'):
+    """Atomar holat o'tishi (ikki marta bosishdan himoya)."""
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE post_drafts SET status=? WHERE id=? AND status=?", (yangi, int(did), eski))
+    n = c.rowcount; conn.commit(); conn.close()
+    return n == 1
+
+
+def draft_matn_yangila(did):
+    d = draft_ol(did)
+    p = _mkt_p(d['pid']) if d else None
+    if not p: return ''
+    m = post_matn(p, bool(d['show_price']), d['extra'], d['video_link'], d['manba'])
+    draft_yoz(did, caption=m, custom=0)
+    return m
+
+
+def _draft_ig_matn(d, p, bot_user=''):
+    if d['custom'] or not p: return _ig_caption_qoshimcha(d['caption'], p, bot_user)
+    return post_matn(p, bool(d['show_price']), d['extra'], d['video_link'], d['manba'], ig=True, bot_user=bot_user)
+
+
+def _media_tavsif(media):
+    v = sum(1 for m in media if m.get('type') == 'video'); f = sum(1 for m in media if m.get('type') == 'photo')
+    s = ', '.join(x for x in ((f"{v} video" if v else ''), (f"{f} rasm" if f else '')) if x)
+    return s or "yo'q (faqat matn)"
+
+
+def _post_yoz(d, p, platform, status, mid='', link='', caption='', error='', uid=0):
+    conn = db()
+    conn.execute("INSERT INTO posts (created,product_id,product,platform,status,message_id,link,media_type,caption,draft_id,source,user_id,error) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (_mkt_vaqt(), d.get('pid'), (p or {}).get('name', ''), platform, status, str(mid or ''), link or '',
+                  _media_tavsif(d.get('media') or []), caption[:3000], d.get('id'), d.get('source', ''), uid, (error or '')[:300]))
+    conn.commit(); conn.close()
+
+
+def _bot_user(bot):
+    try:
+        un = getattr(bot, 'username', None)
+    except Exception:
+        un = None
+    return (un or os.getenv('BOT_USERNAME', '')).lstrip('@').strip()
+
+
+def deep_link(bot, pid):
+    un = _bot_user(bot)
+    return f"https://t.me/{un}?start=p{int(pid)}" if un else ''
+
+
+def _kanal_link(ch, mid):
+    ch = str(ch or '')
+    if ch.startswith('@'): return f"https://t.me/{ch[1:]}/{mid}"
+    if ch.startswith('-100'): return f"https://t.me/c/{ch[4:]}/{mid}"
+    return ''
+
+
+def _tg_manba(m, ex):
+    """file_id > lokal fayl > URL"""
+    if m.get('fid'): return m['fid']
+    if m.get('path') and os.path.exists(m['path']): return ex.enter_context(open(m['path'], 'rb'))
+    return m.get('url')
+
+
+async def tg_joyla(bot, d, uid=0):
+    """Qoralamani kanalga joylaydi. Qaytaradi {'ok', 'mid', 'link', 'error'}."""
+    import contextlib
+    ch = get_channel_id()
+    p = _mkt_p(d['pid']) if d.get('pid') else None
+    if not ch: return {'ok': False, 'error': "CHANNEL_ID sozlanmagan (Railway → Variables)"}
+    matn = d['caption'] or (p and post_matn(p)) or ''
+    dl = deep_link(bot, d['pid']) if d.get('pid') else ''
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buyurtma berish", url=dl)]]) if dl else None
+    media = [m for m in (d.get('media') or []) if m.get('type') in ('photo', 'video')][:10]
+
+    async def yubor(html_rejim):
+        cap = _tg_html(matn) if html_rejim else matn
+        pm = 'HTML' if html_rejim else None
+        with contextlib.ExitStack() as ex:
+            if not media:
+                return await bot.send_message(chat_id=ch, text=cap[:TG_TEXT_MAX], parse_mode=pm, reply_markup=kb,
+                                              disable_web_page_preview=True)
+            if len(media) == 1:
+                m = media[0]; src = _tg_manba(m, ex)
+                if m['type'] == 'video':
+                    return await bot.send_video(chat_id=ch, video=src, caption=cap, parse_mode=pm, reply_markup=kb,
+                                                supports_streaming=True)
+                return await bot.send_photo(chat_id=ch, photo=src, caption=cap, parse_mode=pm, reply_markup=kb)
+            grp = []
+            for i, m in enumerate(media):
+                src = _tg_manba(m, ex)
+                kw = {'caption': cap, 'parse_mode': pm} if i == 0 else {}
+                grp.append(InputMediaVideo(src, **kw) if m['type'] == 'video' else InputMediaPhoto(src, **kw))
+            res = await bot.send_media_group(chat_id=ch, media=grp)
+            if kb:   # albomga tugma qo'yib bo'lmaydi — alohida qisqa xabar
+                await bot.send_message(chat_id=ch, text=f"🛒 {p['name'] if p else 'Buyurtma'} — buyurtma berish:", reply_markup=kb)
+            return res[0] if isinstance(res, (list, tuple)) and res else res
+    try:
+        try:
+            msg = await yubor(True)
+        except BadRequest as e:
+            if 'parse' not in str(e).lower() and 'entit' not in str(e).lower(): raise
+            msg = await yubor(False)
+    except Exception as e:
+        err = str(e)[:250]
+        log.warning("Kanalga joylash xatosi: %s", err)
+        _post_yoz(d, p, 'telegram', 'xato', caption=matn, error=err, uid=uid)
+        return {'ok': False, 'error': err}
+    mid = getattr(msg, 'message_id', '') or ''
+    link = _kanal_link(ch, mid) if mid else ''
+    _post_yoz(d, p, 'telegram', 'ok', mid, link, matn, uid=uid)
+    return {'ok': True, 'mid': mid, 'link': link}
+
+
+# ── Vaqtinchalik media URL (Instagram Telegram faylini o'zi yuklab olishi uchun) ──
+_MEDIA = {}                       # token -> {'path', 'ctype', 'exp'}
+_MEDIA_SRV = {'srv': None}
+
+
+def _public_base(): return os.getenv('PUBLIC_BASE_URL', '').strip().rstrip('/')
+
+
+def media_ruxsat(path, ctype, ttl=1800):
+    tok = secrets.token_urlsafe(24)
+    _MEDIA[tok] = {'path': path, 'ctype': ctype, 'exp': time.time() + ttl}
+    return tok
+
+
+def media_bekor(tok, ochir=True):
+    m = _MEDIA.pop(tok, None)
+    if m and ochir:
+        try: os.remove(m['path'])
+        except OSError: pass
+
+
+def media_javob(method, path, headers=None):
+    """(status, headers, body). Faqat GET/HEAD /m/<token>; muddati o'tgan → 404."""
+    headers = headers or {}
+    for k in [k for k, v in _MEDIA.items() if v['exp'] < time.time()]: media_bekor(k)
+    mt = re.fullmatch(r'/m/([A-Za-z0-9_-]{20,64})', path.split('?', 1)[0])
+    m = _MEDIA.get(mt.group(1)) if mt else None
+    if method not in ('GET', 'HEAD') or not m or not os.path.exists(m['path']):
+        return 404, {'Content-Type': 'text/plain'}, b'not found'
+    size = os.path.getsize(m['path']); a, b = 0, size - 1; st = 200
+    rng = re.fullmatch(r'bytes=(\d*)-(\d*)', (headers.get('range') or '').strip())
+    if rng and (rng.group(1) or rng.group(2)):
+        if rng.group(1): a = int(rng.group(1)); b = int(rng.group(2)) if rng.group(2) else size - 1
+        else: a = max(0, size - int(rng.group(2)))
+        b = min(b, size - 1)
+        if a > b: return 416, {'Content-Range': f'bytes */{size}'}, b''
+        st = 206
+    h = {'Content-Type': m['ctype'], 'Content-Length': str(b - a + 1), 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store'}
+    if st == 206: h['Content-Range'] = f'bytes {a}-{b}/{size}'
+    body = b''
+    if method == 'GET':
+        with open(m['path'], 'rb') as f:
+            f.seek(a); body = f.read(b - a + 1)
+    return st, h, body
+
+
+async def _media_handle(reader, writer):
+    try:
+        bosh = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 15)
+        qatorlar = bosh.decode('latin-1').split('\r\n')
+        parts = qatorlar[0].split(' ')
+        hdr = {}
+        for ln in qatorlar[1:]:
+            if ':' in ln:
+                k, v = ln.split(':', 1); hdr[k.strip().lower()] = v.strip()
+        st, h, body = await asyncio.to_thread(media_javob, parts[0] if parts else '', parts[1] if len(parts) > 1 else '/', hdr)
+        sabab = {200: 'OK', 206: 'Partial Content', 404: 'Not Found', 416: 'Range Not Satisfiable'}.get(st, 'OK')
+        writer.write((f"HTTP/1.1 {st} {sabab}\r\n" + ''.join(f"{k}: {v}\r\n" for k, v in h.items())
+                      + "Connection: close\r\n\r\n").encode('latin-1') + body)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try: writer.close()
+        except Exception: pass
+
+
+async def media_server_ishga():
+    if _MEDIA_SRV['srv'] is not None: return True
+    if not _public_base(): return False
+    port = int(os.getenv('PORT', '8080') or 8080)
+    _MEDIA_SRV['srv'] = await asyncio.start_server(_media_handle, '0.0.0.0', port)
+    log.info("Media URL server: port %s", port)
+    return True
+
+
+# ── Instagram (Meta Graph API) ──
+def _ig_cfg():
+    uid = os.getenv('IG_USER_ID', '').strip(); tok = os.getenv('IG_ACCESS_TOKEN', '').strip()
+    ver = os.getenv('IG_GRAPH_VERSION', '').strip() or 'v26.0'
+    if not ver.startswith('v'): ver = 'v' + ver
+    host = os.getenv('IG_GRAPH_HOST', '').strip() or ('graph.instagram.com' if tok.startswith('IG') else 'graph.facebook.com')
+    return uid, tok, ver, host
+
+
+def ig_sozlangan():
+    uid, tok, _, _ = _ig_cfg()
+    return bool(uid and tok)
+
+
+IG_SOZLASH = ("Instagram sozlanmagan. Railway → Variables: IG_USER_ID, IG_ACCESS_TOKEN (va Telegram'dan yuborilgan "
+              "media uchun PUBLIC_BASE_URL). Batafsil: HISOBOT.md → «Instagram sozlash».")
+
+
+def _ig_tozala(s):
+    _, tok, _, _ = _ig_cfg()
+    s = str(s)
+    if tok: s = s.replace(tok, '***')
+    return re.sub(r'access_token=[^&\s"\']+', 'access_token=***', s)[:300]
+
+
+def _ig_http(method, url, fields):
+    """Yagona tarmoq nuqtasi (testda almashtiriladi). Token so'rov tanasida/parametrda; URL logga yozilmaydi."""
+    if method == 'POST': r = requests.post(url, data=fields, timeout=30)
+    else: r = requests.get(url, params=fields, timeout=30)
+    try: j = r.json()
+    except ValueError: j = {'error': {'message': f"HTTP {r.status_code}"}}
+    return r.status_code, j
+
+
+def _ig_xato_matn(j, st):
+    e = (j or {}).get('error') if isinstance(j, dict) else None
+    e = e if isinstance(e, dict) else {}
+    code = e.get('code'); sub = e.get('error_subcode'); msg = e.get('error_user_msg') or e.get('message') or f"HTTP {st}"
+    if code == 190: s = "Token yaroqsiz yoki muddati tugagan — IG_ACCESS_TOKEN ni yangilang"
+    elif code in (10, 200) or (isinstance(code, int) and 200 <= code < 300): s = "Ruxsat yo'q (instagram_content_publish kerak)"
+    elif code in (4, 17, 32, 613) or sub == 2207042: s = "Limit: juda ko'p so'rov yoki kunlik joylash chegarasi — keyinroq urinib ko'ring"
+    elif code == 9004 or sub in (2207052, 2207003, 2207020): s = "Instagram faylni yuklab ololmadi (URL ochiq emas yoki muddati o'tgan)"
+    elif sub in (2207026, 2207004, 2207009): s = "Video formati/hajmi/davomiyligi Instagram talabiga mos emas"
+    else: s = "Instagram xatosi"
+    return _ig_tozala(f"{s} ({code or st}{'/' + str(sub) if sub else ''}): {msg}")
+
+
+def _ig_sorov(method, path, **fields):
+    uid, tok, ver, host = _ig_cfg()
+    fields['access_token'] = tok
+    try:
+        st, j = _ig_http(method, f"https://{host}/{ver}/{path}", fields)
+    except Exception as e:
+        raise IgXato(_ig_tozala(f"Tarmoq xatosi: {type(e).__name__}: {e}")) from None
+    if st >= 400 or (isinstance(j, dict) and 'error' in j): raise IgXato(_ig_xato_matn(j, st))
+    return j if isinstance(j, dict) else {}
+
+
+def _ig_kut(cid):
+    t0 = time.time()
+    while True:
+        j = _ig_sorov('GET', cid, fields='status_code,status')
+        sc = j.get('status_code')
+        if sc in ('FINISHED', 'PUBLISHED'): return
+        if sc in ('ERROR', 'EXPIRED'):
+            raise IgXato(_ig_tozala(f"Instagram media tayyorlay olmadi ({sc}): {j.get('status', '')}"))
+        if time.time() - t0 > IG_POLL_TIMEOUT: raise IgXato("Instagram media tayyorlanishi juda uzoq davom etdi (timeout)")
+        time.sleep(IG_POLL_SEC)
+
+
+def ig_joyla_sync(items, caption):
+    """items: [{'type': 'photo'|'video', 'url'}]. Konteyner → holat → joylash. Qaytaradi (media_id, permalink)."""
+    uid, _, _, _ = _ig_cfg()
+    if not items: raise IgXato("Instagram uchun kamida bitta rasm yoki video kerak")
+    caption = caption[:IG_CAPTION_MAX]
+    if len(items) == 1:
+        it = items[0]
+        if it['type'] == 'video':
+            cid = _ig_sorov('POST', f"{uid}/media", media_type='REELS', video_url=it['url'], caption=caption, share_to_feed='true')['id']
+        else:
+            cid = _ig_sorov('POST', f"{uid}/media", image_url=it['url'], caption=caption)['id']
+        _ig_kut(cid)
+    else:
+        kids = []
+        for it in items[:10]:
+            f = {'is_carousel_item': 'true'}
+            if it['type'] == 'video': f.update(media_type='VIDEO', video_url=it['url'])
+            else: f['image_url'] = it['url']
+            kids.append(_ig_sorov('POST', f"{uid}/media", **f)['id'])
+        for k in kids: _ig_kut(k)
+        cid = _ig_sorov('POST', f"{uid}/media", media_type='CAROUSEL', children=','.join(kids), caption=caption)['id']
+        _ig_kut(cid)
+    mid = _ig_sorov('POST', f"{uid}/media_publish", creation_id=cid)['id']
+    link = ''
+    try: link = _ig_sorov('GET', mid, fields='permalink').get('permalink', '')
+    except IgXato: pass
+    return mid, link
+
+
+def _ig_url_mos(m):
+    u_ = (m.get('url') or '').split('?', 1)[0].lower()
+    return u_.endswith(('.mp4', '.mov')) if m.get('type') == 'video' else u_.endswith(('.jpg', '.jpeg'))
+
+
+def _jpg_qil(path):
+    """Instagram faqat JPEG rasm qabul qiladi."""
+    with open(path, 'rb') as f:
+        if f.read(3) == b'\xff\xd8\xff': return path
+    try:
+        from PIL import Image
+    except ImportError:
+        raise IgXato("Rasm JPEG emas va Pillow o'rnatilmagan") from None
+    out = path + '.jpg'
+    with Image.open(path) as im: im.convert('RGB').save(out, 'JPEG', quality=90)
+    return out
+
+
+def _temp_dir():
+    d = os.path.join(tempfile.gettempdir(), 'tc_media'); os.makedirs(d, exist_ok=True)
+    return d
+
+
+async def _tg_yukla(bot, fid, tur):
+    f = await bot.get_file(fid)
+    if (getattr(f, 'file_size', 0) or 0) > TG_DL_MAX:
+        raise IgXato("Telegram bot 20 MB dan katta faylni yuklab ololmaydi — videoni kichikroq yuboring")
+    path = os.path.join(_temp_dir(), secrets.token_hex(8) + ('.mp4' if tur == 'video' else '.jpg'))
+    await f.download_to_drive(path)
+    return path
+
+
+async def _ig_tayyorla(bot, media):
+    items, toks = [], []
+    try:
+        for m in media[:10]:
+            if m.get('url') and _ig_url_mos(m):
+                items.append({'type': m['type'], 'url': m['url']}); continue
+            if not _public_base():
+                raise IgXato("Bu media uchun PUBLIC_BASE_URL kerak (Instagram faylni ochiq URL'dan oladi). HISOBOT.md → Instagram sozlash")
+            path = m.get('path') if m.get('path') and os.path.exists(m['path']) else None
+            if not path and m.get('fid'): path = await _tg_yukla(bot, m['fid'], m['type'])
+            if not path and m.get('url'): path = await asyncio.to_thread(web_yukla, m['url'], WEB_MEDIA_MAX)
+            if not path: continue
+            if m['type'] == 'photo': path = await asyncio.to_thread(_jpg_qil, path)
+            tok = media_ruxsat(path, 'video/mp4' if m['type'] == 'video' else 'image/jpeg'); toks.append(tok)
+            items.append({'type': m['type'], 'url': f"{_public_base()}/m/{tok}"})
+        if toks and not await media_server_ishga():
+            raise IgXato("Media server ishga tushmadi (PUBLIC_BASE_URL/PORT)")
+    except Exception:
+        for t_ in toks: media_bekor(t_)
+        raise
+    return items, toks
+
+
+_IG_ISHDA = set()
+_FON = set()
+
+
+async def ig_post(bot, did, uid=0):
+    d = draft_ol(did)
+    if not d: return {'ok': False, 'error': "Qoralama topilmadi"}
+    p = _mkt_p(d['pid']) if d.get('pid') else None
+    if not ig_sozlangan(): return {'ok': False, 'error': IG_SOZLASH}
+    cap = _draft_ig_matn(d, p, _bot_user(bot))
+    toks = []
+    try:
+        items, toks = await _ig_tayyorla(bot, d.get('media') or [])
+        mid, link = await asyncio.to_thread(ig_joyla_sync, items, cap)
+    except IgXato as e:
+        _post_yoz(d, p, 'instagram', 'xato', caption=cap, error=str(e), uid=uid)
+        return {'ok': False, 'error': str(e)}
+    except Exception as e:
+        err = _ig_tozala(f"{type(e).__name__}: {e}")
+        log.warning("Instagram: %s", err)
+        _post_yoz(d, p, 'instagram', 'xato', caption=cap, error=err, uid=uid)
+        return {'ok': False, 'error': err}
+    finally:
+        for t_ in toks: media_bekor(t_)
+    _post_yoz(d, p, 'instagram', 'ok', mid, link, cap, uid=uid)
+    return {'ok': True, 'mid': mid, 'link': link}
+
+
+async def _ig_fon(bot, chat_id, did, uid=0, tg_ok=False):
+    try:
+        r = await ig_post(bot, did, uid)
+        if r['ok']:
+            if not tg_ok: draft_yoz(did, status='joylandi')
+            txt = "📸 Instagram'ga joylandi ✅" + (f"\n{r['link']}" if r.get('link') else '')
+            kb = None
+        else:
+            if not tg_ok: draft_yoz(did, status='qoralama')
+            txt = f"📸 Instagram: joylanmadi ❌\n{r['error']}"
+            kb = InlineKeyboardMarkup([[_btn("🔁 Instagram'ga qayta urinish", f"mkt:pub:{did}:ig")]])
+        if chat_id: await bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
+    finally:
+        _IG_ISHDA.discard(int(did))
+
+
+def _fon(coro):
+    if not IG_FON: return coro
+    t_ = asyncio.create_task(coro); _FON.add(t_); t_.add_done_callback(_FON.discard)
+    return None
+
+
+async def mkt_joyla(bot, did, plat, chat_id=0, uid=0):
+    """plat: tg | ig | both. Qaytaradi (ok, xabar)."""
+    d = draft_ol(did)
+    if not d: return False, "Qoralama topilmadi"
+    ig_qayta = (plat == 'ig' and d['status'] == 'joylandi')
+    if plat in ('ig', 'both'):
+        if not ig_sozlangan(): return False, IG_SOZLASH
+        if int(did) in _IG_ISHDA: return False, "⏳ Instagram'ga yuborilmoqda…"
+    if plat in ('tg', 'both') and not get_channel_id(): return False, "CHANNEL_ID sozlanmagan (Railway → Variables)"
+    if ig_qayta:
+        conn = db(); bor = conn.execute("SELECT 1 FROM posts WHERE draft_id=? AND platform='instagram' AND status='ok'", (int(did),)).fetchone(); conn.close()
+        if bor: return False, "Bu post Instagram'ga allaqachon joylangan"
+    elif not draft_band(did):
+        return False, "Bu post allaqachon joylangan yoki bekor qilingan"
+    natija = []; tg_ok = False
+    if plat in ('tg', 'both'):
+        r = await tg_joyla(bot, d, uid)
+        tg_ok = r['ok']
+        natija.append(("📢 Kanalga joylandi ✅" + (f"\n{r['link']}" if r.get('link') else '')) if r['ok']
+                      else f"📢 Kanal: joylanmadi ❌\n{r['error']}")
+    if plat in ('ig', 'both'):
+        _IG_ISHDA.add(int(did))
+        if tg_ok: draft_yoz(did, status='joylandi')
+        natija.append("📸 Instagram'ga yuborilmoqda… (1–5 daqiqa, natijasini yozaman)")
+        c_ = _fon(_ig_fon(bot, chat_id, did, uid, tg_ok or ig_qayta))
+        if c_ is not None: await c_
+    elif not ig_qayta:
+        draft_yoz(did, status='joylandi' if tg_ok else 'qoralama')
+    return (tg_ok or plat == 'ig'), '\n'.join(natija)
+
+
+# ── Oldindan ko'rish ──
+def mkt_preview(did, izoh=''):
+    d = draft_ol(did)
+    p = _mkt_p(d['pid']) if d and d.get('pid') else None
+    if not d or not p: return "Qoralama topilmadi", [_x_btn('mkt')]
+    cap = d['caption'] or ''
+    head = [f"👁 POST KO'RINISHI #{d['id']}" + (" · 🤖 kunlik kontent" if d['source'] == 'kontent' else ''),
+            f"📎 Media: {_media_tavsif(d['media'])}"]
+    if d['manba'] and d['source'] == 'kontent': head.append(f"🌐 Rasmlar: {d['manba']} rasmiy sayti")
+    if d['custom'] == 1: head.append("✏️ Matn qo'lda o'zgartirilgan")
+    elif d['custom'] == 2: head.append("✨ Matn AI bilan yaxshilangan")
+    if izoh: head.append(izoh)
+    m = '\n'.join(head) + "\n━━━━━━━━━━━━\n" + cap + f"\n━━━━━━━━━━━━\n({len(cap)}/{TG_CAPTION_MAX} belgi)"
+    did = d['id']
+    rows = [[_btn("✅ Telegram", f"mkt:pub:{did}:tg"), _btn("📸 Instagram", f"mkt:pub:{did}:ig"), _btn("🔁 Ikkalasi", f"mkt:pub:{did}:both")],
+            [_btn("✏️ Matnni o'zgartirish", f"mkt:ed:{did}"),
+             _btn("💲 Narxni ko'rsatma" if d['show_price'] else "💲 Narxni ko'rsat", f"mkt:pr:{did}")],
+            [_btn("✨ AI bilan yaxshilash", f"mkt:ai:{did}")]]
+    if d['source'] == 'kontent': rows.append([_btn("⏭ Boshqa tovar", f"mkt:skip:{did}"), _btn("❌ Bugun yo'q", f"mkt:no:{did}")])
+    else: rows.append([_btn("❌ Bekor", f"mkt:cx:{did}")])
+    return m[:TG_TEXT_MAX], rows
+
+
+# ── Marketing menyusi (egasi/admin) ──
+def _mkt_menu():
+    auto = soz('auto_post') == '1'
+    kun = soz('kontent_kunlik') == '1'
+    conn = db()
+    n_lead = conn.execute("SELECT COUNT(*) FROM leads WHERE status='yangi'").fetchone()[0]
+    n_post = conn.execute("SELECT COUNT(*) FROM posts WHERE status='ok' AND created>=?",
+                          ((_local_now() - timedelta(days=7)).strftime('%Y-%m-%d'),)).fetchone()[0]
+    conn.close()
+    m = ("📢 MARKETING\n\n"
+         f"📢 Kanal: {get_channel_id() or '— (CHANNEL_ID yo‘q)'}\n"
+         f"📸 Instagram: {'ulangan' if ig_sozlangan() else 'sozlanmagan'}\n"
+         f"🗓 Kunlik kontent: {'yoqilgan, ' + soz('kontent_vaqt') if kun else 'o‘chirilgan'}"
+         f" · {'🤖 avto-joylash (' + PLATFORMA_NOMI.get(soz('auto_platforma'), 'Telegram') + ')' if auto else '👁 oldindan ko‘rsatadi'}\n"
+         f"📈 7 kunda joylangan: {n_post} · 📩 yangi so'rov: {n_lead}\n\n"
+         "Yangi post: shu yerga video yoki rasm(lar) yuboring.")
+    rows = [[_btn("➕ Yangi post", "mkt:new"), _btn("📋 Oxirgi postlar", "mkt:posts")],
+            [_btn("📅 Kontent kalendari", "mkt:cal"), _btn("▶️ Hozir post", "mkt:now")],
+            [_btn("🔗 Tovar ↔ sayt", "mkt:map:0"), _btn(f"📩 So'rovlar ({n_lead})", "mkt:leads")],
+            [_btn(f"🤖 Avto: {'ON' if auto else 'OFF'}", "mkt:auto"), _btn("⚙️ Kontent sozlamalari", "mkt:ks")],
+            [_btn("🌐 Ochiq katalog", "mkt:pubs")], _x_btn('mkt')]
+    return m, rows
+
+
+def _mkt_postlar():
+    conn = db()
+    rr = conn.execute("SELECT created,product,platform,status,link,error,source FROM posts ORDER BY id DESC LIMIT 12").fetchall(); conn.close()
+    if not rr: return "📋 Hali post yo'q.", [[_btn("⬅️ Orqaga", "mkt:menu")]]
+    ic = {'telegram': '📢', 'instagram': '📸'}
+    out = ["📋 OXIRGI POSTLAR\n"]
+    for cr, pr, pl, st, ln, er, so in rr:
+        out.append(f"{'✅' if st == 'ok' else '❌'} {cr} {ic.get(pl, '')} {pr or '—'}" + (" 🤖" if so == 'kontent' else '')
+                   + (f"\n   {ln}" if ln else '') + (f"\n   ⚠️ {er[:80]}" if st != 'ok' and er else ''))
+    return '\n'.join(out), [[_btn("⬅️ Orqaga", "mkt:menu")]]
+
+
+def _mkt_tovar_cats():
+    prods = get_products()
+    cats = _omb_cats(prods)
+    rows = [[_btn(f"{c_} ({sum(1 for p in prods if (p['cat'] or 'Boshqa') == c_)})", f"mkt:cat:{i}:0")] for i, c_ in enumerate(cats)]
+    rows.append([_btn("🔍 Qidirish", "mkt:s"), _btn("❌ Bekor", "mkt:x")])
+    return rows
+
+
+def _mkt_tovarlar(ci, page, prefix='mkt:pk'):
+    prods = get_products(); cats = _omb_cats(prods)
+    if not (0 <= ci < len(cats)): return [[_btn("⬅️ Orqaga", "mkt:cats")]]
+    lst = [p for p in prods if (p['cat'] or 'Boshqa') == cats[ci]]
+    sl = lst[page * 8:(page + 1) * 8]
+    rows = [[_btn(f"{'✅' if p['qty'] > 0 else '🕐'} {p['name']}", f"{prefix}:{p['id']}")] for p in sl]
+    nav = []
+    if page > 0: nav.append(_btn("◀️", f"mkt:cat:{ci}:{page - 1}"))
+    if (page + 1) * 8 < len(lst): nav.append(_btn("▶️", f"mkt:cat:{ci}:{page + 1}"))
+    if nav: rows.append(nav)
+    rows.append([_btn("⬅️ Kategoriyalar", "mkt:cats"), _btn("❌ Bekor", "mkt:x")])
+    return rows
+
+
+def _pub_sozlama():
+    m = ("🌐 OCHIQ KATALOG (ro'yxatda yo'q mijozlar uchun)\n\n"
+         "Mijoz botga tovar nomini yozsa yoki kanaldagi «🛒 Buyurtma berish» tugmasini bossa — tovar kartasi chiqadi.\n"
+         "Tannarx hech qachon ko'rsatilmaydi.\n\n"
+         f"📦 Aniq qoldiq soni: {'ko‘rsatiladi' if soz('ochiq_qoldiq') == '1' else 'yo‘q (faqat Mavjud/Buyurtma asosida)'}\n"
+         f"📩 So'rovlar sotuvchilarga ham: {'ha' if soz('lead_sotuvchi') == '1' else 'yo‘q (egasi va admin)'}\n"
+         f"📞 Aloqa telefoni: {_mkt_tel() or '— (kiritilmagan)'}")
+    rows = [[_btn("📦 Qoldiq sonini almashtirish", "mkt:oq")], [_btn("📩 Sotuvchilarga: almashtirish", "mkt:ls")],
+            [_btn("📞 Telefonni kiritish", "mkt:tel")], [_btn("👁 Tovarlar ko'rinishi / narxi", "mkt:pv:0")],
+            [_btn("⬅️ Orqaga", "mkt:menu")]]
+    return m, rows
+
+
+def _pub_tovar_royxat(page):
+    conn = db()
+    rr = conn.execute("SELECT id,name,COALESCE(public_show,1),COALESCE(public_price,1) FROM products WHERE active=1 ORDER BY cat,name").fetchall()
+    conn.close()
+    sl = rr[page * 8:(page + 1) * 8]
+    m = ("👁 — mijozlarga ko'rinadi / 🙈 — yashirin\n💲 — narx ko'rsatiladi / 🚫 — «narxi so'rov bo'yicha»\n"
+         "Tugmani bosib almashtiring.")
+    rows = [[_btn(f"{'👁' if sh else '🙈'} {n[:28]}", f"mkt:pvs:{i}:{page}"), _btn('💲' if pr else '🚫', f"mkt:pvp:{i}:{page}")]
+            for i, n, sh, pr in sl]
+    nav = []
+    if page > 0: nav.append(_btn("◀️", f"mkt:pv:{page - 1}"))
+    if (page + 1) * 8 < len(rr): nav.append(_btn("▶️", f"mkt:pv:{page + 1}"))
+    if nav: rows.append(nav)
+    rows.append([_btn("⬅️ Orqaga", "mkt:pubs")])
+    return m, rows
+
+
+def _lead_matn(ld):
+    i, cr, chat, un, nm, ph, pid, pr, qt, st = ld[:10]
+    p = _mkt_p(pid)
+    narx = (f"\n💵 {fmt(p['price'])} × {qt} = {fmt(p['price'] * qt)}" if p and p['price'] else '')
+    holat = {'yangi': '🆕 yangi', 'boglanildi': '✅ bog‘lanildi', 'savatda': '🛒 savatga o‘tkazildi', 'bekor': '❌ bekor'}.get(st, st)
+    return (f"🛒 BUYURTMA SO'ROVI #L{i}\n🕒 {cr}\n👤 {nm or '—'}" + (f" (@{un})" if un else '')
+            + f"\n📞 {ph or '—'}\n📦 {pr} × {qt}{narx}\nHolat: {holat}")
+
+
+def _lead_kb(lid):
+    return [[_btn("🛒 POS savatga", f"lead:pos:{lid}")],
+            [_btn("✅ Bog'lanildi", f"lead:ok:{lid}"), _btn("❌ Bekor", f"lead:x:{lid}")]]
+
+
+def _lead_ol(lid):
+    conn = db()
+    r = conn.execute("SELECT id,created,chat_id,username,name,phone,product_id,product,qty,status,handled_by FROM leads WHERE id=?", (int(lid),)).fetchone()
+    conn.close()
+    return r
+
+
+def _mkt_leads():
+    conn = db()
+    rr = conn.execute("SELECT id,created,name,product,qty,status FROM leads ORDER BY id DESC LIMIT 10").fetchall(); conn.close()
+    if not rr: return "📩 Hali so'rov yo'q.", [[_btn("⬅️ Orqaga", "mkt:menu")]]
+    ic = {'yangi': '🆕', 'boglanildi': '✅', 'savatda': '🛒', 'bekor': '❌'}
+    rows = [[_btn(f"{ic.get(st, '•')} #L{i} {nm[:12]} — {pr[:18]} ×{qt}", f"lead:c:{i}")] for i, cr, nm, pr, qt, st in rr]
+    rows.append([_btn("⬅️ Orqaga", "mkt:menu")])
+    return "📩 SO'ROVLAR (oxirgi 10)", rows
+
+
+async def cmd_marketing(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not can(u, 'marketing'): return
+    _ui_yangi(ctx, 'mkt')
+    m, r = _mkt_menu()
+    await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r))
+
+
+async def mkt_media(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Egasi/admin video yoki rasm yubordi → qoralama → tovar tanlash → oldindan ko'rish."""
+    m = u.message
+    if getattr(m, 'video', None):
+        item = {'type': 'video', 'fid': m.video.file_id, 'size': getattr(m.video, 'file_size', 0) or 0}
+    elif getattr(m, 'photo', None):
+        item = {'type': 'photo', 'fid': m.photo[-1].file_id}
+    else:
+        return
+    st = _ui_ol(ctx, 'mkt')
+    mg = getattr(m, 'media_group_id', None)
+    if st and st.get('draft') and mg and st.get('mg') == mg:          # albomning keyingi bo'laklari
+        d = draft_ol(st['draft'])
+        if d and d['status'] == 'qoralama' and len(d['media']) < 10:
+            draft_yoz(d['id'], media=d['media'] + [item])
+            return
+    x = xodim(u) or {}
+    cap = (m.caption or '').strip()
+    did = draft_yarat('tg', media=[item], user_id=x.get('id', 0), chat_id=u.effective_chat.id)
+    st = _ui_yangi(ctx, 'mkt', draft=did, mg=mg)
+    p = None
+    qidir = re.sub(r"(?i)\b(kanal|kanalga|post|e'?lon)\b", ' ', cap).strip()
+    if qidir:
+        p, _v = match_product(qidir, prefer_stock=True)
+    if p:
+        draft_yoz(did, product_id=p['id']); draft_matn_yangila(did)
+        txt, rows = mkt_preview(did, "📦 Tovar izohdan aniqlandi")
+    else:
+        txt = (f"📎 Qabul qilindi ({'video' if item['type'] == 'video' else 'rasm'}"
+               + (", albomning qolgan rasmlari ham qo'shiladi" if mg else '') + ").\n📦 Qaysi tovar uchun post?")
+        rows = _mkt_tovar_cats()
+    await m.reply_text(txt, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def mkt_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not can(u, 'marketing'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    p_ = q.data.split(':')
+    w = p_[1] if len(p_) > 1 else 'menu'
+    st = _ui_ol(ctx, 'mkt') or _ui_yangi(ctx, 'mkt')
+    uid = (xodim(u) or {}).get('id', 0)
+    chat_id = u.effective_chat.id if getattr(u, 'effective_chat', None) else uid
+
+    def iarg(i, dflt=0):
+        try: return int(p_[i])
+        except (IndexError, ValueError): return dflt
+
+    if w == 'x':
+        st['wait'] = None
+        await q.answer(); await _pos_chiqar(q, "Yopildi.", None); return
+    if w == 'menu':
+        st['wait'] = None; await q.answer(); await _pos_chiqar(q, *_mkt_menu()); return
+    if w == 'new':
+        st['wait'] = 'media'; st['draft'] = None; await q.answer()
+        await _pos_chiqar(q, "📎 Video yoki rasm(lar)ni yuboring (albom ham bo'ladi). Izohga tovar nomini yozsangiz — o'zi topadi.",
+                          [[_btn("⬅️ Orqaga", "mkt:menu")]]); return
+    if w == 'posts':
+        await q.answer(); await _pos_chiqar(q, *_mkt_postlar()); return
+    if w == 'leads':
+        await q.answer(); await _pos_chiqar(q, *_mkt_leads()); return
+    if w == 'cats':
+        await q.answer(); await _pos_chiqar(q, "📦 Qaysi tovar uchun post?", _mkt_tovar_cats()); return
+    if w == 'cat':
+        await q.answer(); await _pos_chiqar(q, "📦 Tovarni tanlang:", _mkt_tovarlar(iarg(2), iarg(3))); return
+    if w == 's':
+        st['wait'] = 's'; await q.answer()
+        await _pos_chiqar(q, "🔍 Tovar nomini yozing:", [[_btn("⬅️ Orqaga", "mkt:cats")]]); return
+    if w == 'pk':
+        did = st.get('draft'); d = draft_ol(did) if did else None
+        p = _mkt_p(iarg(2))
+        if not d or d['status'] != 'qoralama' or not p:
+            await q.answer("Qoralama topilmadi — media'ni qayta yuboring", show_alert=True); return
+        draft_yoz(did, product_id=p['id']); draft_matn_yangila(did); st['wait'] = None
+        await q.answer(); await _pos_chiqar(q, *mkt_preview(did)); return
+    if w == 'pub':
+        did, plat = iarg(2), (p_[3] if len(p_) > 3 else 'tg')
+        if plat not in ('tg', 'ig', 'both'): plat = 'tg'
+        d = draft_ol(did)
+        if not d:
+            await q.answer("Qoralama topilmadi", show_alert=True); return
+        if d['status'] != 'qoralama' and not (plat == 'ig' and d['status'] == 'joylandi'):
+            await q.answer("Bu post allaqachon joylangan yoki bekor qilingan", show_alert=True); return
+        if plat in ('ig', 'both') and not ig_sozlangan():
+            await q.answer(IG_SOZLASH[:195], show_alert=True); return
+        await q.answer("⏳ Joylanmoqda…")
+        ok, msg = await mkt_joyla(ctx.bot, did, plat, chat_id, uid)
+        if not ok and msg.startswith(("Bu post", "⏳", "CHANNEL_ID", "Qoralama")):
+            await q.message.reply_text(msg); return
+        if d['source'] == 'kontent' and ok: soz_yoz('kontent_oxirgi', today())
+        rows = None if ok else mkt_preview(did)[1]
+        await _pos_chiqar(q, f"{msg}\n\n📦 {(_mkt_p(d['pid']) or {}).get('name', '')}", rows); return
+    if w in ('ed', 'pr', 'ai', 'cx', 'skip', 'no'):
+        did = iarg(2); d = draft_ol(did)
+        if not d or d['status'] != 'qoralama':
+            await q.answer("Bu post allaqachon joylangan yoki bekor qilingan", show_alert=True); return
+        p = _mkt_p(d['pid'])
+        if w == 'ed':
+            st['wait'] = f'ed:{did}'; await q.answer()
+            await q.message.reply_text("✏️ Yangi matnni yuboring (to'liq post matni). Joriy matn:")
+            await q.message.reply_text(d['caption'][:TG_TEXT_MAX] or '—'); return
+        if w == 'pr':
+            draft_yoz(did, show_price=0 if d['show_price'] else 1)
+            draft_matn_yangila(did); await q.answer("💲 Narx " + ("yashirildi" if d['show_price'] else "ko'rsatiladi"))
+            await _pos_chiqar(q, *mkt_preview(did, "↩️ Matn shablondan qayta tuzildi" if d['custom'] else '')); return
+        if w == 'ai':
+            if not p:
+                await q.answer("Tovar topilmadi", show_alert=True); return
+            await q.answer("✨ AI yozmoqda…")
+            sm = ''
+            if d['source'] == 'kontent':
+                kc = await asyncio.to_thread(kontent_kesh, d['pid'])
+                sm = (kc or {}).get('text', '')
+            m = await asyncio.to_thread(ai_post_matn, p, d['caption'], bool(d['show_price']), sm)
+            if not m:
+                await q.message.reply_text("⚠️ AI ishlamadi yoki matn tekshiruvdan o'tmadi — shablon matn qoldi."); return
+            draft_yoz(did, caption=m, custom=2)
+            await _pos_chiqar(q, *mkt_preview(did)); return
+        if w == 'cx':
+            draft_band(did, 'qoralama', 'bekor'); kontent_tozala(d)
+            await q.answer(); await _pos_chiqar(q, "❌ Post bekor qilindi.", None); return
+        if w == 'no':
+            draft_band(did, 'qoralama', 'bekor'); kontent_tozala(d); soz_yoz('kontent_oxirgi', today())
+            await q.answer(); await _pos_chiqar(q, "❌ Bugun kontent joylanmaydi. Ertaga yana taklif qilaman.", None); return
+        if w == 'skip':
+            if not draft_band(did, 'qoralama', 'bekor'):
+                await q.answer("Allaqachon o'tkazilgan", show_alert=True); return
+            kontent_tozala(d); kontent_otkaz(d['pid'])
+            await q.answer("⏭ Keyingi tovar tayyorlanmoqda…")
+            await _pos_chiqar(q, f"⏭ {p['name'] if p else ''} o'tkazib yuborildi. Keyingisi tayyorlanmoqda…", None)
+            await kontent_kunlik(ctx.bot, majburiy=True, chat_id=chat_id)
+            return
+    # ── Kontent (D) ──
+    if w in KONTENT_TUGMALAR:
+        return await kontent_callback(u, ctx, q, st, p_, w)
+    # ── Ochiq katalog sozlamalari ──
+    if w == 'pubs':
+        await q.answer(); await _pos_chiqar(q, *_pub_sozlama()); return
+    if w in ('oq', 'ls'):
+        k = 'ochiq_qoldiq' if w == 'oq' else 'lead_sotuvchi'
+        soz_yoz(k, '0' if soz(k) == '1' else '1'); await q.answer("✅")
+        await _pos_chiqar(q, *_pub_sozlama()); return
+    if w == 'tel':
+        st['wait'] = 'tel'; await q.answer()
+        await _pos_chiqar(q, "📞 Aloqa telefonini yozing (masalan +998 90 123 45 67). O'chirish: -", [[_btn("⬅️ Orqaga", "mkt:pubs")]]); return
+    if w == 'pv':
+        await q.answer(); await _pos_chiqar(q, *_pub_tovar_royxat(iarg(2))); return
+    if w in ('pvs', 'pvp'):
+        col = 'public_show' if w == 'pvs' else 'public_price'
+        conn = db(); conn.execute(f"UPDATE products SET {col}=1-COALESCE({col},1) WHERE id=?", (iarg(2),)); conn.commit(); conn.close()
+        await q.answer("✅"); await _pos_chiqar(q, *_pub_tovar_royxat(iarg(3))); return
+    await q.answer()
+
+
+async def mkt_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Marketing matn kiritish. True — matn shu yerda ishlandi."""
+    st = _ui_ol(ctx, 'mkt')
+    if not st or not st.get('wait') or not can(u, 'marketing'): return False
+    w = st['wait']; t_ = (u.message.text or '').strip()
+    if w == 'media': return False                     # media kutilmoqda — matn odatdagidek ishlansin
+    if t_ in MENU_MAP:
+        st['wait'] = None; return False
+    if w == 's':
+        prods = get_products(); p, v = match_product(t_, prods=prods)
+        lst = [p] if p else [x for x in prods if x['name'] in {c_['name'] for c_ in v}]
+        if not lst:
+            await u.message.reply_text("Topilmadi. Boshqacha yozing yoki kategoriyadan tanlang.",
+                                       reply_markup=InlineKeyboardMarkup(_mkt_tovar_cats())); return True
+        st['wait'] = None
+        await u.message.reply_text("📦 Tanlang:", reply_markup=InlineKeyboardMarkup(
+            [[_btn(x['name'], f"mkt:pk:{x['id']}")] for x in lst[:8]] + [[_btn("❌ Bekor", "mkt:x")]])); return True
+    if w.startswith('ed:'):
+        did = int(w[3:]); d = draft_ol(did)
+        st['wait'] = None
+        if not d or d['status'] != 'qoralama':
+            await u.message.reply_text("Qoralama topilmadi yoki joylangan."); return True
+        if len(t_) > TG_CAPTION_MAX and d['media']:
+            st['wait'] = w
+            await u.message.reply_text(f"Juda uzun: {len(t_)} belgi. Media bilan post {TG_CAPTION_MAX} belgigacha bo'ladi. Qisqartirib yuboring."); return True
+        draft_yoz(did, caption=t_, custom=1)
+        m, r = mkt_preview(did)
+        await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    if w == 'tel':
+        st['wait'] = None
+        if t_ == '-': soz_yoz('aloqa_tel', '')
+        elif len(re.sub(r'\D', '', t_)) < 7:
+            st['wait'] = 'tel'; await u.message.reply_text("Telefon noto'g'ri. Masalan: +998 90 123 45 67"); return True
+        else: soz_yoz('aloqa_tel', t_[:40])
+        m, r = _pub_sozlama(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    if w.startswith(('vaqt', 'url:')):
+        return await kontent_matn(u, ctx, st, w, t_)
+    return False
+
+
+# ── 🌐 Ochiq tovar kartasi va so'rov (ro'yxatda yo'q foydalanuvchilar) ──
+_RL = {}
+
+
+def _rl_ok(uid, tur, limit, oyna):
+    now = time.time(); k = (uid, tur)
+    lst = [t_ for t_ in _RL.get(k, []) if now - t_ < oyna]
+    if len(lst) >= limit:
+        _RL[k] = lst; return False
+    lst.append(now); _RL[k] = lst
+    if len(_RL) > 5000:
+        for kk in [kk for kk, v in _RL.items() if not v or now - v[-1] > 3600]: _RL.pop(kk, None)
+    return True
+
+
+def _pub_tovarlar():
+    conn = db()
+    ids = {r[0] for r in conn.execute("SELECT id FROM products WHERE active=1 AND COALESCE(public_show,1)=1").fetchall()}
+    conn.close()
+    return [p for p in get_products() if p['id'] in ids]
+
+
+def pub_karta_matn(p, rate=None):
+    """Ochiq karta: narx (ruxsat bo'lsa), xususiyatlar, kafolat, mavjudlik. Tannarx YO'Q; dona soni — sozlama bo'yicha."""
+    rate = rate or get_exchange_rate()
+    out = [f"🔥 {p['name']}"]
+    b = _brend(p['sup'])
+    if b or p['cat']: out.append("🏷 " + " · ".join(x for x in (b, p['cat']) if x))
+    out.append('')
+    out.append(f"💵 Narxi: {_narx_txt(p, rate)}" if (p['public_price'] and p['price'] > 0) else "💬 Narxi: so'rov bo'yicha")
+    if p['qty'] > 0:
+        out.append(f"✅ Mavjud: {p['qty']} dona" if soz('ochiq_qoldiq') == '1' else "✅ Mavjud — Toshkentda")
+    else:
+        out.append("🕐 Buyurtma asosida")
+    specs = get_product_specs(p['id'])
+    if specs: out += ['', "⚙️ Xususiyatlari:"] + [f"• {k}: {v}" for k, v in specs[:12]]
+    kf = _kafolat_txt(p['warranty'])
+    if kf: out += ['', f"🛡 Kafolat: {kf}"]
+    out.append(f"📍 {FIRMA.get('manzil') or 'Toshkent'}")
+    return '\n'.join(out)
+
+
+def _pub_kb(pid):
+    return InlineKeyboardMarkup([[_btn("📞 Bog'lanish", f"pub:tel:{pid}"), _btn("🛒 Buyurtma qoldirish", f"pub:o:{pid}")],
+                                 [_btn("📚 Katalog", "pub:k")]])
+
+
+async def pub_karta_yubor(bot, chat_id, pid):
+    p = _mkt_p(pid)
+    if not p or not p['active'] or not p['public_show']:
+        await bot.send_message(chat_id=chat_id, text="Bu tovar hozir ko'rsatilmaydi. 📚 Katalog:",
+                               reply_markup=InlineKeyboardMarkup([[_btn("📚 Katalog", "pub:k")]])); return False
+    matn = pub_karta_matn(p); kb = _pub_kb(p['id'])
+    photos = get_product_photos(p['id'])[:5]
+    try:
+        if len(photos) > 1:
+            await bot.send_media_group(chat_id=chat_id, media=[InputMediaPhoto(f) for f in photos])
+        elif photos and len(matn) <= TG_CAPTION_MAX:
+            await bot.send_photo(chat_id=chat_id, photo=photos[0], caption=matn, reply_markup=kb); return True
+        elif photos:
+            await bot.send_photo(chat_id=chat_id, photo=photos[0])
+    except Exception as e:
+        log.warning("ochiq karta rasm: %s", str(e)[:120])
+    await bot.send_message(chat_id=chat_id, text=matn[:TG_TEXT_MAX], reply_markup=kb)
+    return True
+
+
+def _pub_katalog(ci=None, page=0):
+    prods = _pub_tovarlar(); cats = _omb_cats(prods)
+    if ci is None or not (0 <= ci < len(cats)):
+        if not prods: return "Katalog hozircha bo'sh.", []
+        return ("📚 KATALOG — bo'limni tanlang:",
+                [[_btn(f"{c_} ({sum(1 for p in prods if (p['cat'] or 'Boshqa') == c_)})", f"pub:c:{i}:0")] for i, c_ in enumerate(cats)])
+    lst = [p for p in prods if (p['cat'] or 'Boshqa') == cats[ci]]
+    sl = lst[page * 8:(page + 1) * 8]
+    rows = [[_btn(f"{'✅' if p['qty'] > 0 else '🕐'} {p['name']}", f"pub:p:{p['id']}")] for p in sl]
+    nav = []
+    if page > 0: nav.append(_btn("◀️", f"pub:c:{ci}:{page - 1}"))
+    if (page + 1) * 8 < len(lst): nav.append(_btn("▶️", f"pub:c:{ci}:{page + 1}"))
+    if nav: rows.append(nav)
+    rows.append([_btn("⬅️ Bo'limlar", "pub:k")])
+    return f"📚 {cats[ci]}:", rows
+
+
+async def pub_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; us = u.effective_user
+    p_ = q.data.split(':'); w = p_[1] if len(p_) > 1 else ''
+    if not _rl_ok(us.id, 'cb', 40, 60):
+        await q.answer("Juda tez — biroz kuting", show_alert=True); return
+
+    def iarg(i, dflt=0):
+        try: return int(p_[i])
+        except (IndexError, ValueError): return dflt
+    chat_id = u.effective_chat.id
+    if w == 'k':
+        await q.answer(); m, r = _pub_katalog(); await _pos_chiqar(q, m, r); return
+    if w == 'c':
+        await q.answer(); m, r = _pub_katalog(iarg(2), iarg(3)); await _pos_chiqar(q, m, r); return
+    if w == 'p':
+        await q.answer(); await pub_karta_yubor(ctx.bot, chat_id, iarg(2)); return
+    if w == 'tel':
+        tel = _mkt_tel()
+        await q.answer()
+        await q.message.reply_text((f"📞 Qo'ng'iroq qiling: {tel}\n" if tel else '')
+                                   + "✍️ Yoki shu yerga savolingizni yozing — javob beramiz.\n"
+                                   + "🛒 Tezroq: «Buyurtma qoldirish» — o'zimiz qo'ng'iroq qilamiz.")
+        return
+    if w == 'o':
+        p = _mkt_p(iarg(2))
+        if not p or not p['active'] or not p['public_show']:
+            await q.answer("Tovar topilmadi", show_alert=True); return
+        await q.answer()
+        ctx.user_data['pub'] = {'ts': time.time(), 'pid': p['id'], 'wait': None}
+        await q.message.reply_text(f"🛒 {p['name']}\nNechta kerak?", reply_markup=InlineKeyboardMarkup(
+            [[_btn(str(n), f"pub:q:{p['id']}:{n}") for n in (1, 2, 3, 5)], [_btn("❌ Bekor", "pub:x")]]))
+        return
+    if w == 'q':
+        st = ctx.user_data.get('pub') or {}
+        if st.get('pid') != iarg(2):
+            await q.answer("Qaytadan «Buyurtma qoldirish» ni bosing", show_alert=True); return
+        st.update(qty=max(1, min(99, iarg(3, 1))), wait='name', ts=time.time())
+        await q.answer(); await _pos_chiqar(q, f"Soni: {st['qty']} ta.\n👤 Ismingizni yozing:", None); return
+    if w == 'x':
+        ctx.user_data.pop('pub', None); await q.answer()
+        await _pos_chiqar(q, "Bekor qilindi. 📚 Katalog: /start", None); return
+    if w == 'ok':
+        st = ctx.user_data.get('pub') or {}
+        if not st.get('phone') or st.get('tok') != (p_[2] if len(p_) > 2 else None):
+            await q.answer("So'rov topilmadi yoki allaqachon yuborilgan", show_alert=True); return
+        ctx.user_data.pop('pub', None)
+        if not _rl_ok(us.id, 'lead', 3, 3600):
+            await q.answer("Bir soatda 3 tadan ko'p so'rov yuborib bo'lmaydi. Biz bilan bog'laning.", show_alert=True); return
+        await q.answer()
+        lid = await lead_yarat(ctx.bot, us, st)
+        await _pos_chiqar(q, f"✅ So'rovingiz qabul qilindi (#L{lid}). Tez orada qo'ng'iroq qilamiz!", None); return
+    await q.answer()
+
+
+async def pub_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ochiq foydalanuvchi so'rovi: ism → telefon. True — ishlandi."""
+    st = ctx.user_data.get('pub')
+    if not st or not st.get('wait'): return False
+    if time.time() - st.get('ts', 0) > UI_TTL:
+        ctx.user_data.pop('pub', None); return False
+    st['ts'] = time.time()
+    t_ = (u.message.text or '').strip()
+    if st['wait'] == 'name':
+        if not (2 <= len(t_) <= 60):
+            await u.message.reply_text("Ismingizni yozing (2–60 belgi):"); return True
+        st['name'] = t_; st['wait'] = 'phone'
+        await u.message.reply_text("📞 Telefon raqamingizni yozing yoki pastdagi tugmani bosing:",
+                                   reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📱 Raqamni yuborish", request_contact=True)]],
+                                                                    resize_keyboard=True, one_time_keyboard=True))
+        return True
+    if st['wait'] == 'phone':
+        return await _pub_tel(u, ctx, st, t_)
+    return False
+
+
+async def _pub_tel(u, ctx, st, tel):
+    raqam = re.sub(r'[^\d+]', '', tel or '')
+    if len(re.sub(r'\D', '', raqam)) < 9:
+        await u.message.reply_text("Raqam noto'g'ri. Masalan: +998 90 123 45 67"); return True
+    st['phone'] = raqam[:20]; st['wait'] = None; st['tok'] = secrets.token_hex(4)
+    p = _mkt_p(st['pid'])
+    await u.message.reply_text("✅ Rahmat!", reply_markup=ReplyKeyboardRemove())
+    await u.message.reply_text(f"Tekshiring:\n📦 {p['name'] if p else '—'} × {st.get('qty', 1)}\n👤 {st.get('name')}\n📞 {st['phone']}",
+                               reply_markup=InlineKeyboardMarkup([[_btn("✅ Yuborish", f"pub:ok:{st['tok']}"), _btn("❌ Bekor", "pub:x")]]))
+    return True
+
+
+async def pub_contact(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st = ctx.user_data.get('pub')
+    if not st or st.get('wait') != 'phone': return
+    c_ = u.message.contact
+    if c_ and getattr(c_, 'user_id', None) not in (None, u.effective_user.id):
+        await u.message.reply_text("Iltimos, o'zingizning raqamingizni yuboring."); return
+    await _pub_tel(u, ctx, st, getattr(c_, 'phone_number', ''))
+
+
+async def lead_yarat(bot, us, st):
+    p = _mkt_p(st['pid'])
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO leads (created,chat_id,username,name,phone,product_id,product,qty) VALUES (?,?,?,?,?,?,?,?)",
+              (_mkt_vaqt(), us.id, us.username or '', st.get('name', ''), st.get('phone', ''), st['pid'],
+               p['name'] if p else '', int(st.get('qty', 1))))
+    lid = c.lastrowid; conn.commit(); conn.close()
+    try: sub_add(us.id, st.get('name', ''), us.username or '', 'lead')
+    except Exception: pass
+    matn = _lead_matn(_lead_ol(lid)); kb = InlineKeyboardMarkup(_lead_kb(lid))
+    kimga = {OWNER_ID} | {x['id'] for x in xodimlar_royxati() if x['active'] and
+                          (x['role'] == 'admin' or (x['role'] == 'sotuvchi' and soz('lead_sotuvchi') == '1'))}
+    for cid in sorted(kimga):
+        if not cid: continue
+        try: await bot.send_message(chat_id=cid, text=matn, reply_markup=kb)
+        except Exception: log.warning("lead xabari yetmadi: %s", cid)
+    return lid
+
+
+def _lead_mijoz(nom, tel):
+    """Telefon bo'yicha mavjud mijoz yoki yangi (bir xil ismli boshqa mijozning telefoni ustidan yozilmaydi)."""
+    oxir = re.sub(r'\D', '', tel or '')[-9:]
+    conn = db(); rr = conn.execute("SELECT id,name,phone,type FROM customers").fetchall(); conn.close()
+    for i, n, ph, ty in rr:
+        if oxir and re.sub(r'\D', '', ph or '')[-9:] == oxir: return {'id': i, 'name': n, 'phone': ph, 'type': ty or 'B2C'}
+    nom = (nom or 'Mijoz').strip()
+    if any((n or '').strip().lower() == nom.lower() for _, n, _, _ in rr): nom = f"{nom} ({oxir[-4:]})"
+    _, cid = add_customer(nom, tel or '', 'B2C', 'Telegram so‘rov')
+    return {'id': cid, 'name': nom, 'phone': tel or '', 'type': 'B2C'}
+
+
+async def lead_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    p_ = q.data.split(':'); w = p_[1] if len(p_) > 1 else ''
+    try: lid = int(p_[2])
+    except (IndexError, ValueError): lid = 0
+    sotuvchi_ok = soz('lead_sotuvchi') == '1' and can(u, 'pos')
+    if not (can(u, 'marketing') or sotuvchi_ok):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    ld = _lead_ol(lid) if lid else None
+    if not ld:
+        await q.answer("So'rov topilmadi", show_alert=True); return
+    x = xodim(u) or {}
+    if w == 'c':
+        await q.answer(); await _pos_chiqar(q, _lead_matn(ld), _lead_kb(lid) + [[_btn("⬅️ Orqaga", "mkt:leads")]]); return
+    if w in ('ok', 'x'):
+        yangi = 'boglanildi' if w == 'ok' else 'bekor'
+        conn = db(); conn.execute("UPDATE leads SET status=?, handled_by=? WHERE id=?", (yangi, x.get('name', ''), lid)); conn.commit(); conn.close()
+        await q.answer("✅"); await _pos_chiqar(q, _lead_matn(_lead_ol(lid)) + f"\n👷 {x.get('name', '')}", None); return
+    if w == 'pos':
+        if not can(u, 'pos'):
+            await q.answer("Ruxsat yo'q", show_alert=True); return
+        if ld[9] == 'savatda':
+            await q.answer("Bu so'rov allaqachon savatga o'tkazilgan", show_alert=True); return
+        p = next((pp for pp in get_products() if pp['id'] == ld[6]), None)
+        if not p:
+            await q.answer("Tovar topilmadi yoki nofaol", show_alert=True); return
+        cm = _lead_mijoz(ld[4], ld[5])
+        pos = _pos_yangi(ctx)
+        _pos_qosh(pos, p, max(1, int(ld[8] or 1)))
+        pos['cust'] = cm
+        conn = db(); conn.execute("UPDATE leads SET status='savatda', handled_by=? WHERE id=?", (x.get('name', ''), lid)); conn.commit(); conn.close()
+        await q.answer("🛒 Savatga qo'shildi")
+        m, r = pos_ekran_savat(pos, get_exchange_rate(), f"🛒 So'rov #L{lid}: {cm['name']} ({cm['phone']})")
+        await q.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return
+    await q.answer()
+
+
+async def pub_start_link(u: Update, ctx: ContextTypes.DEFAULT_TYPE, payload):
+    """/start p<ID> (kanal tugmasi) yoki /start katalog. True — ishlandi."""
+    mt = re.fullmatch(r'p(\d{1,9})', payload or '')
+    if not mt and payload != 'katalog': return False
+    us = u.effective_user
+    if not _rl_ok(us.id, 'msg', 20, 60): return True
+    nomi = ((us.first_name or '') + (' ' + us.last_name if us.last_name else '')).strip()
+    yangi = sub_add(us.id, nomi, us.username or '', 'deeplink')
+    if yangi:
+        try: await ctx.bot.send_message(OWNER_ID, f"👤 Yangi obunachi (kanal tugmasi): {nomi or 'ismsiz'}"
+                                        + (f" (@{us.username})" if us.username else ''))
+        except Exception: pass
+    if mt:
+        await pub_karta_yubor(ctx.bot, u.effective_chat.id, int(mt.group(1)))
+    else:
+        m, r = _pub_katalog(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r) if r else None)
+    return True
+
+
+async def pub_qidir(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ochiq foydalanuvchi tovar nomini yozdi → karta / variantlar. True — ishlandi."""
+    t_ = (u.message.text or '').strip()
+    if len(t_) < 2 or len(t_) > 80: return False
+    prods = _pub_tovarlar()
+    if not prods: return False
+    p, v = match_product(t_, prods=prods)
+    if p:
+        await pub_karta_yubor(ctx.bot, u.effective_chat.id, p['id']); return True
+    lst = [x for x in prods if x['name'] in {c_['name'] for c_ in v}]
+    if not lst:
+        yaqin = difflib.get_close_matches(_nrm(t_), [_nrm(x['name']) for x in prods], n=3, cutoff=0.72)
+        lst = [x for x in prods if _nrm(x['name']) in yaqin]
+    if not lst: return False
+    await u.message.reply_text("🔍 Shulardan qaysi biri?", reply_markup=InlineKeyboardMarkup(
+        [[_btn(f"{'✅' if x['qty'] > 0 else '🕐'} {x['name']}", f"pub:p:{x['id']}")] for x in lst[:8]] + [[_btn("📚 Katalog", "pub:k")]]))
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════
+# ── 🗓 KUNLIK KONTENT (yetkazuvchi saytlaridan): Two Trees, Freesub
+# ══════════════════════════════════════════════════════════════════
+# Faqat ochiq sahifalar; robots.txt hurmat qilinadi; har saytga so'rovlar orasida >= WEB_DELAY soniya;
+# timeout; hammasi alohida oqimda (asyncio.to_thread). Sayt tuzilishi o'zgarsa — o'tkazib yuboriladi + egasiga izoh.
+SUPPLIER_SAYTLAR = {
+    'two trees': {'nom': 'Two Trees', 'base': 'https://twotrees3d.com', 'tur': 'shopify'},
+    'freesub': {'nom': 'Freesub', 'base': 'https://www.freesub.com', 'tur': 'sitemap', 'sitemap': '/product-sitemap.xml'},
+}
+WEB_UA = "ThermoCraftsBot/1.0 (dealer content fetcher; +https://t.me/ThermoCrafts)"
+WEB_TIMEOUT = 15
+WEB_DELAY = 2.0                       # bir saytga so'rovlar orasidagi minimal pauza (s)
+WEB_HTML_MAX = 3 * 1024 * 1024
+WEB_MEDIA_MAX = 50 * 1024 * 1024
+TG_UPLOAD_MAX = 50 * 1024 * 1024      # Bot API: bot yuboradigan fayl chegarasi
+TG_PHOTO_MAX = 10 * 1024 * 1024       # Bot API: rasm chegarasi
+KONTENT_KESH_KUN = 7
+XARITA_AVTO_BALL = 0.8
+_WEB = {'last': {}, 'robots': {}, 'katalog': {}}
+_WEB_LOCK = threading.Lock()
+KONTENT_TUGMALAR = {'cal', 'now', 'auto', 'autop', 'ks', 'kun', 'man', 'days', 'vaqt', 'map', 'mp', 'mc', 'mok', 'mu', 'mx', 'mf', 'mr'}
+_AKSESSUAR = ('blade', 'bit', 'bits', 'set', 'module', 'kit', 'spare', 'replacement', 'belt', 'lens', 'nozzle', 'cable',
+              'collet', 'end mill', 'clamp', 'honeycomb', 'enclosure', 'rotary', 'roller', 'paper', 'tape', 'ink', 'filter')
+
+
+class KontentXato(Exception):
+    pass
+
+
+def _web_xom(url, max_bytes):
+    """Yagona tarmoq nuqtasi (testda almashtiriladi). Qaytaradi (status, {header: qiymat}, bytes)."""
+    with requests.get(url, headers={'User-Agent': WEB_UA, 'Accept': '*/*'}, timeout=WEB_TIMEOUT, stream=True) as r:
+        h = {k.lower(): v for k, v in r.headers.items()}
+        if r.status_code != 200: return r.status_code, h, b''
+        cl = int(h.get('content-length') or 0)
+        if cl and cl > max_bytes: raise KontentXato(f"juda katta ({cl / 1048576:.0f} MB)")
+        buf = bytearray()
+        for ch in r.iter_content(65536):
+            buf += ch
+            if len(buf) > max_bytes: raise KontentXato(f"juda katta (>{max_bytes / 1048576:.0f} MB)")
+        return r.status_code, h, bytes(buf)
+
+
+def _url_qism(url):
+    from urllib.parse import urlsplit
+    s = urlsplit(url)
+    return f"{s.scheme}://{s.netloc}", (s.path or '/') + (('?' + s.query) if s.query else '')
+
+
+def robots_qoidalar(matn):
+    """robots.txt → [(allow, pattern)] — bizning UA guruhi bo'lsa o'sha, aks holda '*'."""
+    guruhlar = []; joriy = None; qoida_boshlandi = False
+    for ln in str(matn or '').splitlines():
+        ln = ln.split('#', 1)[0].strip()
+        if ':' not in ln: continue
+        k, v = ln.split(':', 1); k = k.strip().lower(); v = v.strip()
+        if k == 'user-agent':
+            if joriy is None or qoida_boshlandi:
+                joriy = {'ua': [], 'q': []}; guruhlar.append(joriy); qoida_boshlandi = False
+            joriy['ua'].append(v.lower())
+        elif k in ('allow', 'disallow') and joriy is not None:
+            qoida_boshlandi = True
+            if v: joriy['q'].append((k == 'allow', v))
+    bizniki = [g for g in guruhlar if any(a and a != '*' and a in WEB_UA.lower() for a in g['ua'])]
+    tanlov = bizniki or [g for g in guruhlar if '*' in g['ua']]
+    return [q for g in tanlov for q in g['q']]
+
+
+def robots_ruxsat(qoidalar, path):
+    eng = None   # (uzunlik, allow)
+    for allow, pat in qoidalar:
+        rx = '^' + re.escape(pat).replace(r'\*', '.*')
+        if rx.endswith(r'\$'): rx = rx[:-2] + '$'
+        if re.match(rx, path):
+            n = len(pat)
+            if eng is None or n > eng[0] or (n == eng[0] and allow): eng = (n, allow)
+    return True if eng is None else eng[1]
+
+
+def robots_ok(url):
+    base, path = _url_qism(url)
+    kesh = _WEB['robots'].get(base)
+    if not kesh or time.time() - kesh[0] > 86400:
+        try:
+            _web_pauza(base)
+            st, _h, body = _web_xom(base + '/robots.txt', 512 * 1024)
+            if st == 200: q = robots_qoidalar(body.decode('utf-8', 'replace'))
+            elif 400 <= st < 500: q = []                          # robots.txt yo'q → ruxsat
+            else: q = [(False, '/')]                               # 5xx → hozircha hech narsa olmaymiz
+        except Exception:
+            q = [(False, '/')]
+        kesh = (time.time(), q); _WEB['robots'][base] = kesh
+    return robots_ruxsat(kesh[1], path)
+
+
+def _web_pauza(base):
+    with _WEB_LOCK:
+        kut = WEB_DELAY - (time.time() - _WEB['last'].get(base, 0))
+        _WEB['last'][base] = time.time() + max(0, kut)
+    if kut > 0: time.sleep(kut)
+
+
+def web_ol(url, max_bytes=WEB_HTML_MAX):
+    if not re.match(r'^https?://', url or ''): raise KontentXato("URL noto'g'ri")
+    if not robots_ok(url): raise KontentXato("robots.txt ruxsat bermaydi")
+    base, _ = _url_qism(url)
+    _web_pauza(base)
+    try:
+        st, _h, body = _web_xom(url, max_bytes)
+    except KontentXato:
+        raise
+    except Exception as e:
+        raise KontentXato(f"tarmoq: {type(e).__name__}") from None
+    if st != 200: raise KontentXato(f"HTTP {st}")
+    return body
+
+
+def web_yukla(url, max_bytes):
+    body = web_ol(url, max_bytes)
+    ext = os.path.splitext(url.split('?', 1)[0])[1].lower()
+    if ext not in ('.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mov', '.gif'): ext = '.bin'
+    path = os.path.join(_temp_dir(), secrets.token_hex(8) + ext)
+    with open(path, 'wb') as f: f.write(body)
+    return path
+
+
+def _sayt(sup):
+    s = (sup or '').lower().replace(' ', '')
+    for k, v in SUPPLIER_SAYTLAR.items():
+        if k.replace(' ', '') in s: return k, v
+    return None, None
+
+
+def _sayt_url(url):
+    for k, v in SUPPLIER_SAYTLAR.items():
+        if (url or '').startswith(v['base']): return k, v
+    return None, None
+
+
+KATALOG_KESH_KUN = 7
+
+
+def _sahifa_model(url):
+    """Sahifadagi 'Model Number: F137' (Freesub sahifalarida bor, URL'da yo'q)."""
+    t_ = _html_matn(web_ol(url).decode('utf-8', 'replace'))
+    m = re.search(r'\bModel\s*(?:Number|No\.?)?\s*[:：]?\s*([A-Za-z]{1,4}[- ]?\d{2,5}[A-Za-z0-9-]*)', t_, re.I)
+    return m.group(1).strip() if m else ''
+
+
+def sayt_katalog(kalit):
+    """Yetkazuvchi tovarlari ro'yxati [{'title', 'url'}]. Xotira + bazada 7 kun kesh (sozlamalar: katalog:<kalit>)."""
+    s = SUPPLIER_SAYTLAR[kalit]
+    kesh = _WEB['katalog'].get(kalit)
+    if not kesh:
+        try:
+            j = json.loads(soz('katalog:' + kalit) or '{}')
+            if j.get('items'): kesh = (float(j.get('ts', 0)), j['items'])
+        except ValueError:
+            kesh = None
+    if kesh and time.time() - kesh[0] < KATALOG_KESH_KUN * 86400: return kesh[1]
+    items = []
+    if s['tur'] == 'shopify':
+        for page in range(1, 6):
+            j = json.loads(web_ol(f"{s['base']}/products.json?limit=250&page={page}").decode('utf-8', 'replace'))
+            prods = j.get('products') or []
+            for p in prods:
+                if p.get('handle') and p.get('title'):
+                    items.append({'title': p['title'], 'url': f"{s['base']}/products/{p['handle']}"})
+            if len(prods) < 250: break
+    else:
+        xml = web_ol(s['base'] + s['sitemap']).decode('utf-8', 'replace')
+        for loc in re.findall(r'<loc>\s*([^<\s]+)\s*</loc>', xml)[:120]:
+            if not loc.startswith(s['base']): continue
+            slug = re.sub(r'\.(html?|php)$', '', loc.rstrip('/').rsplit('/', 1)[-1])
+            title = slug.replace('-', ' ').strip()
+            try:
+                model = _sahifa_model(loc)          # URL'da model raqami yo'q — sahifadan (sekin, shuning uchun 7 kun kesh)
+                if model: title += ' ' + model
+            except Exception:
+                pass
+            items.append({'title': title, 'url': loc})
+    _WEB['katalog'][kalit] = (time.time(), items)
+    try: soz_yoz('katalog:' + kalit, json.dumps({'ts': time.time(), 'items': items}))
+    except Exception: pass
+    return items
+
+
+def _model_kodlar(s):
+    t_ = re.sub(r'[^a-z0-9]+', ' ', str(s or '').lower())
+    out = set()
+    for m in re.findall(r'[a-z]{0,6} ?\d+[a-z]{0,4}', t_):
+        m = m.replace(' ', '')
+        if re.fullmatch(r'\d+(w|kw|mm|cm|m|v|l|kg|g|pcs|oz|in)', m): continue   # 500W, 20oz — model emas, o'lcham
+        if len(m) >= 3 and len(re.sub(r'\D', '', m)) >= 2: out.add(m)     # 'in1' (3-in-1) kabi soxta kodlar emas
+    return out
+
+
+_SINONIM = {'kepka': 'cap hat', 'krujka': 'mug cup', 'stakan': 'tumbler cup', 'futbolka': 'shirt', 'termopress': 'heat press',
+            'lazer': 'laser', 'gravyor': 'engraver', 'kombo': 'combo', 'avtomat': 'automatic', 'shpindel': 'spindle'}
+
+
+def moslik_ball(nom, sarlavha):
+    """0..1: model raqami (TTS-20, P8100 ...) mos kelsa yuqori; aksessuar sahifalari jarimalanadi."""
+    brend_soz = r'\b(two ?trees|twotrees|freesub)\b'
+    n = re.sub(brend_soz, ' ', str(nom or '').lower()); s_ = re.sub(brend_soz, ' ', str(sarlavha or '').lower())
+    n = ' '.join(_SINONIM.get(w, w) for w in re.split(r'\s+', n))
+    nc, sc = _nrm(n), _nrm(s_)
+    if not nc or not sc: return 0.0
+    ball = 0.0
+    kodlar = _model_kodlar(n)
+    sarlavha_kodlar = _model_kodlar(s_)
+    for k in kodlar:
+        for c_ in sarlavha_kodlar:                  # 'tts20' ~ 'tts20pro', lekin 'tts20' != 'tts2000'
+            i = c_.find(k)
+            if i >= 0 and not c_[i - 1:i].isdigit() and not c_[i + len(k):i + len(k) + 1].isdigit():
+                ball = max(ball, 0.65)
+    nw = {w for w in re.findall(r'[a-z0-9]+', n) if len(w) > 1}
+    sw = {w for w in re.findall(r'[a-z0-9]+', s_) if len(w) > 1}
+    if nw: ball += 0.25 * (len(nw & sw) / len(nw))
+    ball += 0.10 * difflib.SequenceMatcher(None, nc, sc).ratio()
+    n1, s1 = re.findall(r'(\d+) ?in ?1\b', n), re.findall(r'(\d+) ?in ?1\b', s_)     # "11 in 1" kombo
+    if n1 and s1:                                   # model kodi aniq mos bo'lsa, "N in 1" farqi jarimalanmaydi
+        ball += 0.15 if set(n1) & set(s1) else (0.0 if ball >= 0.65 else -0.1)
+    if not kodlar: ball = min(ball, 0.6)
+    if any(a in s_ for a in _AKSESSUAR) and not any(a in n for a in _AKSESSUAR): ball -= 0.3
+    return round(max(0.0, min(1.0, ball)), 3)
+
+
+def moslash(nom, katalog, n=5):
+    sc = sorted(((moslik_ball(nom, it['title']), it) for it in katalog), key=lambda x: -x[0])
+    return [(b, it) for b, it in sc[:n] if b >= 0.08]      # takliflar (egasi tanlaydi); avto — faqat >= 0.8
+
+
+def _html_matn(h):
+    h = re.sub(r'(?is)<(script|style|noscript)[^>]*>.*?</\1>', ' ', h or '')
+    h = re.sub(r'(?i)<br\s*/?>|</(p|li|tr|h[1-6]|div)>', '\n', h)
+    h = re.sub(r'(?s)<[^>]+>', ' ', h)
+    h = _html.unescape(h)
+    return '\n'.join(re.sub(r'[ \t\u00a0]+', ' ', ln).strip() for ln in h.splitlines() if ln.strip())
+
+
+def _abs(u_, base):
+    from urllib.parse import urljoin
+    u_ = (u_ or '').strip()
+    if u_.startswith('//'): return 'https:' + u_
+    return urljoin(base, u_)
+
+
+def _video_topish(h, base):
+    vids = []
+    for vid in re.findall(r'(?:youtube(?:-nocookie)?\.com/(?:embed/|watch\?v=)|youtu\.be/)([A-Za-z0-9_-]{11})', h):
+        u_ = f"https://www.youtube.com/watch?v={vid}"
+        if u_ not in vids: vids.append(u_)
+    for mp in re.findall(r'(?:https?:)?//[^\s"\'<>()]+?\.mp4(?:\?[^\s"\'<>()]*)?', h):
+        u_ = _abs(mp, base)
+        if u_ not in vids: vids.append(u_)
+    return vids[:4]
+
+
+def parse_html_kontent(h, url):
+    """Umumiy sahifa: og:*, JSON-LD Product, jadval qatorlari, rasm va videolar."""
+    def meta(prop):
+        return [_html.unescape(m) for m in re.findall(
+            r'<meta[^>]+(?:property|name)=["\']' + re.escape(prop) + r'["\'][^>]*content=["\']([^"\']*)["\']', h, re.I)]
+    title = (meta('og:title') or [''])[0]
+    desc = (meta('og:description') or meta('description') or [''])[0]
+    imgs = [_abs(x, url) for x in meta('og:image')]
+    for blok in re.findall(r'(?is)<script[^>]+application/ld\+json[^>]*>(.*?)</script>', h):
+        try: j = json.loads(blok.strip())
+        except ValueError: continue
+        nodes = j if isinstance(j, list) else (j.get('@graph') or [j]) if isinstance(j, dict) else []
+        for nd in nodes:
+            if not isinstance(nd, dict) or 'Product' not in str(nd.get('@type', '')): continue
+            title = nd.get('name') or title
+            desc = (nd.get('description') or '') if len(nd.get('description') or '') > len(desc) else desc
+            im = nd.get('image')
+            for x in (im if isinstance(im, list) else [im]):
+                x = x.get('url') if isinstance(x, dict) else x
+                if isinstance(x, str): imgs.append(_abs(x, url))
+    tana = re.sub(r'(?is)<(script|style|noscript)[^>]*>.*?</\1>', ' ', h)
+    for src in re.findall(r'<img[^>]+(?:data-src|src)=["\']([^"\']+\.(?:jpe?g|png|webp)(?:\?[^"\']*)?)["\']', tana, re.I):
+        if not re.search(r'logo|icon|avatar|flag|payment|sprite|banner-?nav|loading', src, re.I): imgs.append(_abs(src, url))
+    rasmlar = []
+    for x in imgs:
+        if x and x.startswith('http') and x not in rasmlar: rasmlar.append(x)
+    jadval = []
+    for tr in re.findall(r'(?is)<tr[^>]*>(.*?)</tr>', tana)[:40]:
+        cells = [_html_matn(c) for c in re.findall(r'(?is)<t[hd][^>]*>(.*?)</t[hd]>', tr)]
+        cells = [c.replace('\n', ' ') for c in cells if c]
+        if len(cells) >= 2 and len(cells[0]) <= 40: jadval.append(f"{cells[0]}: {' '.join(cells[1:])[:80]}")
+    title = _html_matn(title).replace('\n', ' ').strip()
+    if not title and not rasmlar: raise KontentXato("sahifa tuzilishi tanilmadi")
+    matn = '\n'.join(x for x in [title, _html_matn(desc)] + jadval if x)
+    return {'title': title[:200], 'images': rasmlar[:8], 'videos': _video_topish(h, url), 'text': matn[:4000]}
+
+
+def parse_shopify_js(j, base):
+    if not isinstance(j, dict) or not j.get('title'): raise KontentXato("Shopify javobi tanilmadi")
+    imgs = []
+    for x in j.get('images') or []:
+        x = _abs(x if isinstance(x, str) else (x or {}).get('src', ''), base)
+        if x not in imgs: imgs.append(x)
+    vids = []
+    for m in j.get('media') or []:
+        if m.get('media_type') == 'video':
+            src = [s_ for s_ in (m.get('sources') or []) if 'mp4' in str(s_.get('format', '')) or str(s_.get('url', '')).split('?')[0].endswith('.mp4')]
+            if src:
+                ok_ = [s_ for s_ in src if (s_.get('height') or 0) <= 1080]
+                tan = max(ok_, key=lambda s_: s_.get('height') or 0) if ok_ else min(src, key=lambda s_: s_.get('height') or 0)
+                vids.append(_abs(tan['url'], base))
+        elif m.get('media_type') == 'external_video' and m.get('host') == 'youtube' and m.get('external_id'):
+            vids.append(f"https://www.youtube.com/watch?v={m['external_id']}")
+    body = j.get('description') or ''
+    for v in _video_topish(body, base):
+        if v not in vids: vids.append(v)
+    return {'title': j['title'][:200], 'images': imgs[:8], 'videos': vids[:4], 'text': (j['title'] + '\n' + _html_matn(body))[:4000]}
+
+
+def sahifa_kontent(url):
+    k, s = _sayt_url(url)
+    if s and s['tur'] == 'shopify' and '/products/' in url:
+        js = url.split('?', 1)[0].rstrip('/') + '.js'
+        try: j = json.loads(web_ol(js).decode('utf-8', 'replace'))
+        except ValueError: raise KontentXato("Shopify javobi JSON emas") from None
+        return parse_shopify_js(j, s['base'])
+    return parse_html_kontent(web_ol(url).decode('utf-8', 'replace'), url)
+
+
+# ── Kesh ──
+def kontent_kesh(pid):
+    try:
+        conn = db()
+        r = conn.execute("SELECT url,fetched,title,images,videos,text,status,error FROM supplier_content WHERE product_id=?", (int(pid),)).fetchone()
+        conn.close()
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return None
+    if not r: return None
+    try: imgs, vids = json.loads(r[3] or '[]'), json.loads(r[4] or '[]')
+    except ValueError: imgs, vids = [], []
+    return {'url': r[0], 'fetched': r[1], 'title': r[2], 'images': imgs, 'videos': vids, 'text': r[5] or '',
+            'status': r[6], 'error': r[7] or ''}
+
+
+def _kesh_yoz(pid, url, k=None, xato=''):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO supplier_content (product_id,url,fetched,title,images,videos,text,status,error) "
+                 "VALUES (?,?,?,?,?,?,?,?,?)",
+                 (int(pid), url, _mkt_vaqt(), (k or {}).get('title', ''), json.dumps((k or {}).get('images', [])),
+                  json.dumps((k or {}).get('videos', [])), (k or {}).get('text', ''), 'xato' if xato else 'ok', xato[:300]))
+    conn.commit(); conn.close()
+
+
+def kontent_ol(pid, majburiy=False):
+    """Tovar sahifasidan kontent (kesh 7 kun). Hech qachon exception tashlamaydi: {'status': 'ok'|'xato', ...} yoki None."""
+    p = _mkt_p(pid)
+    if not p or not p['supplier_url']: return None
+    k = kontent_kesh(pid)
+    if (k and not majburiy and k['url'] == p['supplier_url'] and k['status'] == 'ok'
+            and k['fetched'] >= (_local_now() - timedelta(days=KONTENT_KESH_KUN)).strftime('%Y-%m-%d %H:%M')):
+        return k
+    try:
+        yangi = sahifa_kontent(p['supplier_url'])
+        _kesh_yoz(pid, p['supplier_url'], yangi)
+    except Exception as e:
+        xato = str(e) if isinstance(e, KontentXato) else f"{type(e).__name__}"
+        log.warning("Kontent (%s): %s", p['name'], xato)
+        _kesh_yoz(pid, p['supplier_url'], None, xato)
+    return kontent_kesh(pid)
+
+
+# ── Moslash (tovar ↔ sayt sahifasi) ──
+def xarita_yoz(pid, url, ok=1):
+    conn = db()
+    conn.execute("UPDATE products SET supplier_url=?, supplier_url_ok=? WHERE id=?", (url or '', int(ok) if url else 0, int(pid)))
+    if not url: conn.execute("DELETE FROM supplier_content WHERE product_id=?", (int(pid),))
+    conn.commit(); conn.close()
+
+
+def xarita_takliflar(pid):
+    p = _mkt_p(pid)
+    k, _s = _sayt(p['sup']) if p else (None, None)
+    if not k: return []
+    return moslash(p['name'], sayt_katalog(k))
+
+
+def xarita_avto():
+    """Omborda bor, yetkazuvchisi tanilgan va URL'i yo'q tovarlarga ishonchli moslikni yozadi (tasdiqlanmagan)."""
+    conn = db()
+    rr = conn.execute("SELECT id,name,supplier FROM products WHERE active=1 AND qty>0 AND COALESCE(supplier_url,'')=''").fetchall()
+    conn.close()
+    n = 0
+    for pid, nom, sup in rr:
+        k, _s = _sayt(sup)
+        if not k: continue
+        try: tk = moslash(nom, sayt_katalog(k), 2)
+        except Exception as e:
+            log.warning("katalog %s: %s", k, e); continue
+        if tk and tk[0][0] >= XARITA_AVTO_BALL and (len(tk) < 2 or tk[0][0] - tk[1][0] >= 0.1):
+            xarita_yoz(pid, tk[0][1]['url'], 0); n += 1
+    return n
+
+
+# ── Navbat (rotatsiya) ──
+def kontent_otkaz(pid):
+    try: d = json.loads(soz('kontent_otkaz') or '{}')
+    except ValueError: d = {}
+    if d.get('sana') != today(): d = {'sana': today(), 'pids': []}
+    if int(pid) not in d['pids']: d['pids'].append(int(pid))
+    soz_yoz('kontent_otkaz', json.dumps(d))
+
+
+def kontent_navbat(n=7):
+    """Omborda bor, faol, ochiq; supplier_url yoki o'z rasmi bor; oxirgi N kunda joylanmagan; bugun o'tkazilmagan.
+    Tartib: eng uzoq vaqt joylanmagan (hech qachon — birinchi), keyin id."""
+    try: kun = max(1, int(soz('kontent_kun') or 14))
+    except ValueError: kun = 14
+    chegara = (_local_now() - timedelta(days=kun)).strftime('%Y-%m-%d %H:%M')
+    try: ot = json.loads(soz('kontent_otkaz') or '{}')
+    except ValueError: ot = {}
+    otkaz = set(ot.get('pids') or []) if ot.get('sana') == today() else set()
+    conn = db()
+    oxirgi = dict(conn.execute("SELECT product_id, MAX(created) FROM posts WHERE status='ok' GROUP BY product_id").fetchall())
+    rasm = {r[0] for r in conn.execute("SELECT DISTINCT product_id FROM product_photos").fetchall()}
+    rr = conn.execute("SELECT id,name,COALESCE(supplier_url,''),COALESCE(supplier_url_ok,0) FROM products "
+                      "WHERE active=1 AND qty>0 AND COALESCE(public_show,1)=1").fetchall()
+    conn.close()
+    out = []
+    for pid, nom, url, ok in rr:
+        if pid in otkaz or not (url or pid in rasm): continue
+        if oxirgi.get(pid) and oxirgi[pid] >= chegara: continue
+        out.append({'id': pid, 'name': nom, 'url': url, 'url_ok': ok, 'oxirgi': oxirgi.get(pid) or ''})
+    out.sort(key=lambda x: (x['oxirgi'], x['id']))
+    return out[:n]
+
+
+def kontent_tozala(d):
+    for m in (d or {}).get('media') or []:
+        if m.get('path') and os.path.dirname(m['path']) == _temp_dir():
+            try: os.remove(m['path'])
+            except OSError: pass
+
+
+def _temp_tozala(soat=24):
+    d = _temp_dir(); chegara = time.time() - soat * 3600
+    for f in os.listdir(d):
+        fp = os.path.join(d, f)
+        try:
+            if os.path.getmtime(fp) < chegara and not any(v['path'] == fp for v in _MEDIA.values()): os.remove(fp)
+        except OSError: pass
+
+
+# ── Qoralama (kunlik post) ──
+async def kontent_qoralama(pid, avto=False):
+    """Qaytaradi (draft_id, izoh). Tarmoq/sayt xatosi — post tovarning o'z rasmlari bilan tuziladi."""
+    p = _mkt_p(pid)
+    media, video_link, extra, manba, izoh = [], '', [], '', []
+    k = None
+    if p['supplier_url'] and (p['url_ok'] or not avto):
+        k = await asyncio.to_thread(kontent_ol, pid)
+        if not p['url_ok']: izoh.append("❔ Sayt sahifasi avtomatik moslangan — 🔗 Tovar ↔ sayt'da tasdiqlang")
+    brend = _brend(p['sup'])
+    if k and k['status'] == 'ok':
+        if soz('manba_korsat') == '1': manba = brend
+        mp4 = [v for v in k['videos'] if v.split('?', 1)[0].lower().endswith('.mp4')]
+        yt = [v for v in k['videos'] if 'youtu' in v]
+        if mp4:
+            try:
+                path = await asyncio.to_thread(web_yukla, mp4[0], TG_UPLOAD_MAX)
+                media = [{'type': 'video', 'path': path, 'url': mp4[0]}]
+            except Exception as e:
+                video_link = mp4[0]
+                izoh.append(f"🎬 Video {e if isinstance(e, KontentXato) else 'yuklanmadi'} — rasmlar + video havolasi")
+        if not media:
+            for img in k['images'][:6]:
+                if len(media) >= 4: break
+                try: media.append({'type': 'photo', 'path': await asyncio.to_thread(web_yukla, img, TG_PHOTO_MAX), 'url': img})
+                except Exception: continue
+            if not video_link and yt: video_link = yt[0]
+        extra = await asyncio.to_thread(ai_xususiyatlar, k['text']) or _matndan_xususiyat(k['text'])
+    elif k:
+        izoh.append(f"⚠️ {brend} saytidan ma'lumot olinmadi ({k['error']}) — tovarning o'z rasmlari ishlatildi")
+    if not media:
+        media = [{'type': 'photo', 'fid': f} for f in get_product_photos(pid)[:4]]
+    did = draft_yarat('kontent', pid, media, user_id=OWNER_ID, chat_id=OWNER_ID, extra='\n'.join(extra),
+                      video_link=video_link, manba=manba)
+    return did, '\n'.join(izoh)
+
+
+async def kontent_preview_yubor(bot, did, chat_id, izoh=''):
+    """Media'ni egasiga yuboradi (file_id'lar saqlanadi — kanalga qayta yuklanmaydi), keyin matn + tugmalar."""
+    import contextlib
+    d = draft_ol(did); media = d['media']
+    try:
+        with contextlib.ExitStack() as ex:
+            if len(media) == 1:
+                m = media[0]; src = _tg_manba(m, ex)
+                msg = await (bot.send_video(chat_id=chat_id, video=src, supports_streaming=True) if m['type'] == 'video'
+                             else bot.send_photo(chat_id=chat_id, photo=src))
+                obj = getattr(msg, 'video', None) if m['type'] == 'video' else (getattr(msg, 'photo', None) or [None])[-1]
+                if getattr(obj, 'file_id', None): m['fid'] = obj.file_id
+            elif media:
+                res = await bot.send_media_group(chat_id=chat_id, media=[
+                    InputMediaVideo(_tg_manba(m, ex)) if m['type'] == 'video' else InputMediaPhoto(_tg_manba(m, ex)) for m in media])
+                for m, msg in zip(media, res or [], strict=False):
+                    obj = getattr(msg, 'video', None) if m['type'] == 'video' else (getattr(msg, 'photo', None) or [None])[-1]
+                    if getattr(obj, 'file_id', None): m['fid'] = obj.file_id
+        draft_yoz(did, media=media)
+    except Exception as e:
+        izoh = (izoh + '\n' if izoh else '') + f"⚠️ Media ko'rinishi yuborilmadi: {str(e)[:120]}"
+    txt, rows = mkt_preview(did, izoh)
+    await bot.send_message(chat_id=chat_id, text=txt, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def kontent_kunlik(bot, majburiy=False, chat_id=None):
+    """Kunlik post: navbatdagi tovar → qoralama → egasiga ko'rinish (yoki AUTO_POST bo'lsa — darhol joylash)."""
+    chat_id = chat_id or OWNER_ID
+    if not majburiy and soz('kontent_kunlik') != '1': return None
+    try: await asyncio.to_thread(_temp_tozala)
+    except Exception: pass
+    try: await asyncio.to_thread(xarita_avto)
+    except Exception: log.warning("xarita_avto ishlamadi")
+    nav = await asyncio.to_thread(kontent_navbat, 1)
+    if not nav:
+        if majburiy:
+            await bot.send_message(chat_id=chat_id, text=(f"📭 Hozir joylash uchun tovar yo'q: omborda bor, ochiq, rasmi yoki sayt sahifasi bor "
+                                                          f"va oxirgi {soz('kontent_kun')} kunda joylanmagan tovar topilmadi."))
+        return None
+    avto = (soz('auto_post') == '1' and not majburiy)
+    try:
+        did, izoh = await kontent_qoralama(nav[0]['id'], avto)
+    except Exception as e:
+        log.exception("kontent qoralama")
+        await bot.send_message(chat_id=chat_id, text=f"⚠️ Kunlik kontent tayyorlanmadi: {str(e)[:150]}")
+        return None
+    if avto:
+        plat = soz('auto_platforma') if soz('auto_platforma') in ('tg', 'ig', 'both') else 'tg'
+        if plat != 'tg' and not ig_sozlangan():
+            plat = 'tg'; izoh = (izoh + '\n' if izoh else '') + "📸 Instagram sozlanmagan — faqat kanalga"
+        if plat in ('tg', 'both') and not get_channel_id():
+            await kontent_preview_yubor(bot, did, chat_id, "⚠️ CHANNEL_ID yo'q — avto-joylash o'rniga ko'rinish"); return did
+        ok, msg = await mkt_joyla(bot, did, plat, chat_id, OWNER_ID)
+        if plat == 'tg': kontent_tozala(draft_ol(did))
+        await bot.send_message(chat_id=chat_id, text=f"🤖 Avto-post: {nav[0]['name']}\n{msg}" + (f"\n{izoh}" if izoh else ''))
+        return did
+    await kontent_preview_yubor(bot, did, chat_id, izoh)
+    return did
+
+
+# ── Kontent ekranlari ──
+def _kontent_sozlama():
+    m = ("⚙️ KUNLIK KONTENT SOZLAMALARI\n\n"
+         f"🗓 Kunlik: {'yoqilgan' if soz('kontent_kunlik') == '1' else 'o‘chirilgan'} · ⏰ {soz('kontent_vaqt')} (Toshkent)\n"
+         f"🔁 Takrorlamaslik: {soz('kontent_kun')} kun\n"
+         f"🤖 Avto-joylash: {'ON' if soz('auto_post') == '1' else 'OFF (oldindan ko‘rsatadi)'} → {PLATFORMA_NOMI.get(soz('auto_platforma'), 'Telegram')}\n"
+         f"ℹ️ «Manba: brend rasmiy sayti»: {'ko‘rsatiladi' if soz('manba_korsat') == '1' else 'yo‘q'}\n\n"
+         "Avto rejimda faqat ✅ tasdiqlangan sayt sahifalari ishlatiladi.")
+    rows = [[_btn("🗓 Kunlik: almashtirish", "mkt:kun"), _btn("⏰ Vaqt", "mkt:vaqt")],
+            [_btn(f"🔁 {soz('kontent_kun')} kun → keyingi", "mkt:days"), _btn("🤖 Avto: almashtirish", "mkt:auto")],
+            [_btn("📡 Avto platforma", "mkt:autop"), _btn("ℹ️ Manba: almashtirish", "mkt:man")],
+            [_btn("⬅️ Orqaga", "mkt:menu")]]
+    return m, rows
+
+
+def _kontent_kalendar():
+    nav = kontent_navbat(7)
+    if not nav:
+        return ("📅 Navbat bo'sh: omborda bor, ochiq va rasmi/sayt sahifasi bor tovar yo'q "
+                f"(yoki hammasi oxirgi {soz('kontent_kun')} kunda joylangan).", [[_btn("⬅️ Orqaga", "mkt:menu")]])
+    bosh = 0 if soz('kontent_ishladi') != today() else 1
+    out = [f"📅 KONTENT KALENDARI (har kuni {soz('kontent_vaqt')})\n"]
+    for i, x in enumerate(nav):
+        kun = (_local_now() + timedelta(days=i + bosh)).strftime('%d.%m')
+        belgi = '✅' if x['url'] and x['url_ok'] else ('❔' if x['url'] else '📷')
+        out.append(f"{kun} — {belgi} {x['name']}" + (f" (oxirgi: {x['oxirgi'][:10]})" if x['oxirgi'] else ''))
+    out.append("\n✅ sayt tasdiqlangan · ❔ avtomatik moslangan · 📷 faqat o'z rasmlari")
+    return '\n'.join(out), [[_btn("▶️ Hozir post", "mkt:now"), _btn("🔗 Tovar ↔ sayt", "mkt:map:0")], [_btn("⬅️ Orqaga", "mkt:menu")]]
+
+
+def _xarita_royxat(page):
+    conn = db()
+    rr = conn.execute("SELECT id,name,supplier,COALESCE(supplier_url,''),COALESCE(supplier_url_ok,0) FROM products "
+                      "WHERE active=1 AND qty>0 ORDER BY supplier,name").fetchall()
+    conn.close()
+    rr = [r for r in rr if _sayt(r[2])[0]]
+    if not rr:
+        return "🔗 Omborda Two Trees / Freesub tovari yo'q.", [[_btn("⬅️ Orqaga", "mkt:menu")]]
+    sl = rr[page * 8:(page + 1) * 8]
+    rows = [[_btn(f"{'✅' if u_ and ok else ('❔' if u_ else '➖')} {n[:30]}", f"mkt:mp:{i}")] for i, n, s_, u_, ok in sl]
+    nav = []
+    if page > 0: nav.append(_btn("◀️", f"mkt:map:{page - 1}"))
+    if (page + 1) * 8 < len(rr): nav.append(_btn("▶️", f"mkt:map:{page + 1}"))
+    if nav: rows.append(nav)
+    rows.append([_btn("⬅️ Orqaga", "mkt:menu")])
+    return ("🔗 TOVAR ↔ YETKAZUVCHI SAYTI\n✅ tasdiqlangan · ❔ avtomatik (tasdiqlang) · ➖ yo'q\n"
+            "Rasmlar, video va xususiyatlar shu sahifadan olinadi."), rows
+
+
+def _xarita_karta(pid, izoh=''):
+    p = _mkt_p(pid)
+    if not p: return "Tovar topilmadi", [[_btn("⬅️ Orqaga", "mkt:map:0")]]
+    k = kontent_kesh(pid)
+    m = [f"🔗 {p['name']}", f"🏭 {p['sup'] or '—'}",
+         f"🌐 {p['supplier_url'] or '— (moslanmagan)'}" + ((' ✅' if p['url_ok'] else ' ❔') if p['supplier_url'] else '')]
+    if k and k['url'] == p['supplier_url']:
+        m.append(f"📦 Kesh: {k['fetched']} — " + (f"{len(k['images'])} rasm, {len(k['videos'])} video, {len(k['text'])} belgi matn"
+                                                  if k['status'] == 'ok' else f"⚠️ {k['error']}"))
+    if izoh: m.append(izoh)
+    rows = [[_btn("🔍 Saytdan qidirish", f"mkt:mf:{pid}"), _btn("✏️ URL kiritish", f"mkt:mu:{pid}")]]
+    if p['supplier_url']:
+        rows.append([_btn("✅ Tasdiqlash", f"mkt:mok:{pid}"), _btn("🔄 Kontentni yangilash", f"mkt:mr:{pid}")])
+        rows.append([_btn("🗑 Moslikni o'chirish", f"mkt:mx:{pid}")])
+    rows.append([_btn("⬅️ Ro'yxat", "mkt:map:0")])
+    return '\n'.join(m), rows
+
+
+async def kontent_callback(u, ctx, q, st, p_, w):
+    def iarg(i, dflt=0):
+        try: return int(p_[i])
+        except (IndexError, ValueError): return dflt
+    chat_id = u.effective_chat.id if getattr(u, 'effective_chat', None) else OWNER_ID
+    if w == 'cal':
+        await q.answer(); await _pos_chiqar(q, *(await asyncio.to_thread(_kontent_kalendar))); return
+    if w == 'now':
+        if not _ui_done(ctx, f"know{int(time.time() // 20)}"):
+            await q.answer("⏳ Tayyorlanmoqda…"); return
+        await q.answer("⏳ Tayyorlanmoqda (sayt bilan 10–60 soniya)…")
+        await _pos_chiqar(q, "⏳ Kunlik post tayyorlanmoqda…", None)
+        await kontent_kunlik(ctx.bot, majburiy=True, chat_id=chat_id); return
+    if w in ('auto', 'kun', 'man'):
+        k = {'auto': 'auto_post', 'kun': 'kontent_kunlik', 'man': 'manba_korsat'}[w]
+        soz_yoz(k, '0' if soz(k) == '1' else '1'); await q.answer("✅")
+        await _pos_chiqar(q, *(_mkt_menu() if w == 'auto' and len(p_) < 3 and st.get('ekran') != 'ks' else _kontent_sozlama())); return
+    if w == 'ks':
+        st['ekran'] = 'ks'; await q.answer(); await _pos_chiqar(q, *_kontent_sozlama()); return
+    if w == 'days':
+        tartib = ['7', '14', '21', '30']; joriy = soz('kontent_kun')
+        soz_yoz('kontent_kun', tartib[(tartib.index(joriy) + 1) % 4] if joriy in tartib else '14')
+        await q.answer("✅"); await _pos_chiqar(q, *_kontent_sozlama()); return
+    if w == 'autop':
+        tartib = ['tg', 'ig', 'both']; joriy = soz('auto_platforma')
+        soz_yoz('auto_platforma', tartib[(tartib.index(joriy) + 1) % 3] if joriy in tartib else 'tg')
+        await q.answer("✅"); await _pos_chiqar(q, *_kontent_sozlama()); return
+    if w == 'vaqt':
+        st['wait'] = 'vaqt'; await q.answer()
+        await _pos_chiqar(q, "⏰ Vaqtni yozing (Toshkent), masalan 10:00", [[_btn("⬅️ Orqaga", "mkt:ks")]]); return
+    if w == 'map':
+        st['ekran'] = 'map'; await q.answer(); await _pos_chiqar(q, *_xarita_royxat(iarg(2))); return
+    pid = iarg(2)
+    if w == 'mp':
+        await q.answer(); await _pos_chiqar(q, *_xarita_karta(pid)); return
+    if w == 'mf':
+        await q.answer("🔍 Saytdan qidirilmoqda…")
+        try: tk = await asyncio.to_thread(xarita_takliflar, pid)
+        except Exception as e:
+            await _pos_chiqar(q, *_xarita_karta(pid, f"⚠️ Sayt ochilmadi: {str(e)[:120]}")); return
+        if not tk:
+            await _pos_chiqar(q, *_xarita_karta(pid, "Mos sahifa topilmadi — ✏️ URL kiriting.")); return
+        st.setdefault('cands', {})[str(pid)] = [it['url'] for _b, it in tk]
+        m, rows = _xarita_karta(pid, "Mos keladiganini tanlang:")
+        rows = [[_btn(f"{int(b * 100)}% {it['title'][:40]}", f"mkt:mc:{pid}:{i}")] for i, (b, it) in enumerate(tk)] + rows
+        await _pos_chiqar(q, m, rows); return
+    if w == 'mc':
+        lst = (st.get('cands') or {}).get(str(pid)) or []
+        i = iarg(3, -1)
+        if not (0 <= i < len(lst)):
+            await q.answer("Ro'yxat eskirgan — qayta qidiring", show_alert=True); return
+        xarita_yoz(pid, lst[i], 1); await q.answer("✅ Saqlandi")
+        await _pos_chiqar(q, *_xarita_karta(pid, "✅ Moslik saqlandi")); return
+    if w == 'mok':
+        p = _mkt_p(pid)
+        if p and p['supplier_url']: xarita_yoz(pid, p['supplier_url'], 1)
+        await q.answer("✅"); await _pos_chiqar(q, *_xarita_karta(pid, "✅ Tasdiqlandi")); return
+    if w == 'mx':
+        xarita_yoz(pid, '', 0); await q.answer("🗑")
+        await _pos_chiqar(q, *_xarita_karta(pid)); return
+    if w == 'mu':
+        st['wait'] = f'url:{pid}'; await q.answer()
+        await _pos_chiqar(q, "✏️ Tovarning yetkazuvchi saytidagi sahifa manzilini yuboring (https://…)",
+                          [[_btn("⬅️ Orqaga", f"mkt:mp:{pid}")]]); return
+    if w == 'mr':
+        await q.answer("🔄 Yuklanmoqda…")
+        k = await asyncio.to_thread(kontent_ol, pid, True)
+        iz = "Moslik yo'q" if not k else (f"✅ {len(k['images'])} rasm, {len(k['videos'])} video" if k['status'] == 'ok' else f"⚠️ {k['error']}")
+        await _pos_chiqar(q, *_xarita_karta(pid, iz)); return
+    await q.answer()
+
+
+async def kontent_matn(u, ctx, st, w, t_):
+    if w == 'vaqt':
+        mt = re.fullmatch(r'(\d{1,2})[:.](\d{2})', t_)
+        if not mt or int(mt.group(1)) > 23 or int(mt.group(2)) > 59:
+            await u.message.reply_text("Format: 10:00"); return True
+        st['wait'] = None; soz_yoz('kontent_vaqt', f"{int(mt.group(1)):02d}:{mt.group(2)}")
+        m, r = _kontent_sozlama(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    if w.startswith('url:'):
+        pid = int(w[4:])
+        if not re.fullmatch(r'https?://[^\s]{4,500}', t_):
+            await u.message.reply_text("URL noto'g'ri. https:// bilan boshlansin."); return True
+        st['wait'] = None; xarita_yoz(pid, t_, 1)
+        m, r = _xarita_karta(pid, "✅ URL saqlandi. «🔄 Kontentni yangilash» bilan tekshiring.")
+        await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    return False
+
+
 async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     # Faqat egasi: aks holda kanal/forward qilingan xabardagi tugma orqali begona odam
@@ -8845,10 +10928,10 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rol: return
     msg = u.message.text
     if msg in MENU_MAP:
-        for _k in ('pos', 'omb', 'mij', 'his', 'zav'):            # menyu bosildi — tugmali oynalar kutishi bekor
+        for _k in ('pos', 'omb', 'mij', 'his', 'zav', 'mkt'):     # menyu bosildi — tugmali oynalar kutishi bekor
             if ctx.user_data.get(_k): ctx.user_data[_k]['wait'] = None
     elif (await pos_matn(u, ctx) or await omb_matn(u, ctx) or await mij_matn(u, ctx)
-          or await his_matn_kirit(u, ctx) or await zav_matn(u, ctx)):
+          or await his_matn_kirit(u, ctx) or await zav_matn(u, ctx) or await mkt_matn(u, ctx)):
         return
     if rol == 'sotuvchi':
         await sotuvchi_matn(u, ctx, msg); return
@@ -9427,22 +11510,9 @@ async def handle_photo_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"Xato: {e}")
 
 async def handle_video_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not can(u, 'boshqaruv'): return
-    ch = get_channel_id()
-    if not ch:
-        await u.message.reply_text("CHANNEL_ID sozlanmagan!")
-        return
-    video = u.message.video
-    caption = u.message.caption or ""
-    if not caption:
-        caption = "ThermoCrafts\n\nYunusobod, Toshkent\n#ThermoCrafts"
-    else:
-        caption = caption + "\n\nYunusobod, Toshkent\n#ThermoCrafts"
-    try:
-        await ctx.bot.send_video(chat_id=ch, video=video.file_id, caption=caption)
-        await u.message.reply_text("Video kanalga yuborildi!")
-    except Exception as e:
-        await u.message.reply_text(f"Xato: {e}")
+    """Egasi/admin video yubordi → 📢 Marketing: tovar tanlash → oldindan ko'rish → Telegram/Instagram."""
+    if not can(u, 'marketing'): return
+    await mkt_media(u, ctx)
 
 # ── SELF-UPDATE (GitHub API) ──────────────────────────────────────
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
@@ -10946,6 +13016,7 @@ def main():
     app.add_handler(CommandHandler('qarzdorlar', cmd_qarzdorlar))
     app.add_handler(CommandHandler('hisobotlar', cmd_hisobotlar))
     app.add_handler(CommandHandler('zavod', cmd_zavod_ui))
+    app.add_handler(CommandHandler('marketing', cmd_marketing))
     app.add_handler(CommandHandler('help', cmd_yordam))
     app.add_handler(CommandHandler('yordam', cmd_yordam))
     app.add_handler(CommandHandler('astatka', cmd_astatka))
@@ -11015,6 +13086,10 @@ def main():
     app.add_handler(CallbackQueryHandler(mij_callback, pattern=r'^mij:'))
     app.add_handler(CallbackQueryHandler(his_callback, pattern=r'^his:'))
     app.add_handler(CallbackQueryHandler(zav_callback, pattern=r'^zav:'))
+    app.add_handler(CallbackQueryHandler(mkt_callback, pattern=r'^mkt:'))
+    app.add_handler(CallbackQueryHandler(lead_callback, pattern=r'^lead:'))
+    app.add_handler(CallbackQueryHandler(pub_callback, pattern=r'^pub:'))
+    app.add_handler(MessageHandler(filters.CONTACT & ~STAFF, pub_contact))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & STAFF, handle_text))
