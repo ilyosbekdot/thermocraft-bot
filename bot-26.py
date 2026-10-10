@@ -8893,6 +8893,7 @@ SOZ_DEFAULT = {
     'kontent_vaqt': '10:00',   # Toshkent vaqti
     'kontent_kun': '14',       # shu kun ichida joylangan tovar takrorlanmaydi
     'manba_korsat': '1',       # "Manba: <brend> rasmiy sayti"
+    'buyurtma_kontakt': 'Uzb_economist_1',   # kanal postidagi «🛒 Buyurtma berish» → https://t.me/<shu username>
 }
 PLATFORMA_NOMI = {'tg': 'Telegram', 'ig': 'Instagram', 'both': 'Telegram + Instagram'}
 
@@ -8925,7 +8926,8 @@ def init_marketing_tables():
     for ddl in ("ALTER TABLE products ADD COLUMN public_show INTEGER DEFAULT 1",
                 "ALTER TABLE products ADD COLUMN public_price INTEGER DEFAULT 1",
                 "ALTER TABLE products ADD COLUMN supplier_url TEXT DEFAULT ''",
-                "ALTER TABLE products ADD COLUMN supplier_url_ok INTEGER DEFAULT 0"):
+                "ALTER TABLE products ADD COLUMN supplier_url_ok INTEGER DEFAULT 0",
+                "ALTER TABLE posts ADD COLUMN kb_mid TEXT DEFAULT ''"):
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_posts_pid ON posts(product_id, created)")
@@ -9029,6 +9031,64 @@ def _narxsiz(s):
     return re.sub(r'\b\d[\d,.]*\s?(?:USD|EUR|usd|dollar)\b', '', s)
 
 
+_SARLAVHA_SOZLAR = {re.sub(r'[\W_]+', '', s.lower()) for s in (
+    "Asosiy afzalliklari", "Asosiy afzalliklar", "Afzalliklari", "Afzalliklar", "Asosiy xususiyatlari", "Xususiyatlari",
+    "Xususiyatlar", "Texnik xususiyatlari", "Tavsif", "Mahsulot tavsifi", "Parametrlar", "Key features", "Main features",
+    "Features", "Product features", "Highlights", "Specifications", "Specs", "Description", "Product description", "Overview",
+    "Advantages", "Benefits", "Преимущества", "Основные преимущества", "Особенности", "Характеристики", "Описание",
+    "Технические характеристики")}
+_MD_SARLAVHA = re.compile(r'^\s{0,3}#{1,6}(?:\s|$)')
+
+
+def _md_tozala(s):
+    """Bitta qatordan markdown belgilarini olib tashlaydi: # sarlavha, **qalin**, *kursiv*, `kod`, [havola](url), > iqtibos."""
+    t = str(s or '').strip()
+    t = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', t)
+    t = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', t)
+    t = re.sub(r'^\s{0,3}>\s?', '', t)
+    t = re.sub(r'^\s{0,3}#{1,6}(?:\s+|$)', '', t)   # '#xeshteg' saqlanadi
+    t = re.sub(r'(\*\*|__)(.+?)\1', r'\2', t)
+    t = re.sub(r'(?<![\w*])\*(?![\s*])(.+?)(?<![\s*])\*(?![\w*])', r'\1', t)
+    t = re.sub(r'(?<!\w)_(?![\s_])(.+?)(?<![\s_])_(?!\w)', r'\1', t)
+    t = t.replace('**', '').replace('__', '').replace('`', '')
+    t = re.sub(r'\s+#+\s*$', '', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def _xususiyat_tozala(matn, sarlavhalar=(), brend='', n=5):
+    """'✨ Afzalliklari' uchun 3–5 ta toza qator (AI yoki sayt matnidan): markdown sarlavhalar (#), chiziqlar, bo'lim
+    nomlari ('…:' / 'Asosiy afzalliklari'), tovar nomining takrori va dublikatlar tashlanadi."""
+    nrm = lambda s: re.sub(r'[\W_]+', '', str(s or '').lower())
+    nomlar = [nrm(x) for x in sarlavhalar if x and len(nrm(x)) >= 4]
+    nom_soz = {w.lower() for x in sarlavhalar if x for w in re.findall(r'[^\W\d_]{4,}', str(x))}
+    bk = nrm(brend)
+    out, korildi = [], set()
+    for ln in str(matn or '').splitlines():
+        raw = ln.strip()
+        if not raw or _MD_SARLAVHA.match(raw): continue                    # markdown sarlavha — xususiyat emas
+        if re.fullmatch(r'[-*_=~•·—–\s]{3,}', raw): continue                # gorizontal chiziq
+        t = _md_tozala(raw)   # avval *kursiv* ochiladi, so'ng '* ' marker olinadi
+        t = re.sub(r'^(?:[\s•\-*–—·▪▫◦●○✔✓✅☑➤►▶→]+|\d{1,2}[.)]\s+)+', '', t).strip(' •-*–—·\t')
+        if len(t) < 3 or not re.search(r'\w', t) or t.endswith(':'): continue
+        k = nrm(t)
+        if not k or k in _SARLAVHA_SOZLAR or k in korildi: continue
+        if any(k == x or k in x or (x in k and len(k) <= len(x) + 12) for x in nomlar): continue
+        sozlar = re.findall(r'\w+', t)
+        if (bk and len(bk) >= 3 and bk in k and ':' not in t and len(sozlar) <= 8
+                and any(w.lower() in nom_soz for w in sozlar)): continue      # "Brend + tovar nomi" — sarlavha takrori
+        korildi.add(k); out.append(t[:110])
+        if len(out) >= n: break
+    return out
+
+
+def _kesh_sarlavha(pid):
+    try:
+        k = kontent_kesh(pid)
+        return (k or {}).get('title') or ''
+    except Exception:
+        return ''
+
+
 def post_matn(p, show_price=True, extra='', video_link='', manba='', ig=False, rate=None, bot_user=''):
     """Kanal (ig=False) yoki Instagram (ig=True) uchun tayyor matn (oddiy matn). Tannarx YO'Q."""
     rate = rate or get_exchange_rate()
@@ -9040,9 +9100,9 @@ def post_matn(p, show_price=True, extra='', video_link='', manba='', ig=False, r
     else: bosh.append("💬 Narxi: so'rov bo'yicha")
     bosh.append("✅ Mavjud — Toshkentda" if p['qty'] > 0 else "🕐 Buyurtma asosida")
     ixt = []
-    feats = [ln.strip(' •-*\t') for ln in _narxsiz(extra).splitlines() if ln.strip(' •-*\t')]
+    feats = _xususiyat_tozala(_narxsiz(extra), (p['name'], _kesh_sarlavha(p['id'])), brend)
     if feats:
-        ixt += ['', "✨ Afzalliklari:"] + [f"• {ln}" for ln in feats[:8]]
+        ixt += ['', "✨ Afzalliklari:"] + [f"• {ln}" for ln in feats]
     specs = get_product_specs(p['id'])
     if specs:
         ixt += ['', "⚙️ Xususiyatlari:"] + [f"• {k}: {v}" for k, v in specs[:12]]
@@ -9107,8 +9167,17 @@ def ai_post_matn(p, asos, show_price=True, manba_matn=''):
     user = f"Shablon post:\n{asos}"
     if manba_matn:
         user += "\n\nIshlab chiqaruvchi ma'lumoti (inglizcha — kerakli 3-5 ta afzallikni tarjima qilib qo'sh):\n" + _narxsiz(manba_matn)[:2500]
-    m = _ai_matn(system, user)
+    m = _post_md_tozala(_ai_matn(system, user))
     return m if _ai_tekshir(m, p, show_price, TG_CAPTION_MAX) else ''
+
+
+def _post_md_tozala(matn):
+    """AI yozgan butun post: markdown belgilarini olib tashlaydi (#, **, ---), qator tuzilishi saqlanadi."""
+    qator = []
+    for ln in str(matn or '').splitlines():
+        if re.fullmatch(r'\s*[-*_=]{3,}\s*', ln): continue
+        qator.append(_md_tozala(ln) if ln.strip() else '')
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(qator)).strip()
 
 
 def ai_xususiyatlar(matn, n=5):
@@ -9117,7 +9186,8 @@ def ai_xususiyatlar(matn, n=5):
     m = _ai_matn("Inglizcha texnik matndan uskunaning eng muhim 3-5 ta afzalligini o'zbek tilida (lotin), har birini alohida "
                  "qatorda, qisqa (60 belgigacha) yoz. Narx, chegirma, yetkazib berish, kafolat shartlarini yozma. Faqat ro'yxat.",
                  _narxsiz(matn)[:3000], 400)
-    out = [ln.strip(' •-*0123456789.)\t') for ln in m.splitlines()]
+    out = [_md_tozala(re.sub(r'^\s*(?:[•\-*]+|\d{1,2}[.)])\s*', '', ln)).strip(' •-*\t') for ln in m.splitlines()
+           if not _MD_SARLAVHA.match(ln) and not ln.strip().endswith(':')]
     out = [ln[:90] for ln in out if 3 <= len(ln) and '$' not in ln]      # narx qatori bo'lsa — tashlanadi
     return out[:n]
 
@@ -9197,12 +9267,13 @@ def _media_tavsif(media):
     return s or "yo'q (faqat matn)"
 
 
-def _post_yoz(d, p, platform, status, mid='', link='', caption='', error='', uid=0):
+def _post_yoz(d, p, platform, status, mid='', link='', caption='', error='', uid=0, kb_mid=''):
     conn = db()
-    conn.execute("INSERT INTO posts (created,product_id,product,platform,status,message_id,link,media_type,caption,draft_id,source,user_id,error) "
-                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    conn.execute("INSERT INTO posts (created,product_id,product,platform,status,message_id,link,media_type,caption,draft_id,source,user_id,error,kb_mid) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (_mkt_vaqt(), d.get('pid'), (p or {}).get('name', ''), platform, status, str(mid or ''), link or '',
-                  _media_tavsif(d.get('media') or []), caption[:3000], d.get('id'), d.get('source', ''), uid, (error or '')[:300]))
+                  _media_tavsif(d.get('media') or []), caption[:3000], d.get('id'), d.get('source', ''), uid, (error or '')[:300],
+                  str(kb_mid or '')))
     conn.commit(); conn.close()
 
 
@@ -9217,6 +9288,88 @@ def _bot_user(bot):
 def deep_link(bot, pid):
     un = _bot_user(bot)
     return f"https://t.me/{un}?start=p{int(pid)}" if un else ''
+
+
+KONTAKT_STANDART = 'Uzb_economist_1'
+_KONTAKT_RE = re.compile(r'[A-Za-z0-9_]{5,32}')
+
+
+def kontakt_nrm(s):
+    """'@user', 'user', 't.me/user', 'https://t.me/user' → 'user' (5–32 belgi: A-Z a-z 0-9 _). Noto'g'ri — None."""
+    t = str(s or '').strip()
+    t = re.sub(r'^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/', '', t, flags=re.I).strip().rstrip('/').lstrip('@')
+    return t if _KONTAKT_RE.fullmatch(t) else None
+
+
+def buyurtma_kontakt():
+    return kontakt_nrm(soz('buyurtma_kontakt')) or KONTAKT_STANDART
+
+
+def buyurtma_url():
+    """Kanal postidagi tugma: egasining shaxsiy chatiga to'g'ridan-to'g'ri (oldindan yozilgan matnsiz)."""
+    return f"https://t.me/{buyurtma_kontakt()}"
+
+
+def buyurtma_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buyurtma berish", url=buyurtma_url())]])
+
+
+def _albommi(media_tavsif):
+    """posts.media_type ('2 rasm', '1 video, 3 rasm', "yo'q (faqat matn)") → albom (2+ media) bo'lganmi."""
+    return sum(int(n) for n in re.findall(r'(\d+) (?:video|rasm)', str(media_tavsif or ''))) > 1
+
+
+def _albom_soni(media_tavsif):
+    return sum(int(n) for n in re.findall(r'(\d+) (?:video|rasm)', str(media_tavsif or '')))
+
+
+async def postlar_tugma_yangila(bot, limit=100):
+    """Oxirgi kanal postlaridagi «🛒 Buyurtma berish» tugmasini joriy kontaktga yangilaydi (edit_message_reply_markup).
+    Albomli eski postlarda tugmali xabar id saqlanmagan — albomdan keyingi xabar (id + media soni) sinab ko'riladi."""
+    ch = get_channel_id()
+    r = {'kanal': bool(ch), 'jami': 0, 'ok': 0, 'taxmin': 0, 'xato': 0, 'otkazildi': 0}
+    if not ch: return r
+    conn = db()
+    rr = conn.execute("SELECT id, message_id, COALESCE(kb_mid,''), media_type FROM posts WHERE platform='telegram' AND status='ok' "
+                      "AND product_id IS NOT NULL AND COALESCE(message_id,'')<>'' ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+    conn.close()
+    kb = buyurtma_kb()
+    for post_id, mid, kmid, mt in rr:
+        r['jami'] += 1
+        taxmin = False
+        if kmid: tgt = kmid
+        elif not _albommi(mt): tgt = mid
+        else:
+            try: tgt = str(int(mid) + _albom_soni(mt)); taxmin = True
+            except ValueError: r['otkazildi'] += 1; continue
+        try:
+            await bot.edit_message_reply_markup(chat_id=ch, message_id=int(tgt), reply_markup=kb)
+            ok_ = True
+        except Exception as e:
+            ok_ = 'not modified' in str(e).lower()
+            if not ok_: log.info("tugma yangilanmadi (post #%s): %s", post_id, str(e)[:120])
+        if ok_:
+            r['ok'] += 1; r['taxmin'] += int(taxmin)
+            if not kmid:
+                try:
+                    c2 = db(); c2.execute("UPDATE posts SET kb_mid=? WHERE id=?", (str(tgt), post_id)); c2.commit(); c2.close()
+                except sqlite3.Error:
+                    pass
+        else:
+            r['xato'] += 1
+        await asyncio.sleep(0.05)
+    return r
+
+
+def _kbup_matn(r):
+    if not r.get('kanal'): return "⚠️ CHANNEL_ID sozlanmagan — yangilanadigan kanal yo'q."
+    if not r['jami']: return "ℹ️ Bot saqlagan kanal posti topilmadi."
+    s = f"🔄 Tugmalar yangilandi: {r['ok']}/{r['jami']} ta post → https://t.me/{buyurtma_kontakt()}"
+    if r['taxmin']: s += f"\n(shundan {r['taxmin']} tasi albomli eski post — tugmali xabar id bo'yicha taxminan topildi)"
+    if r['xato'] or r['otkazildi']:
+        s += (f"\n⚠️ {r['xato'] + r['otkazildi']} ta postni yangilab bo'lmadi (o'chirilgan yoki albomning tugmali xabari topilmadi) — "
+              "kerak bo'lsa ularni kanalda qo'lda o'chiring/qayta joylang.")
+    return s
 
 
 def _kanal_link(ch, mid):
@@ -9240,9 +9393,9 @@ async def tg_joyla(bot, d, uid=0):
     p = _mkt_p(d['pid']) if d.get('pid') else None
     if not ch: return {'ok': False, 'error': "CHANNEL_ID sozlanmagan (Railway → Variables)"}
     matn = d['caption'] or (p and post_matn(p)) or ''
-    dl = deep_link(bot, d['pid']) if d.get('pid') else ''
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buyurtma berish", url=dl)]]) if dl else None
+    kb = buyurtma_kb() if d.get('pid') else None     # egasining shaxsiy chati (sozlama: 🛒 Buyurtma kontakti)
     media = [m for m in (d.get('media') or []) if m.get('type') in ('photo', 'video')][:10]
+    holat = {'kb_mid': ''}
 
     async def yubor(html_rejim):
         cap = _tg_html(matn) if html_rejim else matn
@@ -9263,8 +9416,9 @@ async def tg_joyla(bot, d, uid=0):
                 kw = {'caption': cap, 'parse_mode': pm} if i == 0 else {}
                 grp.append(InputMediaVideo(src, **kw) if m['type'] == 'video' else InputMediaPhoto(src, **kw))
             res = await bot.send_media_group(chat_id=ch, media=grp)
-            if kb:   # albomga tugma qo'yib bo'lmaydi — alohida qisqa xabar
-                await bot.send_message(chat_id=ch, text=f"🛒 {p['name'] if p else 'Buyurtma'} — buyurtma berish:", reply_markup=kb)
+            if kb:   # albomga tugma qo'yib bo'lmaydi (Telegram cheklovi) — FAQAT shu holda bitta qisqa xabar
+                km = await bot.send_message(chat_id=ch, text="👆 Buyurtma uchun:", reply_markup=kb)
+                holat['kb_mid'] = getattr(km, 'message_id', '') or ''
             return res[0] if isinstance(res, (list, tuple)) and res else res
     try:
         try:
@@ -9279,7 +9433,8 @@ async def tg_joyla(bot, d, uid=0):
         return {'ok': False, 'error': err}
     mid = getattr(msg, 'message_id', '') or ''
     link = _kanal_link(ch, mid) if mid else ''
-    _post_yoz(d, p, 'telegram', 'ok', mid, link, matn, uid=uid)
+    kb_mid = (holat['kb_mid'] or (mid if kb else '')) if mid else ''
+    _post_yoz(d, p, 'telegram', 'ok', mid, link, matn, uid=uid, kb_mid=kb_mid)
     return {'ok': True, 'mid': mid, 'link': link}
 
 
@@ -9675,15 +9830,18 @@ def _mkt_tovarlar(ci, page, prefix='mkt:pk'):
     return rows
 
 
-def _pub_sozlama():
+def _pub_sozlama(izoh=''):
     m = ("🌐 OCHIQ KATALOG (ro'yxatda yo'q mijozlar uchun)\n\n"
-         "Mijoz botga tovar nomini yozsa yoki kanaldagi «🛒 Buyurtma berish» tugmasini bossa — tovar kartasi chiqadi.\n"
+         "Mijoz botga tovar nomini yozsa — tovar kartasi chiqadi.\n"
          "Tannarx hech qachon ko'rsatilmaydi.\n\n"
          f"📦 Aniq qoldiq soni: {'ko‘rsatiladi' if soz('ochiq_qoldiq') == '1' else 'yo‘q (faqat Mavjud/Buyurtma asosida)'}\n"
          f"📩 So'rovlar sotuvchilarga ham: {'ha' if soz('lead_sotuvchi') == '1' else 'yo‘q (egasi va admin)'}\n"
-         f"📞 Aloqa telefoni: {_mkt_tel() or '— (kiritilmagan)'}")
+         f"📞 Aloqa telefoni: {_mkt_tel() or '— (kiritilmagan)'}\n"
+         f"🛒 Buyurtma kontakti (kanal tugmasi): https://t.me/{buyurtma_kontakt()}"
+         + (f"\n\n{izoh}" if izoh else ''))
     rows = [[_btn("📦 Qoldiq sonini almashtirish", "mkt:oq")], [_btn("📩 Sotuvchilarga: almashtirish", "mkt:ls")],
-            [_btn("📞 Telefonni kiritish", "mkt:tel")], [_btn("👁 Tovarlar ko'rinishi / narxi", "mkt:pv:0")],
+            [_btn("📞 Telefonni kiritish", "mkt:tel")], [_btn("🛒 Buyurtma kontakti", "mkt:kon")],
+            [_btn("🔄 Eski postlar tugmasini yangilash", "mkt:kbup")], [_btn("👁 Tovarlar ko'rinishi / narxi", "mkt:pv:0")],
             [_btn("⬅️ Orqaga", "mkt:menu")]]
     return m, rows
 
@@ -9885,6 +10043,20 @@ async def mkt_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         k = 'ochiq_qoldiq' if w == 'oq' else 'lead_sotuvchi'
         soz_yoz(k, '0' if soz(k) == '1' else '1'); await q.answer("✅")
         await _pos_chiqar(q, *_pub_sozlama()); return
+    if w in ('kon', 'kbup') and not can(u, 'system'):
+        await q.answer("Faqat egasi", show_alert=True); return
+    if w == 'kon':
+        st['wait'] = 'kon'; await q.answer()
+        await _pos_chiqar(q, f"🛒 Kanal postlaridagi «Buyurtma berish» tugmasi qaysi Telegram akkauntga olib borsin?\n"
+                             f"Hozir: https://t.me/{buyurtma_kontakt()}\n\n"
+                             "Username yozing: Uzb_economist_1, @Uzb_economist_1 yoki https://t.me/Uzb_economist_1\n"
+                             "(5–32 belgi: lotin harf, raqam, _)", [[_btn("⬅️ Orqaga", "mkt:pubs")]]); return
+    if w == 'kbup':
+        if not _ui_done(ctx, f"kbup{int(time.time() // 30)}"):
+            await q.answer("⏳ Bajarilmoqda…"); return
+        await q.answer("⏳ Kanal postlari yangilanmoqda…")
+        r = await postlar_tugma_yangila(ctx.bot)
+        await _pos_chiqar(q, *_pub_sozlama(_kbup_matn(r))); return
     if w == 'tel':
         st['wait'] = 'tel'; await q.answer()
         await _pos_chiqar(q, "📞 Aloqa telefonini yozing (masalan +998 90 123 45 67). O'chirish: -", [[_btn("⬅️ Orqaga", "mkt:pubs")]]); return
@@ -9924,6 +10096,13 @@ async def mkt_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text(f"Juda uzun: {len(t_)} belgi. Media bilan post {TG_CAPTION_MAX} belgigacha bo'ladi. Qisqartirib yuboring."); return True
         draft_yoz(did, caption=t_, custom=1)
         m, r = mkt_preview(did)
+        await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    if w == 'kon':
+        k = kontakt_nrm(t_)
+        if not k:
+            await u.message.reply_text("Noto'g'ri username. 5–32 belgi: lotin harf, raqam, _ (masalan Uzb_economist_1)."); return True
+        st['wait'] = None; soz_yoz('buyurtma_kontakt', k)
+        m, r = _pub_sozlama(f"✅ Saqlandi: https://t.me/{k}\nYangi postlarda shu ishlatiladi. Eski postlar uchun «🔄 Eski postlar tugmasini yangilash».")
         await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
     if w == 'tel':
         st['wait'] = None
