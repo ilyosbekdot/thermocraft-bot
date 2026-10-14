@@ -3070,6 +3070,17 @@ async def _briefing(app, kind):
     except Exception:
         log.exception("briefing")
 
+def kontent_slot_keldi(hm, sana, sent):
+    """Hozir boshlanadigan kunlik post vaqtlari: [(ishladi_kaliti, sent_kaliti)]. Har vaqt kuniga bir marta."""
+    if soz('kontent_kunlik') != '1': return []
+    out = []
+    for k, v in kontent_vaqtlar():
+        ish = 'kontent_ishladi' if k == 'kontent_vaqt' else 'kontent_ishladi2'
+        sk = ('k' if k == 'kontent_vaqt' else 'k2') + sana
+        if hm == v and sk not in sent and soz(ish) != sana: out.append((ish, sk))
+    return out
+
+
 async def _scheduler(app):
     log.info("Proaktiv xabarlar yoqildi: %s / %s (UTC%+d)", BRIEF_MORNING, BRIEF_EVENING, TZ_OFFSET)
     sent = set()
@@ -3084,9 +3095,8 @@ async def _scheduler(app):
             sent.add('e' + key[:10]); await _briefing(app, 'evening')
         # Kunlik kontent (9-bosqich): vaqt — 📢 Marketing sozlamasi; restartdan keyin takrorlanmaydi (kontent_ishladi)
         try:
-            if (app is not None and ('k' + key[:10]) not in sent and hm == _hhmm(soz('kontent_vaqt'))
-                    and soz('kontent_kunlik') == '1' and soz('kontent_ishladi') != key[:10]):
-                sent.add('k' + key[:10]); soz_yoz('kontent_ishladi', key[:10])
+            for _kk, _sk in kontent_slot_keldi(hm, key[:10], sent) if app is not None else []:
+                sent.add(_sk); soz_yoz(_kk, key[:10])
                 _t = asyncio.create_task(kontent_kunlik(app.bot)); _FON.add(_t); _t.add_done_callback(_FON.discard)
         except Exception:
             log.exception("kunlik kontent")
@@ -8891,7 +8901,8 @@ SOZ_DEFAULT = {
     'auto_platforma': 'tg',    # tg | ig | both
     'kontent_kunlik': '1',     # kunlik kontent (oldindan ko'rish) yoqilgan
     'kontent_vaqt': '10:00',   # Toshkent vaqti
-    'kontent_kun': '14',       # shu kun ichida joylangan tovar takrorlanmaydi
+    'kontent_kun': '2',        # shu kun ichida joylangan tovar takrorlanmaydi (1–14; yangi tovar bo'lmasa — aylanma)
+    'kontent_vaqt2': '18:00',  # 2-kunlik post vaqti (Toshkent); '' — o'chiq
     'manba_korsat': '1',       # "Manba: <brend> rasmiy sayti"
     'buyurtma_kontakt': 'Uzb_economist_1',   # kanal postidagi «🛒 Buyurtma berish» → https://t.me/<shu username>
 }
@@ -8931,6 +8942,10 @@ def init_marketing_tables():
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_posts_pid ON posts(product_id, created)")
+    # 12-tuzatish: eski 7/14/21/30 kunlik takrorlamaslik bir marta 2 kunga tushiriladi (keyin egasi xohlaganicha o'zgartiradi)
+    if not c.execute("SELECT 1 FROM sozlamalar WHERE kalit='kontent_kun_v2'").fetchone():
+        c.execute("UPDATE sozlamalar SET qiymat='2' WHERE kalit='kontent_kun' AND qiymat IN ('7','14','21','30')")
+        c.execute("INSERT OR REPLACE INTO sozlamalar (kalit, qiymat) VALUES ('kontent_kun_v2', '1')")
     conn.commit(); conn.close()
 
 
@@ -10111,7 +10126,7 @@ async def mkt_matn(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             st['wait'] = 'tel'; await u.message.reply_text("Telefon noto'g'ri. Masalan: +998 90 123 45 67"); return True
         else: soz_yoz('aloqa_tel', t_[:40])
         m, r = _pub_sozlama(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
-    if w.startswith(('vaqt', 'url:')):
+    if w.startswith(('vaqt', 'url:')) or w == 'days':
         return await kontent_matn(u, ctx, st, w, t_)
     return False
 
@@ -10422,7 +10437,7 @@ KONTENT_KESH_KUN = 7
 XARITA_AVTO_BALL = 0.8
 _WEB = {'last': {}, 'robots': {}, 'katalog': {}}
 _WEB_LOCK = threading.Lock()
-KONTENT_TUGMALAR = {'cal', 'now', 'auto', 'autop', 'ks', 'kun', 'man', 'days', 'vaqt', 'map', 'mp', 'mc', 'mok', 'mu', 'mx', 'mf', 'mr'}
+KONTENT_TUGMALAR = {'cal', 'now', 'auto', 'autop', 'ks', 'kun', 'man', 'days', 'vaqt', 'vaqt2', 'map', 'mp', 'mc', 'mok', 'mu', 'mx', 'mf', 'mr'}
 _AKSESSUAR = ('blade', 'bit', 'bits', 'set', 'module', 'kit', 'spare', 'replacement', 'belt', 'lens', 'nozzle', 'cable',
               'collet', 'end mill', 'clamp', 'honeycomb', 'enclosure', 'rotary', 'roller', 'paper', 'tape', 'ink', 'filter')
 
@@ -10816,8 +10831,7 @@ def kontent_otkaz(pid):
 def kontent_navbat(n=7):
     """Omborda bor, faol, ochiq; supplier_url yoki o'z rasmi bor; oxirgi N kunda joylanmagan; bugun o'tkazilmagan.
     Tartib: eng uzoq vaqt joylanmagan (hech qachon — birinchi), keyin id."""
-    try: kun = max(1, int(soz('kontent_kun') or 14))
-    except ValueError: kun = 14
+    kun = kontent_kun()
     chegara = (_local_now() - timedelta(days=kun)).strftime('%Y-%m-%d %H:%M')
     try: ot = json.loads(soz('kontent_otkaz') or '{}')
     except ValueError: ot = {}
@@ -10835,6 +10849,59 @@ def kontent_navbat(n=7):
         out.append({'id': pid, 'name': nom, 'url': url, 'url_ok': ok, 'oxirgi': oxirgi.get(pid) or ''})
     out.sort(key=lambda x: (x['oxirgi'], x['id']))
     return out[:n]
+
+
+def kontent_kun():
+    """Takrorlamaslik kunlari, 1–14 (standart 2)."""
+    try: return min(14, max(1, int(soz('kontent_kun') or 2)))
+    except ValueError: return 2
+
+
+def _kontent_bugun():
+    try: d = json.loads(soz('kontent_tanlangan') or '{}')
+    except ValueError: d = {}
+    return set(d.get('pids') or []) if d.get('sana') == today() else set()
+
+
+def kontent_belgila(pid):
+    """Bugun tanlangan tovar — 2-vaqt boshqa tovarni olishi uchun."""
+    b = _kontent_bugun(); b.add(pid)
+    soz_yoz('kontent_tanlangan', json.dumps({'sana': today(), 'pids': sorted(b)}))
+
+
+def kontent_tanla():
+    """Kunlik post uchun bitta tovar: (tovar, rejim, izoh) yoki (None, None, sabab).
+    1) yangi: omborda bor, rasm/sahifa bor, takrorlamaslik muddatida joylanmagan;
+    2) aylanma: shulardan eng uzoq joylangani (muddatga qaramay);
+    3) buyurtma: omborda yo'q, lekin rasm/sahifa bor (postda «Buyurtma asosida»).
+    Bugun tanlangan/o'tkazilganlar oxirgi navbatda. Rasm/sahifa umuman yo'q bo'lsagina — None."""
+    chegara = (_local_now() - timedelta(days=kontent_kun())).strftime('%Y-%m-%d %H:%M')
+    try: ot = json.loads(soz('kontent_otkaz') or '{}')
+    except ValueError: ot = {}
+    band = (set(ot.get('pids') or []) if ot.get('sana') == today() else set()) | _kontent_bugun()
+    conn = db()
+    oxirgi = dict(conn.execute("SELECT product_id, MAX(created) FROM posts WHERE status='ok' GROUP BY product_id").fetchall())
+    rasm = {r[0] for r in conn.execute("SELECT DISTINCT product_id FROM product_photos").fetchall()}
+    rr = conn.execute("SELECT id,name,COALESCE(supplier_url,''),COALESCE(supplier_url_ok,0),COALESCE(qty,0) FROM products "
+                      "WHERE active=1 AND COALESCE(public_show,1)=1").fetchall()
+    conn.close()
+    hammasi = [{'id': pid, 'name': nom, 'url': url, 'url_ok': ok, 'qty': q, 'oxirgi': oxirgi.get(pid) or ''}
+               for pid, nom, url, ok, q in rr if url or pid in rasm]
+    if not hammasi:
+        if not rr: return None, None, "📭 Faol (ochiq) tovar yo'q. Avval tovar qo'shing yoki tovarni ochiq qiling."
+        return None, None, (f"📭 Kunlik post uchun tovar yo'q: {len(rr)} ta faol tovarning hech birida rasm yoki sayt sahifasi yo'q.\n"
+                            "Qo'shing: tovar kartasida 📷 rasm yuklang yoki 📢 Marketing → 🔗 Tovar ↔ sayt orqali sahifa bog'lang.")
+    tartib = lambda x: (x['oxirgi'], x['id'])
+    bor = sorted([x for x in hammasi if x['qty'] > 0 and x['id'] not in band], key=tartib)
+    yangi = [x for x in bor if not x['oxirgi'] or x['oxirgi'] < chegara]
+    if yangi: return yangi[0], 'yangi', ''
+    if bor:
+        x = bor[0]
+        return x, 'aylanma', f"🔁 Yangi tovar qolmadi — aylanma: eng uzoq joylangani (oxirgi: {x['oxirgi'][:10] or '—'})"
+    yoq = sorted([x for x in hammasi if x['qty'] <= 0 and x['id'] not in band], key=tartib)
+    if yoq: return yoq[0], 'buyurtma', "🕐 Omborda yo'q — postda «Buyurtma asosida» deb ko'rsatiladi"
+    x = sorted(hammasi, key=tartib)[0]   # hammasi bugun ishlatilgan — baribir bittasi (takror)
+    return x, 'aylanma', "🔁 Bugun barcha tovarlar ishlatilgan — takror (eng uzoq joylangani)"
 
 
 def kontent_tozala(d):
@@ -10923,15 +10990,16 @@ async def kontent_kunlik(bot, majburiy=False, chat_id=None):
     except Exception: pass
     try: await asyncio.to_thread(xarita_avto)
     except Exception: log.warning("xarita_avto ishlamadi")
-    nav = await asyncio.to_thread(kontent_navbat, 1)
-    if not nav:
-        if majburiy:
-            await bot.send_message(chat_id=chat_id, text=(f"📭 Hozir joylash uchun tovar yo'q: omborda bor, ochiq, rasmi yoki sayt sahifasi bor "
-                                                          f"va oxirgi {soz('kontent_kun')} kunda joylanmagan tovar topilmadi."))
+    tv, rejim, sabab = await asyncio.to_thread(kontent_tanla)
+    if not tv:
+        await bot.send_message(chat_id=chat_id, text=sabab)   # vaqtida ham ayting — jim qolmasin
         return None
+    nav = [tv]
     avto = (soz('auto_post') == '1' and not majburiy)
     try:
-        did, izoh = await kontent_qoralama(nav[0]['id'], avto)
+        did, izoh = await kontent_qoralama(tv['id'], avto)
+        kontent_belgila(tv['id'])
+        if sabab: izoh = (sabab + '\n' + izoh) if izoh else sabab
     except Exception as e:
         log.exception("kontent qoralama")
         await bot.send_message(chat_id=chat_id, text=f"⚠️ Kunlik kontent tayyorlanmadi: {str(e)[:150]}")
@@ -10951,15 +11019,28 @@ async def kontent_kunlik(bot, majburiy=False, chat_id=None):
 
 
 # ── Kontent ekranlari ──
+def kontent_vaqtlar():
+    """[(kalit, 'HH:MM'), ...] — yoqilgan kunlik post vaqtlari."""
+    out = []
+    for k in ('kontent_vaqt', 'kontent_vaqt2'):
+        v = _hhmm(soz(k)) if soz(k) else ''
+        if re.fullmatch(r'\d\d:\d\d', v): out.append((k, v))
+    return out
+
+
+def kontent_vaqtlar_matn():
+    return ' va '.join(v for _k, v in kontent_vaqtlar()) or 'vaqt yo‘q'
+
+
 def _kontent_sozlama():
     m = ("⚙️ KUNLIK KONTENT SOZLAMALARI\n\n"
-         f"🗓 Kunlik: {'yoqilgan' if soz('kontent_kunlik') == '1' else 'o‘chirilgan'} · ⏰ {soz('kontent_vaqt')} (Toshkent)\n"
-         f"🔁 Takrorlamaslik: {soz('kontent_kun')} kun\n"
+         f"🗓 Kunlik: {'yoqilgan' if soz('kontent_kunlik') == '1' else 'o‘chirilgan'} · ⏰ {kontent_vaqtlar_matn()} (Toshkent)\n"
+         f"🔁 Takrorlamaslik: {kontent_kun()} kun (yangi tovar qolmasa — aylanma)\n"
          f"🤖 Avto-joylash: {'ON' if soz('auto_post') == '1' else 'OFF (oldindan ko‘rsatadi)'} → {PLATFORMA_NOMI.get(soz('auto_platforma'), 'Telegram')}\n"
          f"ℹ️ «Manba: brend rasmiy sayti»: {'ko‘rsatiladi' if soz('manba_korsat') == '1' else 'yo‘q'}\n\n"
          "Avto rejimda faqat ✅ tasdiqlangan sayt sahifalari ishlatiladi.")
-    rows = [[_btn("🗓 Kunlik: almashtirish", "mkt:kun"), _btn("⏰ Vaqt", "mkt:vaqt")],
-            [_btn(f"🔁 {soz('kontent_kun')} kun → keyingi", "mkt:days"), _btn("🤖 Avto: almashtirish", "mkt:auto")],
+    rows = [[_btn("🗓 Kunlik: almashtirish", "mkt:kun"), _btn("⏰ 1-vaqt", "mkt:vaqt"), _btn("⏰ 2-vaqt", "mkt:vaqt2")],
+            [_btn(f"🔁 Takrorlamaslik: {kontent_kun()} kun", "mkt:days"), _btn("🤖 Avto: almashtirish", "mkt:auto")],
             [_btn("📡 Avto platforma", "mkt:autop"), _btn("ℹ️ Manba: almashtirish", "mkt:man")],
             [_btn("⬅️ Orqaga", "mkt:menu")]]
     return m, rows
@@ -10968,10 +11049,12 @@ def _kontent_sozlama():
 def _kontent_kalendar():
     nav = kontent_navbat(7)
     if not nav:
-        return ("📅 Navbat bo'sh: omborda bor, ochiq va rasmi/sayt sahifasi bor tovar yo'q "
-                f"(yoki hammasi oxirgi {soz('kontent_kun')} kunda joylangan).", [[_btn("⬅️ Orqaga", "mkt:menu")]])
+        tv, _r, sabab = kontent_tanla()
+        return ((f"📅 Yangi tovar navbati bo'sh (hammasi oxirgi {kontent_kun()} kunda joylangan yoki omborda yo'q).\n"
+                 f"Keyingi post baribir chiqadi: {tv['name']}\n{sabab}") if tv else sabab,
+                [[_btn("▶️ Hozir post", "mkt:now")], [_btn("⬅️ Orqaga", "mkt:menu")]])
     bosh = 0 if soz('kontent_ishladi') != today() else 1
-    out = [f"📅 KONTENT KALENDARI (har kuni {soz('kontent_vaqt')})\n"]
+    out = [f"📅 KONTENT KALENDARI (har kuni {kontent_vaqtlar_matn()})\n"]
     for i, x in enumerate(nav):
         kun = (_local_now() + timedelta(days=i + bosh)).strftime('%d.%m')
         belgi = '✅' if x['url'] and x['url_ok'] else ('❔' if x['url'] else '📷')
@@ -11037,16 +11120,17 @@ async def kontent_callback(u, ctx, q, st, p_, w):
     if w == 'ks':
         st['ekran'] = 'ks'; await q.answer(); await _pos_chiqar(q, *_kontent_sozlama()); return
     if w == 'days':
-        tartib = ['7', '14', '21', '30']; joriy = soz('kontent_kun')
-        soz_yoz('kontent_kun', tartib[(tartib.index(joriy) + 1) % 4] if joriy in tartib else '14')
-        await q.answer("✅"); await _pos_chiqar(q, *_kontent_sozlama()); return
+        st['wait'] = 'days'; await q.answer()
+        await _pos_chiqar(q, f"🔁 Necha kun ichida joylangan tovar takrorlanmasin? 1–14 son yozing (hozir: {kontent_kun()}).\n"
+                             "Yangi tovar qolmasa bot baribir eng uzoq joylanganini oladi.", [[_btn("⬅️ Orqaga", "mkt:ks")]]); return
     if w == 'autop':
         tartib = ['tg', 'ig', 'both']; joriy = soz('auto_platforma')
         soz_yoz('auto_platforma', tartib[(tartib.index(joriy) + 1) % 3] if joriy in tartib else 'tg')
         await q.answer("✅"); await _pos_chiqar(q, *_kontent_sozlama()); return
-    if w == 'vaqt':
-        st['wait'] = 'vaqt'; await q.answer()
-        await _pos_chiqar(q, "⏰ Vaqtni yozing (Toshkent), masalan 10:00", [[_btn("⬅️ Orqaga", "mkt:ks")]]); return
+    if w in ('vaqt', 'vaqt2'):
+        st['wait'] = w; await q.answer()
+        await _pos_chiqar(q, (f"⏰ {'1' if w == 'vaqt' else '2'}-vaqtni yozing (Toshkent), masalan {'10:00' if w == 'vaqt' else '18:00'}"
+                              + ("\n«-» — 2-postni o'chirish" if w == 'vaqt2' else '')), [[_btn("⬅️ Orqaga", "mkt:ks")]]); return
     if w == 'map':
         st['ekran'] = 'map'; await q.answer(); await _pos_chiqar(q, *_xarita_royxat(iarg(2))); return
     pid = iarg(2)
@@ -11090,11 +11174,19 @@ async def kontent_callback(u, ctx, q, st, p_, w):
 
 
 async def kontent_matn(u, ctx, st, w, t_):
-    if w == 'vaqt':
-        mt = re.fullmatch(r'(\d{1,2})[:.](\d{2})', t_)
+    if w == 'days':
+        if not re.fullmatch(r'\d{1,2}', t_.strip()) or not 1 <= int(t_) <= 14:
+            await u.message.reply_text("1 dan 14 gacha son yozing, masalan 2"); return True
+        st['wait'] = None; soz_yoz('kontent_kun', str(int(t_)))
+        m, r = _kontent_sozlama(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    if w == 'vaqt2' and t_.strip().lower() in ('-', "yo'q", 'yoq', 'off'):
+        st['wait'] = None; soz_yoz('kontent_vaqt2', '')
+        m, r = _kontent_sozlama(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
+    if w in ('vaqt', 'vaqt2'):
+        mt = re.fullmatch(r'(\d{1,2})[:.](\d{2})', t_.strip())
         if not mt or int(mt.group(1)) > 23 or int(mt.group(2)) > 59:
             await u.message.reply_text("Format: 10:00"); return True
-        st['wait'] = None; soz_yoz('kontent_vaqt', f"{int(mt.group(1)):02d}:{mt.group(2)}")
+        st['wait'] = None; soz_yoz('kontent_' + w, f"{int(mt.group(1)):02d}:{mt.group(2)}")
         m, r = _kontent_sozlama(); await u.message.reply_text(m, reply_markup=InlineKeyboardMarkup(r)); return True
     if w.startswith('url:'):
         pid = int(w[4:])
