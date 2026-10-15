@@ -415,6 +415,7 @@ def init_db():
     init_po_tables()             # zavod buyurtmalari (8-bosqich, idempotent)
     init_marketing_tables()      # marketing: postlar, so'rovlar, sozlamalar, sayt keshi (9-bosqich, idempotent)
     init_b10_tables()            # zaxira, qaytarish, smena, serial/kafolat, shtrix-kod (10-bosqich, idempotent)
+    init_video_tables()          # 26: tovar videolari, mijoz Telegram ulanishi, yuborish navbati (additiv, idempotent)
     log.info("DB tayyor!")
 
 
@@ -3100,6 +3101,13 @@ async def _scheduler(app):
                 _t = asyncio.create_task(kontent_kunlik(app.bot)); _FON.add(_t); _t.add_done_callback(_FON.discard)
         except Exception:
             log.exception("kunlik kontent")
+        # 27: haftalik tovar videolari (sayt) — egasiga faqat yangi video bo'lsa xulosa
+        try:
+            if app is not None and ('v' + key[:10]) not in sent and video_sayt_haftalik_kerakmi(now):
+                sent.add('v' + key[:10]); soz_yoz('video_sayt_oxirgi', _mkt_vaqt())
+                _t = asyncio.create_task(video_sayt_hammasi_yubor(app.bot, OWNER_ID, jim=True)); _FON.add(_t); _t.add_done_callback(_FON.discard)
+        except Exception:
+            log.exception("haftalik video")
         # Kunlik zaxira (10-bosqich): belgilangan vaqtdan keyin, kuniga bir marta (restart bo'lsa ham shu kuni qiladi)
         try:
             if app is not None and ('z' + key[:10]) not in sent and zaxira_vaqti_keldimi():
@@ -5041,6 +5049,8 @@ async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
 
 async def cmd_start_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Mijoz /start bosganda — ro'yxatga oladi va katalog ko'rsatadi"""
+    if ctx.args and str(ctx.args[0]).startswith('c_'):              # 26: chekdagi mijoz havolasi (obunaga yozilmaydi)
+        await mijoz_start_token(u, ctx, ctx.args[0]); return
     if ctx.args and await pub_start_link(u, ctx, ctx.args[0]):      # kanal tugmasi: /start p<ID>
         return
     us = u.effective_user
@@ -5087,6 +5097,7 @@ async def cmd_stop_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_text_public(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Mijoz yozganda: so'rov (ism/telefon) → tovar kartasi → aks holda egasiga yetkazadi"""
     us = u.effective_user
+    if await mijoz_menyu_matn(u, ctx): return          # 26: «🎬 Mening xaridlarim / videolar»
     if await pub_matn(u, ctx): return
     if not _rl_ok(us.id, 'msg', 20, 60):
         if _rl_ok(us.id, 'ogoh', 1, 60): await u.message.reply_text("Juda ko'p xabar — 1 daqiqadan keyin yozing.")
@@ -6283,12 +6294,28 @@ async def _pos_tasdiq(u, ctx, cart_id):
     ctx.user_data.pop('pos', None)
     rate = get_exchange_rate()
     chek = pos_chek_matn(res, h, pos, x, rate)
+    vid_tugma = []
+    if cust.get('id'):
+        try:
+            chek += f"\n🎬 Videolar va kafolat: {mijoz_havola(cust['id'], getattr(ctx.bot, 'username', '') or '')}"
+            sids = [str(s['sale_id']) for s in res['sales']]
+            if soz('video_avto') != '0' and any(tovar_videolari(ln['pid']) or _vid_sayt_mumkin(ln['pid'], avto=True) for ln in qatorlar):
+                vm = _vid_mijoz(cust['id'])
+                chek += ("\n🎬 Videolar mijozga yuborilmoqda" if vm and vm['tg'] and vm['holat'] != 'bloklangan'
+                         else "\n⏳ Videolar mijoz havolani ochishini kutmoqda")
+                _t = asyncio.create_task(video_sotuvdan_keyin(ctx.bot, cust['id'], [ln['pid'] for ln in qatorlar], int(sids[0])))
+                _FON.add(_t); _t.add_done_callback(_FON.discard)
+                vid_tugma = [[_btn("📲 Mijozga havola / QR", f"vid:q:{cust['id']}"), _btn("🎬 Video holati", "vid:s:" + ":".join(sids[:8]))]]
+            else:
+                vid_tugma = [[_btn("📲 Mijozga havola / QR", f"vid:q:{cust['id']}")]]
+        except Exception:
+            log.exception("video: sotuvdan keyin")
     arxiv = ctx.user_data.setdefault('pos_chek', {})
     arxiv[cart_id] = {'mijoz': cust.get('name', ''),
                       'qatorlar': [(ln['name'], ln['qty'], round(ln['unit'], 2)) for ln in h['lines']]}
     for k in list(arxiv)[:-5]: arxiv.pop(k, None)
-    await _pos_chiqar(q, chek, [[_btn("🧾 Hisob-faktura", f"pos:inv:{cart_id}")],
-                                [_btn("🛒 Yangi sotuv", "pos:start")]])
+    await _pos_chiqar(q, chek, [[_btn("🧾 Hisob-faktura", f"pos:inv:{cart_id}")]] + vid_tugma +
+                               [[_btn("🛒 Yangi sotuv", "pos:start")]])
 
 async def _pos_faktura(u, ctx, cart_id):
     q = u.callback_query
@@ -7560,6 +7587,10 @@ def _mij_karta(u, cid):
         if m['qarz'] > 0: rows.append([_btn("💵 Qarz to'lovi", f"mij:pay:{cid}"), _btn("📝 Eslatma matni", f"mij:rem:{cid}")])
         rows.append([_btn("📜 Xaridlar", f"mij:h:{cid}:0"), _btn("📋 Akt sverka", f"mij:akt:{cid}")])
         rows.append([_btn("✏️ Tahrirlash", f"mij:e:{cid}"), _btn("📞 Telefon", f"mij:tel:{cid}")])
+        try:
+            out.append(_vid_mijoz_qator(cid))
+            rows.append([_btn("📲 Ulanish havolasi / QR", f"vid:q:{cid}"), _btn("🔁 Videolarni qayta yuborish", f"vid:r:{cid}")])
+        except sqlite3.OperationalError: pass
     else:
         rows.append([_btn("📞 Telefon", f"mij:tel:{cid}")])
     if can(u, 'pos'): rows.append([_btn("🛒 Shu mijozga sotish", f"mij:sell:{cid}")])
@@ -8939,7 +8970,9 @@ SOZ_DEFAULT = {
     'kontent_kun': '2',        # shu kun ichida joylangan tovar takrorlanmaydi (1–14; yangi tovar bo'lmasa — aylanma)
     'kontent_vaqt2': '18:00',  # 2-kunlik post vaqti (Toshkent); '' — o'chiq
     'manba_korsat': '1',       # "Manba: <brend> rasmiy sayti"
-    'buyurtma_kontakt': 'Uzb_economist_1',   # kanal postidagi «🛒 Buyurtma berish» → https://t.me/<shu username>
+    'buyurtma_kontakt': 'Uzb_economist_1',
+    'video_avto': '1',
+    'video_sayt_haftalik': '1',   # 27: har hafta ✅ tasdiqlangan sahifalardan tovar videolarini yangilash         # 26: xariddan keyin mijozga tovar videolari (ulangan bo'lsa darhol, aks holda navbat)   # kanal postidagi «🛒 Buyurtma berish» → https://t.me/<shu username>
 }
 PLATFORMA_NOMI = {'tg': 'Telegram', 'ig': 'Instagram', 'both': 'Telegram + Instagram'}
 
@@ -9892,6 +9925,8 @@ def _pub_sozlama(izoh=''):
     rows = [[_btn("📦 Qoldiq sonini almashtirish", "mkt:oq")], [_btn("📩 Sotuvchilarga: almashtirish", "mkt:ls")],
             [_btn("📞 Telefonni kiritish", "mkt:tel")], [_btn("🛒 Buyurtma kontakti", "mkt:kon")],
             [_btn("🔄 Eski postlar tugmasini yangilash", "mkt:kbup")], [_btn("👁 Tovarlar ko'rinishi / narxi", "mkt:pv:0")],
+            [_btn(f"🎬 Xariddan keyin videolar: {'ON' if soz('video_avto') != '0' else 'OFF'}", "vid:avto")],
+            [_btn(f"🌐 Haftalik video yangilash (sayt): {'ON' if soz('video_sayt_haftalik') != '0' else 'OFF'}", "vid:wavto")],
             [_btn("⬅️ Orqaga", "mkt:menu")]]
     return m, rows
 
@@ -10339,7 +10374,8 @@ async def _pub_tel(u, ctx, st, tel):
 
 async def pub_contact(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = ctx.user_data.get('pub')
-    if not st or st.get('wait') != 'phone': return
+    if not st or st.get('wait') != 'phone':
+        await mijoz_kontakt(u, ctx); return           # 26: o'z raqami orqali mijozga ulanish
     c_ = u.message.contact
     if c_ and getattr(c_, 'user_id', None) not in (None, u.effective_user.id):
         await u.message.reply_text("Iltimos, o'zingizning raqamingizni yuboring."); return
@@ -13137,6 +13173,783 @@ def sn_kirim_btn(items):
     return rows
 
 
+# ── 🎬 26: XARIDDAN KEYIN TOVAR VIDEOLARI ──────────────────────────
+MIJOZ_TUGMA = "🎬 Mening xaridlarim / videolar"
+MIJOZ_TEL_TUGMA = "📱 Raqamim orqali ulanish"
+VIDEO_PAUZA = 1.0          # bitta chatga xabarlar orasida (Telegram: ~1 xabar/soniya)
+_VID_QULF = {}
+
+
+def init_video_tables():
+    conn = db(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS product_videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, kind TEXT DEFAULT 'video',
+        file_id TEXT DEFAULT '', url TEXT DEFAULT '', title TEXT DEFAULT '', ord INTEGER DEFAULT 0,
+        created TEXT DEFAULT '', added_by TEXT DEFAULT '')""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pv_pid ON product_videos(product_id, ord)")
+    c.execute("""CREATE TABLE IF NOT EXISTS video_yuborish (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER DEFAULT 0, customer_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL, status TEXT DEFAULT 'kutmoqda', created TEXT DEFAULT '', sent_at TEXT DEFAULT '',
+        error TEXT DEFAULT '')""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_vy_c ON video_yuborish(customer_id, status)")
+    c.execute("""CREATE TABLE IF NOT EXISTS video_yuborilgan (
+        customer_id INTEGER NOT NULL, product_id INTEGER NOT NULL, sent_at TEXT DEFAULT '',
+        PRIMARY KEY (customer_id, product_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS video_tombstone (product_id INTEGER NOT NULL, src_url TEXT NOT NULL,
+        created TEXT DEFAULT '', PRIMARY KEY (product_id, src_url))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS video_sayt_kuzatuv (product_id INTEGER NOT NULL, domen TEXT NOT NULL,
+        src_url TEXT NOT NULL, PRIMARY KEY (product_id, src_url))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS video_sayt_holat (product_id INTEGER PRIMARY KEY, fetched TEXT DEFAULT '',
+        status TEXT DEFAULT '', topildi INTEGER DEFAULT 0, xato TEXT DEFAULT '')""")
+    for ddl in ("ALTER TABLE product_videos ADD COLUMN source TEXT DEFAULT 'egasi'",
+                "ALTER TABLE product_videos ADD COLUMN src_url TEXT DEFAULT ''"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass
+    for ddl in ("ALTER TABLE customers ADD COLUMN telegram_id INTEGER DEFAULT 0",
+                "ALTER TABLE customers ADD COLUMN tg_holat TEXT DEFAULT ''",
+                "ALTER TABLE customers ADD COLUMN tg_ulangan TEXT DEFAULT ''"):
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass
+    c.execute("CREATE TABLE IF NOT EXISTS sozlamalar (kalit TEXT PRIMARY KEY, qiymat TEXT)")
+    if not c.execute("SELECT 1 FROM sozlamalar WHERE kalit='mijoz_token_sir'").fetchone():
+        c.execute("INSERT INTO sozlamalar (kalit, qiymat) VALUES ('mijoz_token_sir', ?)", (secrets.token_hex(32),))
+    conn.commit(); conn.close()
+
+
+def _vid_sir():
+    s = soz('mijoz_token_sir')
+    if not s:
+        init_video_tables(); s = soz('mijoz_token_sir')
+    return s.encode()
+
+
+def mijoz_token(cid):
+    """Imzolangan, taxmin qilib bo'lmaydigan, bitta mijozga tegishli token: c_<id>_<HMAC-SHA256 dan 20 belgi>."""
+    import hmac
+    imzo = hmac.new(_vid_sir(), f"mijoz:{int(cid)}".encode(), hashlib.sha256).hexdigest()[:20]
+    return f"c_{int(cid)}_{imzo}"
+
+
+def mijoz_token_tekshir(token):
+    import hmac
+    mt = re.fullmatch(r'c_(\d{1,9})_([0-9a-f]{20})', token or '')
+    if not mt: return None
+    cid = int(mt.group(1))
+    return cid if hmac.compare_digest(mijoz_token(cid), token) else None
+
+
+def mijoz_havola(cid, bot_username):
+    return f"https://t.me/{bot_username or 'bot'}?start={mijoz_token(cid)}"
+
+
+def _vid_mijoz(cid):
+    conn = db()
+    r = conn.execute("SELECT id,name,COALESCE(phone,''),COALESCE(telegram_id,0),COALESCE(tg_holat,'') FROM customers WHERE id=?",
+                     (int(cid),)).fetchone()
+    conn.close()
+    return {'id': r[0], 'name': r[1], 'phone': r[2], 'tg': r[3], 'holat': r[4]} if r else None
+
+
+def mijoz_tg_boyicha(tg_id):
+    conn = db()
+    r = conn.execute("SELECT id FROM customers WHERE COALESCE(telegram_id,0)=? ORDER BY id LIMIT 1", (int(tg_id),)).fetchone()
+    conn.close()
+    return _vid_mijoz(r[0]) if r else None
+
+
+def mijoz_ula(cid, tg_id):
+    """Qaytaradi: 'ulandi' | 'avval' (shu odam) | 'band' (boshqa Telegram) | None (mijoz yo'q)."""
+    m = _vid_mijoz(cid)
+    if not m: return None
+    if m['tg'] and m['tg'] != int(tg_id): return 'band'
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE customers SET telegram_id=0 WHERE COALESCE(telegram_id,0)=? AND id<>?", (int(tg_id), int(cid)))
+    c.execute("UPDATE customers SET telegram_id=?, tg_holat='ok', tg_ulangan=? WHERE id=?", (int(tg_id), now_t(), int(cid)))
+    conn.commit(); conn.close()
+    return 'avval' if m['tg'] == int(tg_id) and m['holat'] == 'ok' else 'ulandi'
+
+
+def tovar_videolari(pid):
+    conn = db()
+    rr = conn.execute("SELECT id,kind,file_id,url,title,ord,COALESCE(source,'egasi') FROM product_videos WHERE product_id=? "
+                      "ORDER BY ord,id", (int(pid),)).fetchall()
+    conn.close()
+    return [{'id': a, 'kind': k, 'file_id': f, 'url': u_, 'title': t, 'ord': o, 'source': s_} for a, k, f, u_, t, o, s_ in rr]
+
+
+def video_qosh(pid, kind, file_id='', url='', title='', kim=''):
+    conn = db(); c = conn.cursor()
+    o = c.execute("SELECT COALESCE(MAX(ord),0)+1 FROM product_videos WHERE product_id=?", (int(pid),)).fetchone()[0]
+    c.execute("INSERT INTO product_videos (product_id,kind,file_id,url,title,ord,created,added_by) VALUES (?,?,?,?,?,?,?,?)",
+              (int(pid), kind, file_id, url, (title or '')[:100], o, now_t(), kim))
+    vid = c.lastrowid; conn.commit(); conn.close()
+    return vid
+
+
+def video_surish(vid, yon):
+    """yon: -1 yuqoriga, +1 pastga."""
+    conn = db(); c = conn.cursor()
+    r = c.execute("SELECT product_id FROM product_videos WHERE id=?", (int(vid),)).fetchone()
+    if not r: conn.close(); return
+    ids = [x[0] for x in c.execute("SELECT id FROM product_videos WHERE product_id=? ORDER BY ord,id", (r[0],))]
+    i = ids.index(int(vid)); j = i + yon
+    if 0 <= j < len(ids):
+        ids[i], ids[j] = ids[j], ids[i]
+        for n, x in enumerate(ids, 1): c.execute("UPDATE product_videos SET ord=? WHERE id=?", (n, x))
+    conn.commit(); conn.close()
+
+
+def _vid_tovar_nomi(pid):
+    conn = db(); r = conn.execute("SELECT name FROM products WHERE id=?", (int(pid),)).fetchone(); conn.close()
+    return r[0] if r else f"#{pid}"
+
+
+def _vid_ekran(pid, izoh=''):
+    vv = tovar_videolari(pid)
+    out = [f"🎬 VIDEOLAR — {_vid_tovar_nomi(pid)}",
+           "Xariddan keyin mijozga avtomatik yuboriladi (o'rnatish, ishlatish va h.k.).", ""]
+    rows = []
+    for n, v in enumerate(vv, 1):
+        belgi = '🔗' if v['kind'] == 'link' else '🎞'
+        out.append(f"{n}. {belgi} {v['title'] or ('havola' if v['kind'] == 'link' else 'video')}" + (" 🌐" if v.get('source') == 'sayt' else '')
+                   + (f" — {v['url'][:60]}" if v['kind'] in ('link', 'mp4') else ''))
+        rows.append([_btn(f"{n}. ⬆️", f"vid:up:{v['id']}"), _btn("⬇️", f"vid:dn:{v['id']}"), _btn("🗑", f"vid:del:{v['id']}")])
+    if not vv: out.append("Hali video yo'q.")
+    if izoh: out += ["", izoh]
+    rows.append([_btn("➕ Video yoki havola qo'shish", f"vid:a:{pid}")])
+    p_ = _mkt_p(pid)
+    if p_ and p_['supplier_url']:
+        rows.append([_btn("🌐 Saytdan olish", f"vid:w:{pid}")])
+        out.append(f"\n🌐 Sayt sahifasi: {p_['supplier_url'][:80]}" + ("" if p_['url_ok'] else " ❔ (tasdiqlanmagan — 🔗 Tovar ↔ sayt)"))
+    else:
+        out.append("\n🌐 Sayt sahifasi moslanmagan — 📢 Marketing → 🔗 Tovar ↔ sayt")
+    rows.append([_btn("🌐 Hamma tovarlar videolarini saytdan yangilash", "vid:wall")])
+    out.append("🌐 — saytdan olingan (o'chirsangiz qayta qo'shilmaydi)")
+    rows.append([_btn("⬅️ Tovar kartasi", f"omb:p:{pid}")])
+    return "\n".join(out), rows
+
+
+def video_sotuv_qayd(cid, pids, sale_id=0):
+    """Sotuvdan keyin: videosi bor har tovar uchun navbat yozuvi. Avval yuborilgan bo'lsa — 'avval'. Qaytaradi: yangi soni."""
+    if not cid: return 0
+    conn = db(); c = conn.cursor(); n = 0
+    for pid in dict.fromkeys(int(p) for p in pids if p):
+        if not c.execute("SELECT 1 FROM product_videos WHERE product_id=?", (pid,)).fetchone(): continue
+        avval = c.execute("SELECT 1 FROM video_yuborilgan WHERE customer_id=? AND product_id=?", (int(cid), pid)).fetchone()
+        c.execute("INSERT INTO video_yuborish (sale_id,customer_id,product_id,status,created) VALUES (?,?,?,?,?)",
+                  (int(sale_id or 0), int(cid), pid, 'avval' if avval else 'kutmoqda', now_t()))
+        n += 0 if avval else 1
+    conn.commit(); conn.close()
+    return n
+
+
+def _vy_holat(cid, pid, status, error=''):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE video_yuborish SET status=?, sent_at=?, error=? WHERE customer_id=? AND product_id=? AND status='kutmoqda'",
+              (status, now_t(), error[:200], int(cid), int(pid)))
+    if status == 'yuborildi':
+        c.execute("INSERT OR REPLACE INTO video_yuborilgan (customer_id, product_id, sent_at) VALUES (?,?,?)", (int(cid), int(pid), now_t()))
+    conn.commit(); conn.close()
+
+
+async def _vid_bitta(bot, chat_id, fn, **kw):
+    """Bitta xabar: RetryAfter bo'lsa kutib 1 marta qayta urinadi. Forbidden — tashqariga."""
+    from telegram.error import RetryAfter
+    try:
+        return await fn(chat_id=chat_id, **kw)
+    except RetryAfter as e:
+        ra = e.retry_after
+        await asyncio.sleep(min(60, ra.total_seconds() if hasattr(ra, 'total_seconds') else float(ra)))
+        return await fn(chat_id=chat_id, **kw)
+
+
+async def _vid_yubor_bitta(bot, chat_id, v):
+    """Bitta video. Sayt mp4: file_id bo'lsa — o'sha; aks holda ≤50 MB yuklab olib yuboriladi va file_id saqlanadi;
+    katta yoki yuklab bo'lmasa — havola. Forbidden — tashqariga."""
+    from telegram.error import Forbidden
+    if v['kind'] == 'link':
+        return await _vid_bitta(bot, chat_id, bot.send_message, text=f"🎬 {v['title'] or 'Video'}\n{v['url']}")
+    if v['kind'] == 'doc':
+        return await _vid_bitta(bot, chat_id, bot.send_document, document=v['file_id'], caption=v['title'] or None)
+    if v['kind'] == 'mp4' and not v['file_id']:
+        try:
+            path = await asyncio.to_thread(web_yukla, v['url'], TG_UPLOAD_MAX)
+        except Exception as e:
+            log.info("sayt videosi yuklanmadi (%s): %s — havola yuboriladi", v['url'][:80], e)
+            return await _vid_bitta(bot, chat_id, bot.send_message, text=f"🎬 {v['title'] or 'Video'}\n{v['url']}")
+        try:
+            with open(path, 'rb') as fh:
+                msg = await _vid_bitta(bot, chat_id, bot.send_video, video=fh, caption=v['title'] or None, supports_streaming=True)
+        except Forbidden:
+            raise
+        finally:
+            try: os.remove(path)
+            except OSError: pass
+        fid = getattr(getattr(msg, 'video', None), 'file_id', None)
+        if fid:
+            v['file_id'] = fid
+            conn = db(); conn.execute("UPDATE product_videos SET file_id=? WHERE id=?", (fid, v['id'])); conn.commit(); conn.close()
+        return msg
+    return await _vid_bitta(bot, chat_id, bot.send_video, video=v['file_id'], caption=v['title'] or None, supports_streaming=True)
+
+
+async def video_navbat_yubor(bot, cid):
+    """Mijozning 'kutmoqda' navbatini yuboradi (ulangan va bloklamagan bo'lsa). Qaytaradi {'yuborildi','xato','bloklangan'}."""
+    from telegram.error import Forbidden
+    natija = {'yuborildi': 0, 'xato': 0, 'bloklangan': False}
+    q = _VID_QULF.setdefault(int(cid), asyncio.Lock())
+    async with q:
+        m = _vid_mijoz(cid)
+        if not m or not m['tg'] or m['holat'] == 'bloklangan': return natija
+        conn = db()
+        pids = [r[0] for r in conn.execute("SELECT DISTINCT product_id FROM video_yuborish WHERE customer_id=? AND status='kutmoqda' "
+                                           "ORDER BY id", (int(cid),))]
+        conn.close()
+        for pid in pids:
+            conn = db()
+            avval = conn.execute("SELECT 1 FROM video_yuborilgan WHERE customer_id=? AND product_id=?", (int(cid), pid)).fetchone()
+            conn.close()
+            if avval:
+                _vy_holat(cid, pid, 'avval'); continue
+            vv = tovar_videolari(pid)
+            if not vv:
+                _vy_holat(cid, pid, 'video_yoq'); continue
+            try:
+                await _vid_bitta(bot, m['tg'], bot.send_message,
+                                 text=f"🙏 Xaridingiz uchun rahmat!\n🎬 «{_vid_tovar_nomi(pid)}» bo'yicha videolar (o'rnatish va ishlatish):")
+                for v in vv:
+                    await asyncio.sleep(VIDEO_PAUZA)
+                    await _vid_yubor_bitta(bot, m['tg'], v)
+                _vy_holat(cid, pid, 'yuborildi'); natija['yuborildi'] += 1
+            except Forbidden:
+                conn = db(); c = conn.cursor()
+                c.execute("UPDATE customers SET tg_holat='bloklangan' WHERE id=?", (int(cid),))
+                c.execute("UPDATE video_yuborish SET status='bloklangan', sent_at=? WHERE customer_id=? AND status='kutmoqda'",
+                          (now_t(), int(cid)))
+                conn.commit(); conn.close()
+                natija['bloklangan'] = True
+                log.info("Mijoz %s botni bloklagan — videolar to'xtatildi", cid)
+                break
+            except Exception as e:
+                log.warning("video yuborilmadi (mijoz %s, tovar %s): %s", cid, pid, e)
+                _vy_holat(cid, pid, 'xato', str(e)); natija['xato'] += 1
+            await asyncio.sleep(VIDEO_PAUZA)
+    return natija
+
+
+async def video_sotuvdan_keyin(bot, cid, pids, sale_id=0):
+    """Sotuv tasdiqlangandan keyin (fon vazifasi). Avto o'chiq bo'lsa — hech narsa."""
+    if soz('video_avto') == '0' or not cid: return None
+    for pid in dict.fromkeys(pids):
+        try:
+            if not tovar_videolari(pid) and _vid_sayt_mumkin(pid, avto=True):
+                await asyncio.to_thread(sayt_videolarini_yangila, pid)
+        except Exception:
+            log.exception("sotuvdan oldin sayt videolari")
+    try:
+        video_sotuv_qayd(cid, pids, sale_id)
+        return await video_navbat_yubor(bot, cid)
+    except Exception:
+        log.exception("video_sotuvdan_keyin"); return None
+
+
+def video_qayta_tayyorla(cid):
+    """Egasi «qayta yuborish»: shu mijoz olgan, videosi bor barcha tovarlar navbatga qayta qo'yiladi."""
+    conn = db(); c = conn.cursor()
+    nomlar = [r[0] for r in c.execute("SELECT DISTINCT product FROM sales WHERE customer_id=? AND reversed=0 "
+                                      "AND COALESCE(return_of,0)=0", (int(cid),))]
+    pids = [r[0] for n_ in nomlar for r in c.execute("SELECT id FROM products WHERE name=?", (n_,))]
+    c.execute("DELETE FROM video_yuborilgan WHERE customer_id=?", (int(cid),))
+    c.execute("UPDATE customers SET tg_holat=CASE WHEN COALESCE(telegram_id,0)>0 THEN 'ok' ELSE '' END WHERE id=?", (int(cid),))
+    conn.commit(); conn.close()
+    return video_sotuv_qayd(cid, pids, 0)
+
+
+VY_NOMI = {'yuborildi': '✅ yuborildi', 'kutmoqda': '⏳ mijoz ulanishini kutmoqda', 'xato': '⚠️ xato', 'bloklangan': '🚫 bot bloklangan',
+           'avval': '↩️ avval yuborilgan', 'video_yoq': '— video yo‘q'}
+
+
+def video_sotuv_holati(sale_ids):
+    if not sale_ids: return []
+    conn = db()
+    rr = conn.execute(f"SELECT product_id,status,error FROM video_yuborish WHERE sale_id IN ({','.join('?' * len(sale_ids))}) ORDER BY id",
+                      [int(s) for s in sale_ids]).fetchall()
+    conn.close()
+    return [(_vid_tovar_nomi(p), VY_NOMI.get(s, s), e) for p, s, e in rr]
+
+
+def _vid_mijoz_qator(cid):
+    m = _vid_mijoz(cid)
+    if not m: return ''
+    if m['holat'] == 'bloklangan': return "📲 Telegram: 🚫 bot bloklangan"
+    return "📲 Telegram: ✅ ulangan" if m['tg'] else "📲 Telegram: ulanmagan (videolar navbatda kutadi)"
+
+
+def mijoz_xaridlari_ekran(cid):
+    m = _vid_mijoz(cid)
+    conn = db()
+    rr = conn.execute("SELECT id,date,product,qty FROM sales WHERE customer_id=? AND reversed=0 AND COALESCE(return_of,0)=0 "
+                      "ORDER BY id DESC LIMIT 15", (int(cid),)).fetchall()
+    out = [f"🧾 {m['name'] if m else ''} — XARIDLARINGIZ", ""]
+    rows = []; korildi = set()
+    for sid, d, pr, qty in rr:
+        p = conn.execute("SELECT id, COALESCE(warranty_days,0) FROM products WHERE name=?", (pr,)).fetchone()
+        end = conn.execute("SELECT MAX(warranty_end) FROM serials WHERE sale_id=? AND COALESCE(warranty_end,'')<>''", (sid,)).fetchone()
+        end = end[0] if end and end[0] else None
+        if not end:
+            w = conn.execute("SELECT MAX(end_date) FROM warranties WHERE sale_id=?", (sid,)).fetchone()
+            end = w[0] if w and w[0] else None
+        if not end and p and p[1] and d:
+            try: end = (datetime.strptime(d[:10], '%Y-%m-%d') + timedelta(days=int(p[1]))).strftime('%Y-%m-%d')
+            except ValueError: end = None
+        qoldi = kafolat_qoldi(end)
+        kaf = (f"🛡 kafolat: {qoldi} kun qoldi" if qoldi is not None and qoldi >= 0 else ("🛡 kafolat tugagan" if qoldi is not None else "🛡 kafolat: —"))
+        nv = len(tovar_videolari(p[0])) if p else 0
+        out.append(f"• {d} — {pr} × {qty}\n   {kaf}" + (f" · 🎬 {nv} ta video" if nv else ""))
+        if p and nv and p[0] not in korildi:
+            korildi.add(p[0]); rows.append([_btn(f"🎬 {pr[:40]}", f"mv:{p[0]}")])
+    conn.close()
+    if not rr: out.append("Hozircha xarid topilmadi.")
+    return "\n".join(out), rows
+
+
+def _mijoz_kb():
+    return ReplyKeyboardMarkup([[KeyboardButton(MIJOZ_TUGMA)], [KeyboardButton(MIJOZ_TEL_TUGMA, request_contact=True)]],
+                               resize_keyboard=True)
+
+
+async def mijoz_start_token(u, ctx, token):
+    """/start c_<id>_<imzo> — mijozni ulaydi. Xodimlar menyusiga hech qachon tushirmaydi."""
+    us = u.effective_user
+    if not _rl_ok(us.id, 'cstart', 5, 300):
+        await u.message.reply_text("Juda ko'p urinish — birozdan keyin qayta bosing."); return
+    cid = mijoz_token_tekshir(token)
+    if not cid:
+        await u.message.reply_text("Havola noto'g'ri yoki eskirgan. Do'kondan yangi havola so'rang.", reply_markup=_mijoz_kb()); return
+    h = mijoz_ula(cid, us.id)
+    if h == 'band':
+        await u.message.reply_text("Bu havola boshqa Telegram hisobiga ulangan. Iltimos, do'kon bilan bog'laning."); return
+    if not h:
+        await u.message.reply_text("Mijoz topilmadi. Do'kon bilan bog'laning."); return
+    m = _vid_mijoz(cid)
+    await u.message.reply_text(f"✅ Xush kelibsiz, {m['name']}! Telegram hisobingiz ulandi.\n"
+                               f"Xaridlaringiz videolari shu yerga keladi. «{MIJOZ_TUGMA}» — xaridlar va kafolat.",
+                               reply_markup=_mijoz_kb())
+    if h == 'ulandi':
+        try: await ctx.bot.send_message(OWNER_ID, f"📲 Mijoz Telegramga ulandi: {m['name']}")
+        except Exception: pass
+    await video_navbat_yubor(ctx.bot, cid)
+
+
+async def mijoz_kontakt(u, ctx):
+    """Ro'yxatda yo'q foydalanuvchi o'z raqamini yubordi → telefon bir xil bo'lgan BITTA mijozga ulanadi."""
+    us = u.effective_user; c_ = u.message.contact
+    if not c_ or getattr(c_, 'user_id', None) != us.id:
+        await u.message.reply_text("Iltimos, pastdagi tugma bilan o'zingizning raqamingizni yuboring."); return
+    if not _rl_ok(us.id, 'ckont', 5, 300): return
+    oxir = re.sub(r'\D', '', c_.phone_number or '')[-9:]
+    conn = db(); rr = conn.execute("SELECT id, COALESCE(phone,'') FROM customers").fetchall(); conn.close()
+    mos = [i for i, ph in rr if len(oxir) == 9 and re.sub(r'\D', '', ph)[-9:] == oxir]
+    if len(mos) != 1:
+        await u.message.reply_text("Bu raqam bo'yicha xarid topilmadi. Chekdagi havolani oching yoki do'kon bilan bog'laning.",
+                                   reply_markup=_mijoz_kb()); return
+    h = mijoz_ula(mos[0], us.id)
+    if h == 'band':
+        await u.message.reply_text("Bu mijoz boshqa Telegram hisobiga ulangan. Do'kon bilan bog'laning."); return
+    m = _vid_mijoz(mos[0])
+    await u.message.reply_text(f"✅ Ulandi: {m['name']}. «{MIJOZ_TUGMA}» — xaridlar, videolar va kafolat.", reply_markup=_mijoz_kb())
+    await video_navbat_yubor(ctx.bot, mos[0])
+
+
+async def mijoz_menyu_matn(u, ctx):
+    """Ro'yxatda yo'q foydalanuvchi: mijoz tugmasi. True — ishlandi."""
+    if (u.message.text or '').strip() != MIJOZ_TUGMA: return False
+    m = mijoz_tg_boyicha(u.effective_user.id)
+    if not m:
+        await u.message.reply_text("Telegram hisobingiz hali xaridga ulanmagan.\n• Chekdagi havolani (yoki QR kodni) oching, yoki\n"
+                                   f"• «{MIJOZ_TEL_TUGMA}» tugmasini bosing (xarid paytidagi raqam bo'lsa).", reply_markup=_mijoz_kb())
+        return True
+    t_, rows = mijoz_xaridlari_ekran(m['id'])
+    await u.message.reply_text(t_, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    return True
+
+
+async def mijoz_video_cb(u, ctx):
+    """mv:<pid> — ulangan mijoz o'zi OLGAN tovarning videolarini qayta ko'radi."""
+    q = u.callback_query
+    m = mijoz_tg_boyicha(u.effective_user.id)
+    try: pid = int((q.data or '').split(':')[1])
+    except (IndexError, ValueError): pid = 0
+    nom = _vid_tovar_nomi(pid) if pid else ''
+    conn = db()
+    oldi = m and conn.execute("SELECT 1 FROM sales WHERE customer_id=? AND product=? AND reversed=0", (m['id'], nom)).fetchone()
+    conn.close()
+    if not oldi:
+        await q.answer("Topilmadi", show_alert=True); return
+    if not _rl_ok(u.effective_user.id, 'mv', 6, 600):
+        await q.answer("Birozdan keyin qayta bosing", show_alert=True); return
+    await q.answer("🎬 Yuborilmoqda…")
+    from telegram.error import Forbidden
+    try:
+        for v in tovar_videolari(pid):
+            await _vid_yubor_bitta(ctx.bot, u.effective_user.id, v)
+            await asyncio.sleep(VIDEO_PAUZA)
+    except Forbidden:
+        pass
+
+
+async def vid_media(u, ctx):
+    """Videolar ekranida ➕ bosilgan bo'lsa: video/fayl → saqlash. True — ishlandi."""
+    st = ctx.user_data.get('vid')
+    if not st or st.get('wait') != 'add' or not can(u, 'boshqaruv'): return False
+    msg = u.message
+    v = getattr(msg, 'video', None); d = getattr(msg, 'document', None)
+    if v: kind, fid = 'video', v.file_id
+    elif d and str(getattr(d, 'mime_type', '') or '').startswith('video/'): kind, fid = 'doc', d.file_id
+    else: return False
+    sarl = (getattr(msg, 'caption', None) or '').strip()[:100]
+    vid = video_qosh(st['pid'], kind, file_id=fid, title=sarl, kim=(xodim(u) or {}).get('name', ''))
+    if sarl:
+        st['wait'] = None
+        m_, r_ = _vid_ekran(st['pid'], "✅ Video qo'shildi")
+    else:
+        st['wait'] = f'title:{vid}'
+        m_, r_ = _vid_ekran(st['pid'], "✅ Video qo'shildi. Sarlavha yozing (masalan «O'rnatish») yoki «-».")
+    await msg.reply_text(m_, reply_markup=InlineKeyboardMarkup(r_)); return True
+
+
+async def vid_matn(u, ctx):
+    """Videolar ekrani: havola yoki sarlavha. True — ishlandi."""
+    st = ctx.user_data.get('vid')
+    if not st or not st.get('wait') or not can(u, 'boshqaruv'): return False
+    t_ = (u.message.text or '').strip()
+    if st['wait'].startswith('title:'):
+        vid = int(st['wait'][6:]); st['wait'] = None
+        if t_ != '-':
+            conn = db(); conn.execute("UPDATE product_videos SET title=? WHERE id=?", (t_[:100], vid)); conn.commit(); conn.close()
+        m_, r_ = _vid_ekran(st['pid'], "✅ Saqlandi"); await u.message.reply_text(m_, reply_markup=InlineKeyboardMarkup(r_)); return True
+    if st['wait'] == 'add':
+        mt = re.match(r'(https?://\S{4,400})\s*(.*)$', t_)
+        if not mt:
+            await u.message.reply_text("Video faylini yuboring yoki havola yozing (https://… , ixtiyoriy: havoladan keyin sarlavha)."); return True
+        vid = video_qosh(st['pid'], 'link', url=mt.group(1), title=mt.group(2).strip(), kim=(xodim(u) or {}).get('name', ''))
+        st['wait'] = None if mt.group(2).strip() else f'title:{vid}'
+        m_, r_ = _vid_ekran(st['pid'], "✅ Havola qo'shildi" + ("" if mt.group(2).strip() else ". Sarlavha yozing yoki «-»."))
+        await u.message.reply_text(m_, reply_markup=InlineKeyboardMarkup(r_)); return True
+    return False
+
+
+async def vid_callback(u, ctx):
+    q = u.callback_query
+    p_ = (q.data or '').split(':'); w = p_[1] if len(p_) > 1 else ''
+    def iarg(i):
+        try: return int(p_[i])
+        except (IndexError, ValueError): return 0
+    if w in ('q', 's'):
+        if not can(u, 'pos'): await q.answer("Ruxsat yo'q", show_alert=True); return
+    elif w in ('avto', 'wavto'):
+        if not can(u, 'system'): await q.answer("Faqat egasi", show_alert=True); return
+    elif not can(u, 'boshqaruv'):
+        await q.answer("Ruxsat yo'q", show_alert=True); return
+    if w == 'l':
+        await q.answer(); await _pos_chiqar(q, *_vid_ekran(iarg(2))); return
+    if w == 'a':
+        ctx.user_data['vid'] = {'pid': iarg(2), 'wait': 'add', 'ts': time.time()}; await q.answer()
+        await _pos_chiqar(q, "🎬 Video faylini yuboring (izohga sarlavha yozish mumkin) yoki havola yozing:\n"
+                             "https://youtu.be/… O'rnatish", [[_btn("⬅️ Orqaga", f"vid:l:{iarg(2)}")]]); return
+    if w in ('up', 'dn', 'del'):
+        conn = db(); r = conn.execute("SELECT product_id FROM product_videos WHERE id=?", (iarg(2),)).fetchone(); conn.close()
+        if not r: await q.answer("Topilmadi", show_alert=True); return
+        if w == 'del':
+            conn = db()
+            s_ = conn.execute("SELECT product_id, COALESCE(source,''), COALESCE(src_url,'') FROM product_videos WHERE id=?", (iarg(2),)).fetchone()
+            if s_ and s_[1] == 'sayt' and s_[2]:
+                conn.execute("INSERT OR IGNORE INTO video_tombstone (product_id, src_url, created) VALUES (?,?,?)", (s_[0], s_[2], now_t()))
+            conn.execute("DELETE FROM product_videos WHERE id=?", (iarg(2),)); conn.commit(); conn.close()
+        else:
+            video_surish(iarg(2), -1 if w == 'up' else 1)
+        await q.answer("✅"); await _pos_chiqar(q, *_vid_ekran(r[0])); return
+    if w == 'q':
+        cid = iarg(2); m = _vid_mijoz(cid)
+        if not m: await q.answer("Mijoz topilmadi", show_alert=True); return
+        await q.answer()
+        link = mijoz_havola(cid, getattr(ctx.bot, 'username', '') or '')
+        matn = (f"📲 {m['name']} uchun havola (videolar va kafolat):\n{link}\n\n"
+                "Mijoz telefonida QR kodni skanerlaydi yoki havolani ochib «Start» bosadi. Havolani mijozga yuborishingiz ham mumkin.")
+        img = None
+        try: img = kod_rasm(link, 'qr', modul=6)
+        except Exception: img = None
+        if img is not None:
+            bio = io.BytesIO(); img.save(bio, format='PNG'); bio.seek(0); bio.name = 'qr.png'
+            await ctx.bot.send_photo(chat_id=u.effective_chat.id, photo=bio, caption=matn[:1000])
+        else:
+            await q.message.reply_text(matn)
+        return
+    if w == 's':
+        ids = [int(x) for x in p_[2:] if x.isdigit()]
+        hh = video_sotuv_holati(ids)
+        await q.answer()
+        await q.message.reply_text("🎬 Video yuborish holati:\n" + ("\n".join(f"• {n}: {s}" + (f" ({e[:60]})" if e else '') for n, s, e in hh)
+                                                                 or "Bu sotuvdagi tovarlarda video yo'q yoki mijoz tanlanmagan."))
+        return
+    if w == 'r':
+        cid = iarg(2); n = video_qayta_tayyorla(cid); m = _vid_mijoz(cid)
+        if not n: await q.answer("Bu mijoz olgan tovarlarda video yo'q", show_alert=True); return
+        if m and m['tg']:
+            await q.answer(f"🔁 {n} ta tovar videolari yuborilmoqda")
+            _t = asyncio.create_task(video_navbat_yubor(ctx.bot, cid)); _FON.add(_t); _t.add_done_callback(_FON.discard)
+        else:
+            await q.answer(f"⏳ {n} ta tovar navbatda — mijoz ulanganda yuboriladi", show_alert=True)
+        return
+    if w == 'avto':
+        soz_yoz('video_avto', '0' if soz('video_avto') == '1' else '1'); await q.answer("✅")
+        await _pos_chiqar(q, *_pub_sozlama()); return
+    if w == 'wavto':
+        soz_yoz('video_sayt_haftalik', '0' if soz('video_sayt_haftalik') != '0' else '1'); await q.answer("✅")
+        await _pos_chiqar(q, *_pub_sozlama()); return
+    if w == 'w':
+        pid = iarg(2)
+        if not _vid_sayt_mumkin(pid): await q.answer("Sayt sahifasi moslanmagan", show_alert=True); return
+        await q.answer("🌐 Saytdan olinmoqda…")
+        r = await asyncio.to_thread(sayt_videolarini_yangila, pid, True)
+        await _pos_chiqar(q, *_vid_ekran(pid, _vid_sayt_izoh(r))); return
+    if w == 'wall':
+        if _VID_SAYT.get('ish'): await q.answer("⏳ Yangilash allaqachon ketmoqda", show_alert=True); return
+        await q.answer("🌐 Boshlandi")
+        await q.message.reply_text("⏳ Hamma tovarlar sayt sahifalari tekshirilmoqda (har sahifa orasida pauza bor — bir necha daqiqa)…")
+        _t = asyncio.create_task(video_sayt_hammasi_yubor(ctx.bot, u.effective_chat.id)); _FON.add(_t); _t.add_done_callback(_FON.discard)
+        return
+    await q.answer()
+
+
+# ── 🌐 27: tovar sahifasidan videolar ──
+VIDEO_SAYT_KESH_KUN = 7
+_VID_SAYT = {}
+_YT_RE = re.compile(r'(?:youtube(?:-nocookie)?\.com/(?:embed/|watch\?(?:[^"\'<>\s]*&)?v=|shorts/|v/)|youtu\.be/)([A-Za-z0-9_-]{11})')
+_VIMEO_RE = re.compile(r'(?:player\.vimeo\.com/video/|//(?:www\.)?vimeo\.com/)(\d{6,12})')
+_MP4_RE = re.compile(r'(?:https?:)?//[^\s"\'<>()\\]+?\.mp4(?:\?[^\s"\'<>()\\]*)?', re.I)
+
+
+def _vid_norm(raw, base):
+    """URL → {'url','kind'} yoki None. YouTube/Vimeo — havola; mp4 — to'g'ridan (faqat http/https)."""
+    raw = _html.unescape(str(raw or '')).strip().replace('\\/', '/')
+    m = _YT_RE.search(raw)
+    if m: return {'url': f"https://www.youtube.com/watch?v={m.group(1)}", 'kind': 'link', 'tur': 'YouTube'}
+    m = _VIMEO_RE.search(raw)
+    if m: return {'url': f"https://vimeo.com/{m.group(1)}", 'kind': 'link', 'tur': 'Vimeo'}
+    if re.search(r'\.mp4(?:\?|$)', raw, re.I):
+        u_ = _abs(raw, base)
+        if re.match(r'^https?://[^\s]{4,600}$', u_ or ''): return {'url': u_, 'kind': 'mp4', 'tur': 'video'}
+    return None
+
+
+def html_videolar(h, url):
+    """Sahifa HTML'idan faqat video manzillari (matn ishonchsiz — boshqa hech narsa olinmaydi).
+    <header>/<footer>/<nav> ichidagilar tashlanadi (sayt banneri)."""
+    h = re.sub(r'(?is)<(header|footer|nav)\b[^>]*>.*?</\1>', ' ', h or '')
+    h = re.sub(r'(?is)<!--.*?-->', ' ', h)
+    nomzod = []
+    nomzod += re.findall(r'<meta[^>]+(?:property|name)=["\']og:video(?::url|:secure_url)?["\'][^>]*content=["\']([^"\']+)["\']', h, re.I)
+    nomzod += re.findall(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']og:video(?::url|:secure_url)?["\']', h, re.I)
+    nomzod += re.findall(r'<(?:video|source)\b[^>]*?\ssrc=["\']([^"\']+)["\']', h, re.I)
+    nomzod += re.findall(r'<iframe\b[^>]*?\s(?:data-)?src=["\']([^"\']+)["\']', h, re.I)
+    nomzod += ['https://youtu.be/' + x for x in _YT_RE.findall(h)]
+    nomzod += ['https://vimeo.com/' + x for x in _VIMEO_RE.findall(h)]
+    nomzod += _MP4_RE.findall(h)
+    out = []
+    for n in nomzod:
+        v = _vid_norm(n, url)
+        if v and v['url'] not in [o['url'] for o in out]: out.append(v)
+    return out[:8]
+
+
+def shopify_videolar(j, base):
+    out = []
+    for m in (j or {}).get('media') or []:
+        if m.get('media_type') == 'video':
+            src = [s_ for s_ in (m.get('sources') or []) if 'mp4' in str(s_.get('format', '')) or str(s_.get('url', '')).split('?')[0].endswith('.mp4')]
+            if src:
+                ok_ = [s_ for s_ in src if (s_.get('height') or 0) <= 1080]
+                tan = max(ok_, key=lambda s_: s_.get('height') or 0) if ok_ else min(src, key=lambda s_: s_.get('height') or 0)
+                v = _vid_norm(tan['url'], base)
+                if v: out.append(v)
+        elif m.get('media_type') == 'external_video' and m.get('external_id'):
+            host = str(m.get('host') or '')
+            raw = (f"https://youtu.be/{m['external_id']}" if host == 'youtube' else
+                   f"https://vimeo.com/{m['external_id']}" if host == 'vimeo' else '')
+            v = _vid_norm(raw, base)
+            if v: out.append(v)
+    for v in html_videolar((j or {}).get('description') or '', base):
+        out.append(v)
+    res = []
+    for v in out:
+        if v['url'] not in [r_['url'] for r_ in res]: res.append(v)
+    return res[:8]
+
+
+def sahifa_videolari(url):
+    """Tovarning o'z sahifasidagi videolar. Shopify: <url>.js (faqat shu tovar media'si); boshqa: HTML."""
+    k, s = _sayt_url(url)
+    if s and s['tur'] == 'shopify' and '/products/' in url:
+        js = url.split('?', 1)[0].rstrip('/') + '.js'
+        try: j = json.loads(web_ol(js).decode('utf-8', 'replace'))
+        except ValueError: raise KontentXato("Shopify javobi JSON emas") from None
+        if not isinstance(j, dict): raise KontentXato("Shopify javobi tanilmadi")
+        return shopify_videolar(j, s['base'])
+    return html_videolar(web_ol(url).decode('utf-8', 'replace'), url)
+
+
+def _domen(url):
+    return _url_qism(url)[0]
+
+
+def _umumiy_videolar(domen):
+    """Shu saytning ko'p tovar sahifasida takrorlanadigan videolar (banner): ≥3 tovar va ≥50% sahifa."""
+    conn = db()
+    jami = conn.execute("SELECT COUNT(DISTINCT product_id) FROM video_sayt_kuzatuv WHERE domen=?", (domen,)).fetchone()[0]
+    jami = max(jami, conn.execute("SELECT COUNT(*) FROM video_sayt_holat h JOIN products p ON p.id=h.product_id "
+                                  "WHERE h.status='ok' AND COALESCE(p.supplier_url,'') LIKE ?", (domen + '%',)).fetchone()[0])
+    rr = conn.execute("SELECT src_url, COUNT(DISTINCT product_id) FROM video_sayt_kuzatuv WHERE domen=? GROUP BY src_url", (domen,)).fetchall()
+    conn.close()
+    return {u_ for u_, n in rr if n >= 3 and n * 2 >= jami}
+
+
+def _vid_sayt_mumkin(pid, avto=False):
+    try: p = _mkt_p(pid)
+    except Exception: return False
+    return bool(p and p['supplier_url'] and (p['url_ok'] or not avto))
+
+
+def _vid_kuzat(pid, url, topilgan):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM video_sayt_kuzatuv WHERE product_id=?", (int(pid),))
+    for v in topilgan:
+        c.execute("INSERT OR IGNORE INTO video_sayt_kuzatuv (product_id, domen, src_url) VALUES (?,?,?)", (int(pid), _domen(url), v['url']))
+    conn.commit(); conn.close()
+
+
+def _vid_holat_yoz(pid, status, topildi=0, xato=''):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO video_sayt_holat (product_id, fetched, status, topildi, xato) VALUES (?,?,?,?,?)",
+                 (int(pid), _mkt_vaqt(), status, int(topildi), xato[:200]))
+    conn.commit(); conn.close()
+
+
+def _vid_sayt_saqla(pid, topilgan, domen):
+    """Topilganlardan banner va tombstone'larni chiqarib, yangilarini qo'shadi. Banner bo'lib chiqqan eski sayt videolari olinadi."""
+    umumiy = _umumiy_videolar(domen)
+    conn = db(); c = conn.cursor()
+    tomb = {r[0] for r in c.execute("SELECT src_url FROM video_tombstone WHERE product_id=?", (int(pid),))}
+    bor = {r[0] for r in c.execute("SELECT COALESCE(src_url,'') FROM product_videos WHERE product_id=?", (int(pid),))}
+    bor |= {r[0] for r in c.execute("SELECT url FROM product_videos WHERE product_id=? AND url<>''", (int(pid),))}
+    if umumiy:
+        c.execute(f"DELETE FROM product_videos WHERE product_id=? AND source='sayt' AND src_url IN ({','.join('?' * len(umumiy))})",
+                  [int(pid)] + sorted(umumiy))
+    nom = (c.execute("SELECT name FROM products WHERE id=?", (int(pid),)).fetchone() or ['Video'])[0]
+    conn.commit(); conn.close()
+    toza = [v for v in topilgan if v['url'] not in umumiy]
+    yangi = 0
+    for v in toza:
+        if v['url'] in tomb or v['url'] in bor: continue
+        n_ = len(tovar_videolari(pid)) + 1
+        sarl = f"{nom} — {v['tur']} {n_}" if v['tur'] != 'video' else f"{nom} — video {n_}"
+        vid = video_qosh(pid, v['kind'], url=v['url'], title=sarl, kim='sayt')
+        conn = db(); conn.execute("UPDATE product_videos SET source='sayt', src_url=? WHERE id=?", (v['url'], vid)); conn.commit(); conn.close()
+        yangi += 1
+    return len(toza), yangi
+
+
+def sayt_videolarini_yangila(pid, majburiy=False):
+    """Bitta tovar: sahifadan videolar. Qaytaradi {'holat': 'ok'|'sahifa_yoq'|'xato'|'kesh', 'topildi', 'yangi', 'xato'}."""
+    p = _mkt_p(pid)
+    if not p or not p['supplier_url']: return {'holat': 'sahifa_yoq', 'topildi': 0, 'yangi': 0}
+    if not majburiy:
+        conn = db(); r = conn.execute("SELECT fetched, status FROM video_sayt_holat WHERE product_id=?", (int(pid),)).fetchone(); conn.close()
+        if r and r[1] == 'ok' and r[0] >= (_local_now() - timedelta(days=VIDEO_SAYT_KESH_KUN)).strftime('%Y-%m-%d %H:%M'):
+            return {'holat': 'kesh', 'topildi': 0, 'yangi': 0}
+    try:
+        topilgan = sahifa_videolari(p['supplier_url'])
+    except Exception as e:
+        xato = str(e) if isinstance(e, KontentXato) else type(e).__name__
+        log.warning("Sayt videolari (%s): %s", p['name'], xato)
+        _vid_holat_yoz(pid, 'xato', 0, xato)
+        return {'holat': 'xato', 'topildi': 0, 'yangi': 0, 'xato': xato}
+    _vid_kuzat(pid, p['supplier_url'], topilgan)
+    _vid_holat_yoz(pid, 'ok', len(topilgan))
+    toza, yangi = _vid_sayt_saqla(pid, topilgan, _domen(p['supplier_url']))
+    return {'holat': 'ok', 'topildi': toza, 'yangi': yangi}
+
+
+def _vid_sayt_izoh(r):
+    if r['holat'] == 'sahifa_yoq': return "🌐 Sayt sahifasi moslanmagan — 📢 Marketing → 🔗 Tovar ↔ sayt"
+    if r['holat'] == 'xato': return f"⚠️ Sayt ochilmadi: {r.get('xato', '')[:120]}"
+    if not r['topildi']: return "🌐 Sahifada bu tovarga tegishli video topilmadi"
+    return f"🌐 Sahifada {r['topildi']} ta video, {r['yangi']} tasi yangi qo'shildi"
+
+
+def video_sayt_hammasi(faqat_tasdiqlangan=True):
+    """Barcha faol tovarlar. Avval hamma sahifa o'qiladi (banner aniqlash uchun), keyin saqlanadi."""
+    _VID_SAYT['ish'] = True
+    try:
+        conn = db()
+        rr = conn.execute("SELECT id, name, COALESCE(supplier_url,''), COALESCE(supplier_url_ok,0) FROM products "
+                          "WHERE COALESCE(active,1)=1 ORDER BY name").fetchall()
+        conn.close()
+        natija = {'topildi': 0, 'yangi': 0, 'yoq': 0, 'xato': 0, 'sahifasiz': [], 'tasdiqlanmagan': []}
+        olindi = []
+        for pid, nom, url, ok_ in rr:
+            if not url: natija['sahifasiz'].append(nom); continue
+            if faqat_tasdiqlangan and not ok_: natija['tasdiqlanmagan'].append(nom); continue
+            try:
+                topilgan = sahifa_videolari(url)
+            except Exception as e:
+                natija['xato'] += 1; _vid_holat_yoz(pid, 'xato', 0, str(e) if isinstance(e, KontentXato) else type(e).__name__); continue
+            _vid_kuzat(pid, url, topilgan); _vid_holat_yoz(pid, 'ok', len(topilgan)); olindi.append((pid, url, topilgan))
+        for pid, url, topilgan in olindi:
+            toza, yangi = _vid_sayt_saqla(pid, topilgan, _domen(url))
+            if toza: natija['topildi'] += 1
+            else: natija['yoq'] += 1
+            natija['yangi'] += yangi
+        soz_yoz('video_sayt_oxirgi', _mkt_vaqt())
+        return natija
+    finally:
+        _VID_SAYT['ish'] = False
+
+
+def _vid_sayt_xulosa(n):
+    m = ["🌐 SAYTDAN VIDEOLAR — XULOSA",
+         f"🎬 Video topilgan tovarlar: {n['topildi']}", f"🆕 Yangi qo'shilgan videolar: {n['yangi']}",
+         f"➖ Sahifada video yo'q: {n['yoq']}", f"⚠️ Sahifa ochilmadi: {n['xato']}",
+         f"❔ Sahifa tasdiqlanmagan: {len(n['tasdiqlanmagan'])}", f"🔗 Sahifa moslanmagan: {len(n['sahifasiz'])}"]
+    if n['sahifasiz']: m += ["", "Moslash kerak (📢 Marketing → 🔗 Tovar ↔ sayt):"] + [f"• {x}" for x in n['sahifasiz'][:20]] + (
+        [f"… va yana {len(n['sahifasiz']) - 20} ta"] if len(n['sahifasiz']) > 20 else [])
+    if n['tasdiqlanmagan']: m += ["", "Tasdiqlang (❔):"] + [f"• {x}" for x in n['tasdiqlanmagan'][:10]]
+    return "\n".join(m)
+
+
+async def video_sayt_hammasi_yubor(bot, chat_id, jim=False):
+    try:
+        n = await asyncio.to_thread(video_sayt_hammasi)
+    except Exception as e:
+        log.exception("video_sayt_hammasi")
+        if not jim: await bot.send_message(chat_id=chat_id, text=f"⚠️ Saytdan yangilashda xato: {str(e)[:150]}")
+        return None
+    if not jim or n['yangi']:
+        try: await bot.send_message(chat_id=chat_id, text=_vid_sayt_xulosa(n)[:4000],
+                                    reply_markup=InlineKeyboardMarkup([[_btn("🔗 Tovar ↔ sayt", "mkt:map:0")]]) if n['sahifasiz'] else None)
+        except Exception: log.exception("video xulosa")
+    return n
+
+
+def video_sayt_haftalik_kerakmi(now=None):
+    """Haftalik avto-yangilash: yoqilgan, 7 kun o'tgan, soat 04:00–05:00 (Toshkent)."""
+    if soz('video_sayt_haftalik') == '0' or _VID_SAYT.get('ish'): return False
+    now = now or _local_now()
+    if now.hour != 4: return False
+    oxirgi = soz('video_sayt_oxirgi')
+    return not oxirgi or oxirgi < (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M')
+
+
 def _omb_karta_b10(u, pid, out, rows):
     """📦 Tovar kartasiga: serial holati, shtrix-kod va tugmalar (ro'yxatlarni joyida to'ldiradi)."""
     try:
@@ -13151,6 +13964,10 @@ def _omb_karta_b10(u, pid, out, rows):
     b = [_btn("🔢 Seriallar", f"sn:pp:{pid}")]
     if can(u, 'ombor'): b.append(_btn("🏷 Yorliq", f"kod:p:{pid}"))
     rows.append(b)
+    if can(u, 'boshqaruv'):
+        try: nv = len(tovar_videolari(pid))
+        except sqlite3.OperationalError: nv = 0
+        rows.append([_btn(f"🎬 Videolar ({nv})", f"vid:l:{pid}")])
 
 
 def _sn_menu(u):
@@ -14029,9 +14846,9 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rol: return
     msg = menyu_kanon(u.message.text)
     if msg in MENU_MAP:
-        for _k in ('pos', 'omb', 'mij', 'his', 'zav', 'mkt', 'zx', 'qr', 'sm', 'sn', 'kod'):  # menyu bosildi — kutish bekor
+        for _k in ('pos', 'omb', 'mij', 'his', 'zav', 'mkt', 'zx', 'qr', 'sm', 'sn', 'kod', 'vid'):  # menyu bosildi — kutish bekor
             if ctx.user_data.get(_k): ctx.user_data[_k]['wait'] = None
-    elif (await pos_matn(u, ctx) or await omb_matn(u, ctx) or await mij_matn(u, ctx)
+    elif (await vid_matn(u, ctx) or await pos_matn(u, ctx) or await omb_matn(u, ctx) or await mij_matn(u, ctx)
           or await his_matn_kirit(u, ctx) or await zav_matn(u, ctx) or await mkt_matn(u, ctx)
           or await b10_matn(u, ctx) or await kod_erkin(u, ctx)):
         return
@@ -14613,6 +15430,7 @@ async def handle_photo_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_video_post(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Egasi/admin video yubordi → 📢 Marketing: tovar tanlash → oldindan ko'rish → Telegram/Instagram."""
+    if await vid_media(u, ctx): return                 # 26: 🎬 Videolar ekrani (tovar videosi)
     if not can(u, 'marketing'): return
     await mkt_media(u, ctx)
 
@@ -15138,6 +15956,7 @@ async def cmd_update(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_document(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """.xlsx — Excel import (astatka/sotuv/kassa); .py — bot o'zini yangilaydi"""
     if not can(u, 'boshqaruv'): return
+    if await vid_media(u, ctx): return                 # 26: video fayl sifatida (hujjat) yuborilgan
     doc = u.message.document
     fname = ((doc.file_name if doc else '') or '').lower()
     if fname.endswith(('.xlsx', '.xlsm')):
@@ -16269,6 +17088,8 @@ def main():
     app.add_handler(CallbackQueryHandler(sm_callback, pattern=r'^sm:'))
     app.add_handler(CallbackQueryHandler(sn_callback, pattern=r'^sn:'))
     app.add_handler(CallbackQueryHandler(kod_callback, pattern=r'^kod:'))
+    app.add_handler(CallbackQueryHandler(vid_callback, pattern=r'^vid:'))      # 26: tovar videolari (xodim, ruxsat ichida)
+    app.add_handler(CallbackQueryHandler(mijoz_video_cb, pattern=r'^mv:'))     # 26: mijoz o'z xaridi videolari
     app.add_handler(MessageHandler(filters.CONTACT & ~STAFF, pub_contact))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
