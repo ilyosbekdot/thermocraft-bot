@@ -54,7 +54,7 @@ else:
 
 def db_on_volume():
     return bool(VOLUME_PATH) and os.path.abspath(DB_PATH).startswith(os.path.abspath(VOLUME_PATH) + os.sep)
-ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=90.0, max_retries=1)   # 13-tuzatish: 600 s × 3 emas
 
 # Conversation states
 (S_NAME, S_CAT, S_SUP, S_COST, S_PRICE, S_QTY,
@@ -4943,8 +4943,43 @@ ESKI_KB = [
 def _asosiy_kb():
     return ReplyKeyboardMarkup(ASOSIY_KB, resize_keyboard=True, is_persistent=True)
 
+def _menyu_kalit(t):
+    """'📣 Marketing', '📢 Marketing', 'marketing', '⚙ Boshqa' (FE0F'siz) → 'marketing' / 'boshqa'."""
+    t = re.sub(r'[\ufe0e\ufe0f\u200d]', '', str(t or ''))
+    t = re.sub(r"^[^\w'ʻ‘’]+", '', t, flags=re.UNICODE)
+    return re.sub(r'\s+', ' ', t).strip().casefold()
+
+
+def _menyu_nrm_lugat():
+    out, takror = {}, set()
+    for k in MENU_MAP:
+        kk = _menyu_kalit(k)
+        if not kk: continue
+        if kk in out and out[kk] != k: takror.add(kk)
+        out[kk] = k
+    for kk in takror: out.pop(kk, None)
+    return out
+
+
+_MENYU_NRM = None
+
+
+def menyu_kanon(t):
+    """Klaviatura matnini MENU_MAP kalitiga keltiradi (emoji varianti farq qilsa ham). Menyu bo'lmasa — o'zgarmaydi."""
+    global _MENYU_NRM
+    if not isinstance(t, str) or len(t) > 40: return t
+    if t in MENU_MAP: return t
+    if _MENYU_NRM is None: _MENYU_NRM = _menyu_nrm_lugat()
+    return _MENYU_NRM.get(_menyu_kalit(t), t)
+
+
+def menyu_tugmasimi(t):
+    return isinstance(t, str) and menyu_kanon(t) in MENU_MAP
+
+
 async def route_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE, msg: str):
     """Menyu tugmasini tegishli bo'limga yo'naltiradi"""
+    msg = menyu_kanon(msg)
     action = MENU_MAP.get(msg)
     if not action:
         return False
@@ -13992,7 +14027,7 @@ _ARRIVE_NOT_FOUND = "⚠️ Astatkada bu nomli mahsulot topilmadi — astatka o'
 async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rol = user_role(u)
     if not rol: return
-    msg = u.message.text
+    msg = menyu_kanon(u.message.text)
     if msg in MENU_MAP:
         for _k in ('pos', 'omb', 'mij', 'his', 'zav', 'mkt', 'zx', 'qr', 'sm', 'sn', 'kod'):  # menyu bosildi — kutish bekor
             if ctx.user_data.get(_k): ctx.user_data[_k]['wait'] = None
@@ -15952,11 +15987,73 @@ async def conv_escape_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def conv_escape_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    await route_menu(u, ctx, u.message.text)
+    await route_menu(u, ctx, menyu_kanon(u.message.text))
     return ConversationHandler.END
 
+
+async def cmd_bekor_hammasi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/cancel (/bekor) — istalgan holatdan chiqish: barcha kutishlar va ochiq suhbat yopiladi."""
+    ctx.user_data.clear()
+    if not user_role(u): return ConversationHandler.END
+    await u.message.reply_text("❌ Bekor qilindi. Asosiy menyu:",
+                               reply_markup=_asosiy_kb() if can(u, 'boshqaruv') else None)
+    return ConversationHandler.END
+
+
+class MenyuFiltr(filters.MessageFilter):
+    """Asosiy/eski menyu tugmasi (emoji varianti farq qilsa ham)."""
+    def __init__(self):
+        super().__init__(name="MenyuFiltr")
+    def filter(self, message):
+        return menyu_tugmasimi(getattr(message, 'text', None))
+
+
+def _ustuvor_update(update):
+    """Menyu tugmasi va /start, /cancel, /bekor — navbat kutmaydi (uzoq handler bo'lsa ham darhol ishlaydi)."""
+    m = getattr(update, 'message', None)
+    t = getattr(m, 'text', None) if m else None
+    if not isinstance(t, str): return False
+    if t.startswith('/'):
+        return t.split()[0].split('@')[0].lower() in ('/start', '/cancel', '/bekor')
+    return menyu_tugmasimi(t)
+
+
+from telegram.ext import BaseUpdateProcessor   # noqa: E402
+
+
+class FoydalanuvchiNavbati(BaseUpdateProcessor):
+    """Har foydalanuvchi uchun ketma-ket (sotuv/suhbat holati buzilmasin), turli foydalanuvchilar — parallel.
+    Menyu tugmalari va /start, /cancel navbatni kutmaydi. 30 soniyadan uzoq handler logga yoziladi."""
+    def __init__(self):
+        super().__init__(max_concurrent_updates=64)
+        self._qulf = {}
+    async def initialize(self): pass
+    async def shutdown(self): pass
+    async def do_process_update(self, update, coroutine):
+        uid = getattr(getattr(update, 'effective_user', None), 'id', 0) or 0
+        t0 = time.monotonic()
+        try:
+            if _ustuvor_update(update):
+                await coroutine
+            else:
+                q = self._qulf.get(uid)
+                if q is None: q = self._qulf[uid] = asyncio.Lock()
+                async with q:
+                    await coroutine
+        finally:
+            dt_ = time.monotonic() - t0
+            if dt_ > 30:
+                m = getattr(update, 'effective_message', None)
+                log.warning("Uzoq handler: %.0f s (user %s): %r", dt_, uid, (getattr(m, 'text', None) or getattr(getattr(update, 'callback_query', None), 'data', '') or '')[:60])
+
 async def on_error(u: object, ctx: ContextTypes.DEFAULT_TYPE):
-    log.error("Xato:", exc_info=ctx.error)
+    _m = getattr(u, 'effective_message', None) if isinstance(u, Update) else None
+    log.error("Xato (user %s, %r):", getattr(getattr(u, 'effective_user', None), 'id', '-'),
+              ((getattr(_m, 'text', None) or getattr(getattr(u, 'callback_query', None), 'data', None) or '') if _m or isinstance(u, Update) else '')[:60],
+              exc_info=ctx.error)
+    if isinstance(u, Update) and u.callback_query:      # tugma «soat»da qotib qolmasin
+        try: await u.callback_query.answer("⚠️ Xatolik", show_alert=False)
+        except Exception: pass
     try:
         # Xato matni (ichki tafsilotlar) faqat egasiga ko'rsatiladi — mijozga/kanalga emas.
         # Markdown'siz: xato matnidagi ` yoki _ yangi xatoga sabab bo'lmasin.
@@ -16025,14 +16122,15 @@ def main():
     init_db()
 
     app = (Application.builder().token(BOT_TOKEN)
-           .post_init(_post_init).post_shutdown(_post_shutdown).build())
+           .post_init(_post_init).post_shutdown(_post_shutdown)
+           .concurrent_updates(FoydalanuvchiNavbati()).build())   # 13-tuzatish: bitta uzoq handler hammasini to'xtatmasin
 
     STAFF = RolFiltr()                    # egasi + faol xodimlar (rol bazadan, har safar)
     BOSHQ = RolFiltr('boshqaruv')         # egasi + admin
     # Tahrirlangan xabar / kanal postlarini eng oldin to'xtatamiz (group=-1)
     app.add_handler(TypeHandler(Update, _faqat_yangi_xabar), group=-1)
     # Suhbat ichida menyu tugmasi bosilsa — u nom/narx sifatida yozilmasin, fallback'ga o'tsin
-    MENU_F = filters.Text(list(MENU_MAP.keys()))
+    MENU_F = MenyuFiltr()          # 13-tuzatish: emoji varianti farq qilsa ham menyu (📣/📢, FE0F'siz)
     CONV_TEXT = filters.TEXT & ~filters.COMMAND & ~MENU_F
 
     # Yangi tovar qo'shish (ConversationHandler)
@@ -16061,7 +16159,7 @@ def main():
             ],
         },
         fallbacks=[
-            CommandHandler('bekor', conv_cancel),
+            CommandHandler(['bekor', 'cancel'], conv_cancel),
             CommandHandler('start', conv_escape_start),
             MessageHandler(MENU_F, conv_escape_menu),
         ],
@@ -16071,6 +16169,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
+    app.add_handler(CommandHandler(['cancel', 'bekor'], cmd_bekor_hammasi))   # 13-tuzatish: istalgan holatdan chiqish
     app.add_handler(CommandHandler('start', cmd_start, filters=STAFF))
     app.add_handler(CommandHandler('start', cmd_start_public, filters=~STAFF))
     app.add_handler(CommandHandler('stop', cmd_stop_public, filters=~STAFF))
